@@ -31,6 +31,7 @@ mod history;
 mod http_client;
 mod idempotency;
 mod ids;
+mod reconciler;
 mod request_id;
 mod state;
 mod storage;
@@ -489,6 +490,7 @@ async fn main() {
 
     state.health.spawn_canary(state.storage.clone());
     state.health.spawn_rpc_check(state.solana_client.clone());
+    reconciler::spawn(state.storage.clone(), state.solana_client.clone());
     let health = state.health.clone();
     let app = router(state);
 

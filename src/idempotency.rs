@@ -178,6 +178,16 @@ fn mismatch() -> ApiError {
         .with_code("idempotency_mismatch")
 }
 
+/// The signature of the transaction the record at `path` stored, if any.
+pub async fn stored_signature(storage: &Storage, path: &str) -> Result<Option<String>, StoreError> {
+    Ok(storage
+        .state()
+        .get_json::<Record>(path)
+        .await?
+        .and_then(|(record, _)| record.chain)
+        .map(|tx| tx.signature))
+}
+
 fn replay(stored: &StoredResponse) -> Response {
     let status = StatusCode::from_u16(stored.status).unwrap_or(StatusCode::OK);
     let mut response = (status, Json(stored.body.clone())).into_response();

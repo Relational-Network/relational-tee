@@ -3,9 +3,10 @@
 
 //! Staged chain sagas: `staged/{op_id}.json`, create-only, written before a
 //! saga sends anything. Each holds what the saga's commit will write and the
-//! path of its idempotency record, which holds the signed transaction, so a
-//! saga whose request died after the chain step can be finished later. A
-//! lifecycle rule deletes them after 7 days; nothing else does.
+//! path of its idempotency record, which holds the signed transaction, so
+//! the reconciler ([`crate::reconciler`]) can finish a saga whose request
+//! died after the chain step. A lifecycle rule deletes them after 7 days;
+//! nothing else does.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -60,6 +61,14 @@ impl<'a> Sagas<'a> {
                 .map(|(earlier, _)| earlier)
                 .ok_or_else(|| StoreError::Invalid(format!("staged saga {op_id} vanished"))),
         }
+    }
+
+    /// Every staged saga. Only changed ones are fetched.
+    pub async fn all(&self) -> Result<Vec<Staged>, StoreError> {
+        self.s
+            .state()
+            .list_json("staged/", |p| p.ends_with(".json"))
+            .await
     }
 }
 

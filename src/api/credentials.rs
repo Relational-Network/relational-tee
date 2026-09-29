@@ -800,7 +800,7 @@ pub async fn issue_credentials(
 
     // ── RECORD ────────────────────────────────────────────────────
 
-    // If this fails, a retry with the same key adds the entry.
+    // If this fails, a retry with the same key, or the reconciler, adds the entry.
     upload.signature = Some(sig_str.clone());
     let doc = state
         .storage
