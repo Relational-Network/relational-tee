@@ -75,12 +75,3 @@ pub struct TokenBalance {
     /// Number of decimal places.
     pub decimals: u8,
 }
-
-/// Result of a submitted transaction.
-#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
-pub struct SendResult {
-    /// Base58-encoded transaction signature.
-    pub signature: String,
-    /// Solana Explorer URL for this transaction.
-    pub explorer_url: String,
-}

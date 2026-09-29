@@ -15,8 +15,6 @@ use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::{json, Value};
 use solana_hash::Hash;
 use solana_pubkey::Pubkey;
-use solana_signature::Signature;
-use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 // ============================================================================
@@ -152,12 +150,12 @@ impl JsonRpcClient {
     // RPC methods
     // ========================================================================
 
-    /// `getLatestBlockhash` → (Hash, lastValidBlockHeight).
-    pub async fn get_latest_blockhash(&self) -> Result<Hash, RpcError> {
+    /// `getLatestBlockhash`: the blockhash, and the last block height at
+    /// which a transaction using it can still land.
+    pub async fn get_latest_blockhash(&self) -> Result<(Hash, u64), RpcError> {
         #[derive(Deserialize)]
         struct Inner {
             blockhash: String,
-            #[allow(dead_code)]
             #[serde(rename = "lastValidBlockHeight")]
             last_valid_block_height: u64,
         }
@@ -167,21 +165,25 @@ impl JsonRpcClient {
                 json!([{"commitment": self.commitment}]),
             )
             .await?;
-        ctx.value
+        let hash = ctx
+            .value
             .blockhash
             .parse()
-            .map_err(|_| RpcError::new("invalid blockhash"))
+            .map_err(|_| RpcError::new("invalid blockhash"))?;
+        Ok((hash, ctx.value.last_valid_block_height))
     }
 
-    /// `sendTransaction` — serialize, base64 encode, send.
-    pub async fn send_transaction(
-        &self,
-        tx: &solana_transaction::Transaction,
-    ) -> Result<Signature, RpcError> {
-        let bytes =
-            bincode::serialize(tx).map_err(|e| RpcError::new(format!("serialize tx: {e}")))?;
-        let encoded = BASE64.encode(&bytes);
-        let sig_str: String = self
+    /// `getBlockHeight` at `commitment`.
+    pub async fn get_block_height(&self, commitment: &str) -> Result<u64, RpcError> {
+        self.call_typed("getBlockHeight", json!([{ "commitment": commitment }]))
+            .await
+    }
+
+    /// `sendTransaction` of a signed transaction, bincode-serialized and
+    /// base64-encoded, with preflight. Sending one Solana already processed
+    /// again counts as sent: it deduplicates by signature.
+    pub async fn send_encoded_transaction(&self, encoded: &str) -> Result<(), RpcError> {
+        let sent: Result<String, RpcError> = self
             .call_typed(
                 "sendTransaction",
                 json!([
@@ -193,23 +195,45 @@ impl JsonRpcClient {
                     }
                 ]),
             )
-            .await?;
-        Signature::from_str(&sig_str).map_err(|_| RpcError::new("invalid signature in response"))
+            .await;
+        match sent {
+            Ok(_) => Ok(()),
+            Err(e) if e.message.contains("already been processed") => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 
-    /// `getSignatureStatuses` — check confirmation status for one or more signatures.
-    pub async fn get_signature_statuses(
+    /// `getSignatureStatuses` for one signature, searching the whole ledger,
+    /// so a transaction that landed long ago is still found.
+    pub async fn signature_status(
         &self,
-        signatures: &[&Signature],
-    ) -> Result<Vec<Option<SignatureStatus>>, RpcError> {
-        let sigs: Vec<String> = signatures.iter().map(|s| s.to_string()).collect();
+        signature: &str,
+    ) -> Result<Option<SignatureStatus>, RpcError> {
         let ctx: RpcContext<Vec<Option<SignatureStatus>>> = self
             .call_typed(
                 "getSignatureStatuses",
-                json!([sigs, {"searchTransactionHistory": false}]),
+                json!([[signature], {"searchTransactionHistory": true}]),
             )
             .await?;
-        Ok(ctx.value)
+        Ok(ctx.value.into_iter().next().flatten())
+    }
+
+    /// Whether an account exists at `commitment`.
+    pub async fn account_exists(
+        &self,
+        pubkey: &Pubkey,
+        commitment: &str,
+    ) -> Result<bool, RpcError> {
+        let ctx: RpcContext<Value> = self
+            .call_typed(
+                "getAccountInfo",
+                json!([
+                    pubkey.to_string(),
+                    {"encoding": "base64", "commitment": commitment, "dataSlice": {"offset": 0, "length": 0}}
+                ]),
+            )
+            .await?;
+        Ok(!ctx.value.is_null())
     }
 
     /// `getBalance` → lamports.

@@ -7,6 +7,18 @@
 //! assembles all routes into a single Axum sub-router that is merged into
 //! the application root.
 
+/// Open a mutating request's idempotency record: return its stored response
+/// if it completed before, or the operation to run it with.
+macro_rules! open_or_replay {
+    ($state:expr, $user:expr, $request:expr, $body:expr) => {
+        match $crate::idempotency::Operation::open(&$state.storage, $user, &$request, $body).await?
+        {
+            $crate::idempotency::Opened::Replay(response) => return Ok(response),
+            $crate::idempotency::Opened::Run(op) => op,
+        }
+    };
+}
+
 pub mod admin;
 pub mod balance;
 pub mod credentials;

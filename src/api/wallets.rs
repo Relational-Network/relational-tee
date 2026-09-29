@@ -10,6 +10,8 @@
 
 use axum::{
     extract::{Path, State},
+    http::StatusCode,
+    response::Response,
     Json,
 };
 use serde::{Deserialize, Serialize};
@@ -20,6 +22,8 @@ use crate::audit;
 use crate::auth::UserToken;
 use crate::blockchain::signing::{generate_solana_keypair, keypair_from_bytes};
 use crate::error::ApiError;
+use crate::idempotency::{Idempotent, JsonBody};
+use crate::ids;
 use crate::state::AppState;
 use crate::storage::wallets::{CreateOutcome, NewKeypair, WalletResponse, WalletStatus};
 
@@ -70,6 +74,9 @@ pub struct DeleteWalletResponse {
 // ============================================================================
 
 /// Create a new Solana wallet (Ed25519 keypair generated inside the enclave).
+///
+/// The wallet's ID derives from the caller and the `Idempotency-Key`; a
+/// retry reuses the keypair an earlier attempt stored.
 #[utoipa::path(
     post,
     path = "/v1/wallets",
@@ -77,20 +84,30 @@ pub struct DeleteWalletResponse {
     summary = "Create wallet",
     description = "Generate a new Solana keypair inside the worker, store it encrypted, and return its public address. A user has at most one wallet.",
     security(("bearer_auth" = [])),
+    params(
+        ("Idempotency-Key" = String, Header, description = "A UUID naming this user action; reuse it on every retry"),
+    ),
     request_body = CreateWalletRequest,
     responses(
         (status = 201, description = "Wallet created", body = CreateWalletResponse),
-        (status = 400, description = "Invalid request"),
+        (status = 400, description = "Invalid request, or no Idempotency-Key"),
         (status = 401, description = "Unauthorized"),
         (status = 409, description = "The user already has a wallet"),
+        (status = 422, description = "The Idempotency-Key was used for a different request"),
         (status = 503, description = "Storage unavailable"),
     )
 )]
 pub async fn create_wallet(
     UserToken(token): UserToken,
+    request: Idempotent,
     State(state): State<AppState>,
-    Json(payload): Json<CreateWalletRequest>,
-) -> Result<(axum::http::StatusCode, Json<CreateWalletResponse>), ApiError> {
+    JsonBody {
+        value: payload,
+        bytes,
+    }: JsonBody<CreateWalletRequest>,
+) -> Result<Response, ApiError> {
+    let mut op = open_or_replay!(state, &token.sub, request, &bytes);
+
     // Validate label length.
     if let Some(ref label) = payload.label {
         if label.len() > 64 {
@@ -104,8 +121,9 @@ pub async fn create_wallet(
         bytes: zeroize::Zeroizing::new(keypair_bytes),
         address: public_address,
     };
-    let wallet_id = uuid::Uuid::new_v4().to_string();
+    let wallet_id = ids::wallet_id(&token.sub, &request.key);
 
+    op.begin().await?;
     let address_of = |bytes: &[u8]| {
         use solana_signer::Signer;
         keypair_from_bytes(bytes)
@@ -145,7 +163,7 @@ pub async fn create_wallet(
         explorer_url,
     };
 
-    Ok((axum::http::StatusCode::CREATED, Json(response)))
+    op.finish(StatusCode::CREATED, &response).await
 }
 
 /// List the authenticated user's wallets.
@@ -228,22 +246,28 @@ pub async fn get_wallet(
     security(("bearer_auth" = [])),
     params(
         ("wallet_id" = String, Path, description = "Wallet UUID"),
+        ("Idempotency-Key" = String, Header, description = "A UUID naming this user action; reuse it on every retry"),
     ),
     responses(
         (status = 200, description = "Wallet deleted", body = DeleteWalletResponse),
+        (status = 400, description = "No Idempotency-Key"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Not the wallet owner"),
         (status = 404, description = "Wallet not found"),
+        (status = 422, description = "The Idempotency-Key was used for a different request"),
     )
 )]
 pub async fn delete_wallet(
     UserToken(token): UserToken,
+    request: Idempotent,
     State(state): State<AppState>,
     Path(wallet_id): Path<String>,
-) -> Result<Json<DeleteWalletResponse>, ApiError> {
+) -> Result<Response, ApiError> {
+    let mut op = open_or_replay!(state, &token.sub, request, b"");
     let wallet = load_wallet(&state, &wallet_id).await?;
     enforce_owner(&wallet, &token.sub)?;
 
+    op.begin().await?;
     state.storage.wallets().soft_delete(&wallet).await?;
 
     info!(
@@ -252,8 +276,12 @@ pub async fn delete_wallet(
         "Wallet soft-deleted"
     );
 
-    Ok(Json(DeleteWalletResponse {
-        status: "deleted".to_string(),
-        wallet_id,
-    }))
+    op.finish(
+        StatusCode::OK,
+        &DeleteWalletResponse {
+            status: "deleted".to_string(),
+            wallet_id,
+        },
+    )
+    .await
 }

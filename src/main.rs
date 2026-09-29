@@ -20,6 +20,7 @@ mod attestation;
 mod audit;
 mod auth;
 mod blockchain;
+mod chain;
 mod config;
 mod crypto;
 mod data_validation;
@@ -28,6 +29,8 @@ mod handlers;
 mod health;
 mod history;
 mod http_client;
+mod idempotency;
+mod ids;
 mod request_id;
 mod state;
 mod storage;
@@ -174,7 +177,6 @@ Protected endpoints require a JWT issued by the Attestation Verification Service
         history::TokenType,
         history::TxStatus,
         blockchain::types::TokenBalance,
-        blockchain::types::SendResult,
         // DRT schemas (new contract)
         blockchain::drt::types::DrtRequest,
         blockchain::drt::types::SchemaFieldRequest,

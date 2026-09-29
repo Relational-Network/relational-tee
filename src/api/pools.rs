@@ -8,11 +8,16 @@
 
 use axum::{
     extract::{Path, State},
+    http::StatusCode,
+    response::Response,
     Json,
 };
+use solana_instruction::Instruction;
 use solana_keypair::Keypair;
+use solana_message::Message;
 use solana_pubkey::Pubkey;
 use solana_signer::Signer;
+use solana_transaction::Transaction;
 use std::collections::BTreeMap;
 use std::str::FromStr;
 use tracing::info;
@@ -29,10 +34,14 @@ use crate::blockchain::drt::{
     validation::{validate_drt_requests, validate_pool_name, ResolvedDrt},
 };
 use crate::blockchain::signing::keypair_from_bytes_verified;
+use crate::chain::{self, Effect};
 use crate::data_validation::FieldSchema;
 use crate::error::ApiError;
+use crate::idempotency::{Idempotent, JsonBody};
+use crate::ids;
 use crate::state::AppState;
 use crate::storage::pools::{DrtMetadata, PoolDoc, PoolKind};
+use crate::storage::staged::{Saga, Staged};
 use crate::storage::wallets::WalletMetadata;
 use crate::store::Created;
 
@@ -53,30 +62,15 @@ pub(crate) async fn load_wallet_keypair(
     Ok((wallet, keypair))
 }
 
-/// Sign, send and confirm a transaction; `commitment` is `"confirmed"` or
-/// `"finalized"`. Returns its signature.
-pub(crate) async fn sign_and_send(
-    state: &AppState,
-    keypair: &Keypair,
-    instructions: Vec<solana_instruction::Instruction>,
-    commitment: &str,
-) -> Result<String, ApiError> {
-    let rpc = state.solana_client.rpc();
-    let recent_blockhash = rpc
-        .get_latest_blockhash()
-        .await
-        .map_err(|e| ApiError::rpc_unavailable(format!("blockhash fetch failed: {e}")))?;
-    let message = solana_message::Message::new(&instructions, Some(&keypair.pubkey()));
-    let tx = solana_transaction::Transaction::new(&[keypair], message, recent_blockhash);
-    let signature = rpc
-        .send_transaction(&tx)
-        .await
-        .map_err(|e| ApiError::rpc_unavailable(format!("transaction send failed: {e}")))?;
-    state
-        .solana_client
-        .await_confirmation(&signature, commitment)
-        .await?;
-    Ok(signature.to_string())
+/// A transaction of `instructions` paid for and signed by `keypair`.
+pub(crate) fn signed<'a>(
+    keypair: &'a Keypair,
+    instructions: &'a [Instruction],
+) -> impl Fn(solana_hash::Hash) -> Transaction + 'a {
+    move |blockhash| {
+        let message = Message::new(instructions, Some(&keypair.pubkey()));
+        Transaction::new(&[keypair], message, blockhash)
+    }
 }
 
 /// Compare a wallet's Solana public address against `pool.owner`.
@@ -102,16 +96,15 @@ pub(crate) fn explorer_url(state: &AppState, sig: &str) -> String {
     state.solana_client.network().explorer_tx_url(sig)
 }
 
-fn new_uuid_bytes() -> [u8; 16] {
-    *uuid::Uuid::new_v4().as_bytes()
-}
-
 /// Validate the inline schema submitted on MALTA pool create.
 ///
-/// If the caller did not supply a `schema_id`, generate a stable UUID. The
+/// If the caller did not supply a `schema_id`, the pool's UUID names it. The
 /// schema id is an internal handle the dashboard does not surface, so the
 /// operator never has to invent one.
-fn parse_schema(req: &InlineSchemaRequest) -> Result<(String, Vec<FieldSchema>), ApiError> {
+fn parse_schema(
+    req: &InlineSchemaRequest,
+    pool_uuid: &[u8; 16],
+) -> Result<(String, Vec<FieldSchema>), ApiError> {
     let schema_id = match req
         .schema_id
         .as_deref()
@@ -130,7 +123,7 @@ fn parse_schema(req: &InlineSchemaRequest) -> Result<(String, Vec<FieldSchema>),
             }
             s.to_string()
         }
-        None => uuid::Uuid::new_v4().to_string(),
+        None => uuid::Uuid::from_bytes(*pool_uuid).to_string(),
     };
     if req.fields.is_empty() {
         return Err(ApiError::bad_request("schema must have at least one field"));
@@ -153,54 +146,23 @@ fn parse_schema(req: &InlineSchemaRequest) -> Result<(String, Vec<FieldSchema>),
     Ok((schema_id, fields))
 }
 
-// ============================================================================
-// Core create-pool logic.
-// ============================================================================
-
-struct CreatedPool {
-    pool_pda: Pubkey,
-    pool_uuid: [u8; 16],
-    signatures: Vec<String>,
-    drts: BTreeMap<String, DrtMetadata>,
-}
-
-async fn create_pool_atomic(
-    state: &AppState,
-    owner_keypair: &Keypair,
-    drts: &[ResolvedDrt],
-) -> Result<CreatedPool, ApiError> {
-    let owner_pk = owner_keypair.pubkey();
-    let pool_uuid = new_uuid_bytes();
-    let (pool_pda, _bump) = derive_pool_pda(&pool_uuid);
-
-    let mut drt_records: BTreeMap<String, DrtMetadata> = BTreeMap::new();
-    let mut right_ids: Vec<[u8; 16]> = Vec::with_capacity(drts.len());
-    for d in drts {
-        let rid = new_uuid_bytes();
-        right_ids.push(rid);
-        let (mint_pda, _) = derive_mint_pda(&pool_pda, &rid);
-        drt_records.insert(
-            d.name.clone(),
-            DrtMetadata {
-                right_id_hex: hex::encode(rid),
-                mint: mint_pda.to_string(),
-                supply: d.supply,
-                code_repo_url: d.code_repo_url.clone(),
-                code_hash_hex: hex::encode(d.code_hash),
-            },
-        );
-    }
-
-    // Build instructions: compute_budget + create_pool + (register_drt ×N) + seal_pool.
+/// The one transaction that creates a pool: compute budget, `create_pool`,
+/// `register_drt` for each DRT, then `seal_pool`.
+fn pool_instructions(
+    owner: &Pubkey,
+    pool_pda: &Pubkey,
+    pool_uuid: &[u8; 16],
+    drts: &[(ResolvedDrt, [u8; 16])],
+) -> Result<Vec<Instruction>, ApiError> {
     let mut ixs = Vec::with_capacity(3 + drts.len());
     ixs.push(build_compute_budget_ix(1_400_000));
-    ixs.push(build_create_pool(&owner_pk, &pool_pda, &pool_uuid));
-    for (d, rid) in drts.iter().zip(right_ids.iter()) {
+    ixs.push(build_create_pool(owner, pool_pda, pool_uuid));
+    for (d, rid) in drts {
         ixs.push(
             build_register_drt(
-                &owner_pk,
-                &pool_pda,
-                &owner_pk,
+                owner,
+                pool_pda,
+                owner,
                 rid,
                 &d.code_repo_url,
                 &d.code_hash,
@@ -209,58 +171,8 @@ async fn create_pool_atomic(
             .map_err(ApiError::internal)?,
         );
     }
-    ixs.push(build_seal_pool(&owner_pk, &pool_pda));
-
-    let sig = sign_and_send(state, owner_keypair, ixs, "confirmed").await?;
-
-    Ok(CreatedPool {
-        pool_pda,
-        pool_uuid,
-        signatures: vec![sig],
-        drts: drt_records,
-    })
-}
-
-/// What a new pool's document records beyond its on-chain state.
-struct NewPool<'a> {
-    pool_pda: &'a str,
-    pool_name: &'a str,
-    pool_uuid_hex: &'a str,
-    drts: BTreeMap<String, DrtMetadata>,
-    owner: &'a WalletMetadata,
-    schema_id: String,
-    schema: Vec<FieldSchema>,
-    created_by: &'a str,
-    creation_signature: String,
-}
-
-/// Store a newly created pool's document.
-async fn persist_pool(state: &AppState, new: NewPool<'_>) -> Result<PoolDoc, ApiError> {
-    let doc = PoolDoc {
-        pool_pda: new.pool_pda.to_string(),
-        pool_name: new.pool_name.to_string(),
-        kind: PoolKind::Malta,
-        pool_uuid_hex: new.pool_uuid_hex.to_string(),
-        drts: new.drts,
-        owner_wallet_id: new.owner.wallet_id.clone(),
-        owner_pubkey: new.owner.public_address.clone(),
-        schema_id: new.schema_id,
-        schema: new.schema,
-        validation_mode: crate::data_validation::ValidationMode::HeadersOnly,
-        created_by: new.created_by.to_string(),
-        created_at: chrono::Utc::now(),
-        creation_signature: new.creation_signature,
-        initial: None,
-        issuances: Vec::new(),
-        revocations: Vec::new(),
-    };
-    match state.storage.pools().create(&doc).await? {
-        Created::New(_) => Ok(doc),
-        Created::AlreadyExists => Err(ApiError::conflict(format!(
-            "pool {} already has a document",
-            doc.pool_pda
-        ))),
-    }
+    ixs.push(build_seal_pool(owner, pool_pda));
+    Ok(ixs)
 }
 
 // ============================================================================
@@ -268,27 +180,42 @@ async fn persist_pool(state: &AppState, new: NewPool<'_>) -> Result<PoolDoc, Api
 // ============================================================================
 
 /// Create a MALTA pool (CSV-driven, schema required).
+///
+/// The pool's UUID, and so its PDA, derives from the caller and the
+/// `Idempotency-Key`. The pool document is staged first; the creating
+/// transaction follows the stored-transaction rule, so a retry never creates
+/// a second pool; then the document is written with the creation signature.
 #[utoipa::path(
     post,
     path = "/v1/drt/pools/malta",
     tag = "DRT Pools",
     summary = "Create MALTA pool",
-    description = "Atomically: create_pool + register_drt × N (always includes 'append') + seal_pool, then persist the inline schema.",
+    description = "Atomically: create_pool + register_drt × N (always includes 'append') + seal_pool, then store the pool's document with its inline schema. Idempotent: retries with the same Idempotency-Key create one pool.",
     security(("bearer_auth" = [])),
+    params(
+        ("Idempotency-Key" = String, Header, description = "A UUID naming this user action; reuse it on every retry"),
+    ),
     request_body = CreateMaltaPoolRequest,
     responses(
         (status = 201, description = "Pool created", body = CreatePoolResponse),
-        (status = 400, description = "Validation error"),
+        (status = 400, description = "Validation error, or no Idempotency-Key"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden"),
+        (status = 422, description = "The Idempotency-Key was used for a different request"),
         (status = 503, description = "RPC unavailable"),
     )
 )]
 pub async fn create_malta_pool(
     AdminToken(token): AdminToken,
+    request: Idempotent,
     State(state): State<AppState>,
-    Json(payload): Json<CreateMaltaPoolRequest>,
-) -> Result<(axum::http::StatusCode, Json<CreatePoolResponse>), ApiError> {
+    JsonBody {
+        value: payload,
+        bytes,
+    }: JsonBody<CreateMaltaPoolRequest>,
+) -> Result<Response, ApiError> {
+    let mut op = open_or_replay!(state, &token.sub, request, &bytes);
+
     validate_pool_name(&payload.pool_name)?;
     let resolved = validate_drt_requests(&payload.drts)?;
     if !resolved.iter().any(|d| d.name == APPEND_DRT_NAME) {
@@ -296,63 +223,122 @@ pub async fn create_malta_pool(
             "MALTA pools must include the 'append' DRT",
         ));
     }
-    let (schema_id, fields) = parse_schema(&payload.schema)?;
-
+    let pool_uuid = ids::pool_uuid(&token.sub, &request.key);
+    let (schema_id, fields) = parse_schema(&payload.schema, &pool_uuid)?;
     let (wallet, keypair) = load_wallet_keypair(&state, &payload.wallet_id, &token.sub).await?;
 
-    let created = create_pool_atomic(&state, &keypair, &resolved).await?;
+    let (pool_pda, _bump) = derive_pool_pda(&pool_uuid);
+    let pool_pda_str = pool_pda.to_string();
+    let drts: Vec<(ResolvedDrt, [u8; 16])> = resolved
+        .into_iter()
+        .map(|d| {
+            let rid = ids::right_id(&pool_uuid, &d.name);
+            (d, rid)
+        })
+        .collect();
+    let drt_records: BTreeMap<String, DrtMetadata> = drts
+        .iter()
+        .map(|(d, rid)| {
+            let (mint_pda, _) = derive_mint_pda(&pool_pda, rid);
+            (
+                d.name.clone(),
+                DrtMetadata {
+                    right_id_hex: hex::encode(rid),
+                    mint: mint_pda.to_string(),
+                    supply: d.supply,
+                    code_repo_url: d.code_repo_url.clone(),
+                    code_hash_hex: hex::encode(d.code_hash),
+                },
+            )
+        })
+        .collect();
+    let now = chrono::Utc::now();
+    let doc = PoolDoc {
+        pool_pda: pool_pda_str.clone(),
+        pool_name: payload.pool_name.clone(),
+        kind: PoolKind::Malta,
+        pool_uuid_hex: hex::encode(pool_uuid),
+        drts: drt_records,
+        owner_wallet_id: wallet.wallet_id.clone(),
+        owner_pubkey: wallet.public_address.clone(),
+        schema_id,
+        schema: fields,
+        validation_mode: crate::data_validation::ValidationMode::HeadersOnly,
+        created_by: token.sub.clone(),
+        created_at: now,
+        creation_signature: String::new(),
+        initial: None,
+        issuances: Vec::new(),
+        revocations: Vec::new(),
+    };
 
-    let pool_pda_str = created.pool_pda.to_string();
-    let pool_uuid_hex = hex::encode(created.pool_uuid);
-    let final_sig = created.signatures.last().cloned().unwrap_or_default();
+    // ── STAGE, then CREATE ON-CHAIN, then WRITE THE DOCUMENT ─────────
+    op.begin().await?;
+    let staged = state
+        .storage
+        .sagas()
+        .stage(
+            &format!("pool-{pool_pda_str}"),
+            Staged {
+                record: op.record_path().to_string(),
+                staged_at: now,
+                saga: Saga::Pool {
+                    pool: Box::new(doc),
+                },
+            },
+        )
+        .await?;
+    let Saga::Pool { pool } = staged.saga else {
+        return Err(ApiError::internal("another saga is staged under this pool"));
+    };
+    let mut doc = *pool;
 
-    let meta = persist_pool(
-        &state,
-        NewPool {
-            pool_pda: &pool_pda_str,
-            pool_name: &payload.pool_name,
-            pool_uuid_hex: &pool_uuid_hex,
-            drts: created.drts.clone(),
-            owner: &wallet,
-            schema_id: schema_id.clone(),
-            schema: fields,
-            created_by: &token.sub,
-            creation_signature: final_sig.clone(),
-        },
+    let owner = keypair.pubkey();
+    let ixs = pool_instructions(&owner, &pool_pda, &pool_uuid, &drts)?;
+    let signature = chain::run(
+        &state.solana_client,
+        &mut op,
+        &Effect::Account(pool_pda),
+        "confirmed",
+        signed(&keypair, &ixs),
     )
     .await?;
+    audit::pool(&pool_pda_str);
+    audit::signature(&signature);
+
+    doc.creation_signature = signature.clone();
+    let doc = match state.storage.pools().create(&doc).await? {
+        Created::New(_) => doc,
+        Created::AlreadyExists => load_pool(&state, &pool_pda_str).await?,
+    };
 
     info!(
-        signature = %final_sig,
+        signature = %doc.creation_signature,
         pool = %pool_pda_str,
         owner = %wallet.public_address,
-        drts = meta.drts.len(),
-        schema = %schema_id,
+        drts = doc.drts.len(),
+        schema = %doc.schema_id,
         "MALTA pool created"
     );
-    audit::pool(&pool_pda_str);
-    audit::signature(&final_sig);
 
-    Ok((
-        axum::http::StatusCode::CREATED,
-        Json(CreatePoolResponse {
-            signature: final_sig.clone(),
-            signatures: created.signatures,
-            pool_pda: pool_pda_str,
-            pool_uuid: pool_uuid_hex,
-            mints: created
-                .drts
-                .iter()
-                .map(|(n, m)| (n.clone(), m.mint.clone()))
-                .collect(),
-            right_ids: created
-                .drts
-                .iter()
-                .map(|(n, m)| (n.clone(), m.right_id_hex.clone()))
-                .collect(),
-            explorer_url: explorer_url(&state, &final_sig),
-        }),
-    ))
+    let response = CreatePoolResponse {
+        signature: doc.creation_signature.clone(),
+        signatures: vec![doc.creation_signature.clone()],
+        pool_pda: pool_pda_str,
+        pool_uuid: doc.pool_uuid_hex.clone(),
+        mints: doc
+            .drts
+            .iter()
+            .map(|(n, m)| (n.clone(), m.mint.clone()))
+            .collect(),
+        right_ids: doc
+            .drts
+            .iter()
+            .map(|(n, m)| (n.clone(), m.right_id_hex.clone()))
+            .collect(),
+        explorer_url: explorer_url(&state, &doc.creation_signature),
+    };
+    op.finish(StatusCode::CREATED, &response).await
 }
 
 // ============================================================================
@@ -424,8 +410,8 @@ pub async fn get_pool(
 
 /// Fetch live on-chain `DrtConfig` for a registered DRT.
 ///
-/// Useful as a sanity check that the enclave's cached `pool_meta.drts[name]`
-/// matches what's actually on chain.
+/// Useful as a sanity check that the pool document's `drts[name]` matches
+/// what's actually on chain.
 #[utoipa::path(
     get,
     path = "/v1/drt/pools/{pool_pda}/drt/{drt_name}",

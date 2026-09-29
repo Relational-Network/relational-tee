@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Relational Network
 
-//! SPL token balance queries and transfers.
+//! SPL token transfers.
 //!
 //! Inline implementations of ATA derivation, ATA creation, and
 //! `TransferChecked` instruction building — replaces the heavy
@@ -9,15 +9,11 @@
 //! crates with ~40 lines of deterministic instruction construction.
 
 use solana_instruction::{AccountMeta, Instruction};
-use solana_keypair::Keypair;
 use solana_pubkey::Pubkey;
-use solana_signer::Signer;
 use std::str::FromStr;
 use std::sync::OnceLock;
-use tracing::info;
 
 use super::client::SolanaClient;
-use super::types::SendResult;
 use crate::error::ApiError;
 
 // ── Well-known program IDs ──────────────────────────────────────────
@@ -109,26 +105,22 @@ fn transfer_checked_instruction(
 // ── SolanaClient impl ───────────────────────────────────────────────
 
 impl SolanaClient {
-    /// Send SPL tokens from `keypair` to `recipient`.
-    pub async fn send_spl_token(
+    /// The instructions for an SPL transfer from `owner` to `recipient`,
+    /// creating the recipient's token account first if it doesn't exist.
+    pub async fn spl_transfer(
         &self,
-        keypair: &Keypair,
-        recipient: &str,
+        owner: &Pubkey,
+        recipient: &Pubkey,
         mint_address: &str,
         amount: u64,
         decimals: u8,
-    ) -> Result<SendResult, ApiError> {
-        let to_pubkey = Pubkey::from_str(recipient)
-            .map_err(|_| ApiError::unprocessable(format!("invalid recipient: {recipient}")))?;
+    ) -> Result<Vec<Instruction>, ApiError> {
         let mint = Pubkey::from_str(mint_address)
             .map_err(|_| ApiError::unprocessable("invalid mint address"))?;
-
-        let from_ata = get_associated_token_address(&keypair.pubkey(), &mint);
-        let to_ata = get_associated_token_address(&to_pubkey, &mint);
+        let from_ata = get_associated_token_address(owner, &mint);
+        let to_ata = get_associated_token_address(recipient, &mint);
 
         let mut instructions = Vec::new();
-
-        // Create ATA for recipient if it doesn't exist.
         let to_ata_exists = self
             .rpc
             .get_account_data(&to_ata)
@@ -136,42 +128,11 @@ impl SolanaClient {
             .map(|opt| opt.is_some())
             .unwrap_or(false);
         if !to_ata_exists {
-            instructions.push(create_ata_instruction(&keypair.pubkey(), &to_pubkey, &mint));
+            instructions.push(create_ata_instruction(owner, recipient, &mint));
         }
-
-        // SPL transfer instruction.
         instructions.push(transfer_checked_instruction(
-            &from_ata,
-            &mint,
-            &to_ata,
-            &keypair.pubkey(),
-            amount,
-            decimals,
+            &from_ata, &mint, &to_ata, owner, amount, decimals,
         ));
-
-        let recent_blockhash = self
-            .rpc
-            .get_latest_blockhash()
-            .await
-            .map_err(|e| ApiError::rpc_unavailable(format!("blockhash fetch failed: {e}")))?;
-
-        let message = solana_message::Message::new(&instructions, Some(&keypair.pubkey()));
-        let tx = solana_transaction::Transaction::new(&[keypair], message, recent_blockhash);
-
-        let signature = self
-            .rpc
-            .send_transaction(&tx)
-            .await
-            .map_err(|e| ApiError::rpc_unavailable(format!("SPL transfer send failed: {e}")))?;
-
-        self.await_confirmation(&signature, "confirmed").await?;
-
-        let sig_str = signature.to_string();
-        info!(signature = %sig_str, to = %recipient, mint = %mint_address, amount, "SPL transfer sent");
-
-        Ok(SendResult {
-            explorer_url: self.network.explorer_tx_url(&sig_str),
-            signature: sig_str,
-        })
+        Ok(instructions)
     }
 }

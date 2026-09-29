@@ -12,6 +12,8 @@
 
 use axum::{
     extract::{Path, Query, State},
+    http::StatusCode,
+    response::Response,
     Json,
 };
 use serde::Serialize;
@@ -20,6 +22,7 @@ use utoipa::ToSchema;
 
 use crate::auth::AdminToken;
 use crate::error::ApiError;
+use crate::idempotency::{Idempotent, Operation};
 use crate::state::AppState;
 use crate::storage::wallets::{WalletResponse, WalletStatus};
 
@@ -71,6 +74,7 @@ pub struct WalletStatusChangeResponse {
 /// there counts as success).
 async fn set_status(
     state: &AppState,
+    op: &mut Operation<'_>,
     wallet_id: &str,
     status: WalletStatus,
     action: &str,
@@ -81,6 +85,7 @@ async fn set_status(
             "cannot {action} a deleted wallet"
         )));
     }
+    op.begin().await?;
     state
         .storage
         .wallets()
@@ -182,20 +187,32 @@ pub async fn list_all_wallets(
     security(("bearer_auth" = [])),
     params(
         ("wallet_id" = String, Path, description = "Wallet UUID"),
+        ("Idempotency-Key" = String, Header, description = "A UUID naming this user action; reuse it on every retry"),
     ),
     responses(
         (status = 200, description = "Wallet suspended", body = WalletStatusChangeResponse),
+        (status = 400, description = "Deleted wallet, or no Idempotency-Key"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Admin role required"),
         (status = 404, description = "Wallet not found"),
+        (status = 422, description = "The Idempotency-Key was used for a different request"),
     )
 )]
 pub async fn suspend_wallet(
     AdminToken(token): AdminToken,
+    request: Idempotent,
     State(state): State<AppState>,
     Path(wallet_id): Path<String>,
-) -> Result<Json<WalletStatusChangeResponse>, ApiError> {
-    set_status(&state, &wallet_id, WalletStatus::Suspended, "suspend").await?;
+) -> Result<Response, ApiError> {
+    let mut op = open_or_replay!(state, &token.sub, request, b"");
+    set_status(
+        &state,
+        &mut op,
+        &wallet_id,
+        WalletStatus::Suspended,
+        "suspend",
+    )
+    .await?;
 
     info!(
         wallet_id = %wallet_id,
@@ -203,10 +220,14 @@ pub async fn suspend_wallet(
         "Wallet suspended by admin"
     );
 
-    Ok(Json(WalletStatusChangeResponse {
-        wallet_id,
-        new_status: "suspended".to_string(),
-    }))
+    op.finish(
+        StatusCode::OK,
+        &WalletStatusChangeResponse {
+            wallet_id,
+            new_status: "suspended".to_string(),
+        },
+    )
+    .await
 }
 
 /// Reactivate a suspended wallet (admin action).
@@ -219,20 +240,32 @@ pub async fn suspend_wallet(
     security(("bearer_auth" = [])),
     params(
         ("wallet_id" = String, Path, description = "Wallet UUID"),
+        ("Idempotency-Key" = String, Header, description = "A UUID naming this user action; reuse it on every retry"),
     ),
     responses(
         (status = 200, description = "Wallet activated", body = WalletStatusChangeResponse),
+        (status = 400, description = "Deleted wallet, or no Idempotency-Key"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Admin role required"),
         (status = 404, description = "Wallet not found"),
+        (status = 422, description = "The Idempotency-Key was used for a different request"),
     )
 )]
 pub async fn activate_wallet(
     AdminToken(token): AdminToken,
+    request: Idempotent,
     State(state): State<AppState>,
     Path(wallet_id): Path<String>,
-) -> Result<Json<WalletStatusChangeResponse>, ApiError> {
-    set_status(&state, &wallet_id, WalletStatus::Active, "activate").await?;
+) -> Result<Response, ApiError> {
+    let mut op = open_or_replay!(state, &token.sub, request, b"");
+    set_status(
+        &state,
+        &mut op,
+        &wallet_id,
+        WalletStatus::Active,
+        "activate",
+    )
+    .await?;
 
     info!(
         wallet_id = %wallet_id,
@@ -240,8 +273,12 @@ pub async fn activate_wallet(
         "Wallet activated by admin"
     );
 
-    Ok(Json(WalletStatusChangeResponse {
-        wallet_id,
-        new_status: "active".to_string(),
-    }))
+    op.finish(
+        StatusCode::OK,
+        &WalletStatusChangeResponse {
+            wallet_id,
+            new_status: "active".to_string(),
+        },
+    )
+    .await
 }

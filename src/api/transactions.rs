@@ -12,10 +12,13 @@
 
 use axum::{
     extract::{Path, Query, State},
+    http::StatusCode,
+    response::Response,
     Json,
 };
 use serde::{Deserialize, Serialize};
 use solana_pubkey::Pubkey;
+use solana_signer::Signer;
 use std::str::FromStr;
 use tracing::info;
 use utoipa::{IntoParams, ToSchema};
@@ -23,10 +26,14 @@ use utoipa::{IntoParams, ToSchema};
 use crate::audit;
 use crate::auth::UserToken;
 use crate::blockchain::signing::keypair_from_bytes_verified;
+use crate::blockchain::transactions::native_transfer;
+use crate::chain::{self, Effect};
 use crate::error::ApiError;
 use crate::history::{WalletRef, WalletTransaction};
+use crate::idempotency::{Idempotent, JsonBody};
 use crate::state::AppState;
 
+use super::pools::signed;
 use super::{enforce_owner_active, load_wallet};
 
 // ============================================================================
@@ -158,37 +165,46 @@ pub async fn estimate_fee(
 }
 
 /// Sign and broadcast a transaction from the wallet.
+///
+/// The transfer follows the stored-transaction rule, so retries with the
+/// same `Idempotency-Key` send it at most once.
 #[utoipa::path(
     post,
     path = "/v1/wallets/{wallet_id}/send",
     tag = "Transactions",
     summary = "Send transaction",
-    description = "Sign a transfer with the wallet's private key (inside the worker) and broadcast to Solana.",
+    description = "Sign a transfer with the wallet's private key (inside the worker) and broadcast to Solana. Idempotent: retries with the same Idempotency-Key send one transfer.",
     security(("bearer_auth" = [])),
     params(
         ("wallet_id" = String, Path, description = "Wallet UUID"),
+        ("Idempotency-Key" = String, Header, description = "A UUID naming this user action; reuse it on every retry"),
     ),
     request_body = SendTransactionRequest,
     responses(
         (status = 200, description = "Transaction sent", body = SendTransactionResponse),
+        (status = 400, description = "Invalid request, or no Idempotency-Key"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden"),
         (status = 404, description = "Wallet not found"),
-        (status = 422, description = "Invalid address or amount"),
+        (status = 422, description = "Invalid address or amount, or the Idempotency-Key was used for a different request"),
         (status = 503, description = "RPC unavailable"),
     )
 )]
 pub async fn send_transaction(
     UserToken(token): UserToken,
+    request: Idempotent,
     State(state): State<AppState>,
     Path(wallet_id): Path<String>,
-    Json(payload): Json<SendTransactionRequest>,
-) -> Result<Json<SendTransactionResponse>, ApiError> {
+    JsonBody {
+        value: payload,
+        bytes,
+    }: JsonBody<SendTransactionRequest>,
+) -> Result<Response, ApiError> {
+    let mut op = open_or_replay!(state, &token.sub, request, &bytes);
     let wallet = load_wallet(&state, &wallet_id).await?;
     enforce_owner_active(&wallet, &token.sub)?;
 
-    // Validate recipient.
-    let _ = Pubkey::from_str(&payload.recipient)
+    let recipient = Pubkey::from_str(&payload.recipient)
         .map_err(|_| ApiError::unprocessable("invalid recipient address"))?;
 
     if payload.amount == 0 {
@@ -198,19 +214,17 @@ pub async fn send_transaction(
     // Load keypair (never leaves the worker) and verify it matches the wallet.
     let keypair_bytes = state.storage.wallets().read_keypair(&wallet_id).await?;
     let keypair = keypair_from_bytes_verified(&keypair_bytes, &wallet.public_address)?;
+    let owner = keypair.pubkey();
 
-    let result = if payload.token == "native" {
-        state
-            .solana_client
-            .send_native(&keypair, &payload.recipient, payload.amount)
-            .await?
+    let instructions = if payload.token == "native" {
+        native_transfer(&owner, &recipient, payload.amount)
     } else if let Some(mint) = payload.token.strip_prefix("spl:") {
         let decimals = payload
             .decimals
             .ok_or_else(|| ApiError::bad_request("decimals required for SPL transfers"))?;
         state
             .solana_client
-            .send_spl_token(&keypair, &payload.recipient, mint, payload.amount, decimals)
+            .spl_transfer(&owner, &recipient, mint, payload.amount, decimals)
             .await?
     } else {
         return Err(ApiError::bad_request(
@@ -218,22 +232,33 @@ pub async fn send_transaction(
         ));
     };
 
+    op.begin().await?;
+    let signature = chain::run(
+        &state.solana_client,
+        &mut op,
+        &Effect::Transfer,
+        "confirmed",
+        signed(&keypair, &instructions),
+    )
+    .await?;
+
     info!(
         wallet_id = %wallet_id,
-        signature = %result.signature,
+        signature = %signature,
         recipient = %payload.recipient,
         amount = payload.amount,
         "Transaction sent"
     );
-    audit::signature(&result.signature);
+    audit::signature(&signature);
     state.history.invalidate(&wallet.public_address);
     state.history.invalidate(&payload.recipient);
 
-    Ok(Json(SendTransactionResponse {
-        signature: result.signature,
-        explorer_url: result.explorer_url,
+    let response = SendTransactionResponse {
+        explorer_url: state.solana_client.network().explorer_tx_url(&signature),
+        signature,
         wallet_id,
-    }))
+    };
+    op.finish(StatusCode::OK, &response).await
 }
 
 /// List transaction history for a wallet.

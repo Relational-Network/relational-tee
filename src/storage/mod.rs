@@ -10,6 +10,8 @@
 //!   `owners/{user_id}.json`, the user's current wallet ([`wallets`]).
 //! - `identities/{h(tid ‖ oid)}.json` and `identities/email/{h(email)}.json`
 //!   ([`identities`]).
+//! - `staged/{op_id}.json`: in-flight chain sagas ([`staged`]), and
+//!   `idempotency/…`, the idempotency records ([`crate::idempotency`]).
 //! - `canary/{worker_id}`: the readiness canary.
 //!
 //! Every object is sealed inside the worker ([`crate::store::sealed`]), and
@@ -26,6 +28,7 @@ use crate::store::{valid_segment, ObjectStore, Replaced, STATE};
 
 pub mod identities;
 pub mod pools;
+pub mod staged;
 pub mod wallets;
 
 pub use crate::store::sealed::{Change, StorageKeys};
@@ -64,6 +67,10 @@ impl Storage {
 
     pub fn wallets(&self) -> wallets::Wallets<'_> {
         wallets::Wallets::new(self)
+    }
+
+    pub fn sagas(&self) -> staged::Sagas<'_> {
+        staged::Sagas::new(self)
     }
 
     #[cfg_attr(
