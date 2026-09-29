@@ -1581,10 +1581,8 @@ pub async fn list_all_pools(
     // Sort.
     match query.sort.as_str() {
         "created_asc" => entries.sort_by(|a, b| a.created_at.cmp(&b.created_at)),
-        "name_asc" => {
-            entries.sort_by(|a, b| a.pool_name.to_lowercase().cmp(&b.pool_name.to_lowercase()))
-        }
-        "credentials_desc" => entries.sort_by(|a, b| b.total_rows.cmp(&a.total_rows)),
+        "name_asc" => entries.sort_by_key(|a| a.pool_name.to_lowercase()),
+        "credentials_desc" => entries.sort_by_key(|a| std::cmp::Reverse(a.total_rows)),
         _ => entries.sort_by(|a, b| b.created_at.cmp(&a.created_at)), // created_desc
     }
 
