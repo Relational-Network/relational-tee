@@ -1065,7 +1065,7 @@ mod tests {
     fn fresh_db() -> (TxDatabase, std::path::PathBuf) {
         let mut path = std::env::temp_dir();
         let unique = format!(
-            "relational-sdk-test-{}-{}.redb",
+            "relational-tee-test-{}-{}.redb",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

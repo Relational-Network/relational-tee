@@ -22,7 +22,7 @@ use rustls::{ClientConfig, RootCertStore};
 use serde::{de::DeserializeOwned, Serialize};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
-const USER_AGENT: &str = concat!("relational-sdk/", env!("CARGO_PKG_VERSION"));
+const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 
 type HyperClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, Full<Bytes>>;
 

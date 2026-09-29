@@ -6,7 +6,7 @@
 //!
 //! ## Host ABI (zero-copy contract)
 //!
-//! The enclave runtime (`relational-sdk/src/drt/runtime.rs`) places the CSV
+//! The enclave runtime (`relational-tee/src/drt/runtime.rs`) places the CSV
 //! and the args JSON directly into this module's linear memory before
 //! invoking `run`. No host calls are needed during execution beyond the
 //! optional `host_log` diagnostic.

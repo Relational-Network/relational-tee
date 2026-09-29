@@ -1,4 +1,6 @@
-# Relational-SDK
+# Relational-TEE
+
+> Imported from `relational-sdk` and being migrated from Gramine SGX to Azure Confidential Containers. Until the migration lands, the rest of this README describes the SGX server as imported.
 
 SGX enclave server with RA-TLS, JWT validation, and role-based access control (RBAC).
 

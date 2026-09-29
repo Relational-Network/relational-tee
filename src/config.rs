@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Relational Network
 
-//! Configuration constants for the relational-sdk enclave service.
+//! Configuration constants for the relational-tee enclave service.
 //!
 //! Non-sensitive values are hardcoded here. Only values that **must** differ
 //! between environments use `env::var` with a default fallback.
@@ -131,7 +131,7 @@ pub const NONCE_PURGE_INTERVAL_SECS: u64 = 900;
 
 /// DRT program ID on Solana (devnet). Hardcoded — change and rebuild to update.
 /// Canonical: `digital_rights_tokens` Anchor program. IDL lives at
-/// `relational-sdk/idl/digital_rights_tokens.json`.
+/// `idl/digital_rights_tokens.json`.
 pub const DRT_PROGRAM_ID_STR: &str = "8N5hVnK81rWhwfhxt9LfjrbeVT83Jjgy4dKyy4q6HKjk";
 
 /// Get the DRT program `Pubkey` (parsed from the hardcoded constant).
