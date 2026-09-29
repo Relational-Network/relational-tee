@@ -52,13 +52,12 @@ pub fn mainnet_config(rpc_url: &str) -> NetworkConfig {
     }
 }
 
-/// Build a NetworkConfig from the hardcoded config constants.
+/// Build a NetworkConfig from `SOLANA_RPC_URL` and `SOLANA_NETWORK`.
 pub fn network_config_from_env() -> NetworkConfig {
-    let rpc_url = crate::config::SOLANA_RPC_URL;
-    let network = crate::config::SOLANA_NETWORK;
-    match network {
-        "mainnet" | "mainnet-beta" => mainnet_config(rpc_url),
-        _ => devnet_config(rpc_url),
+    let rpc_url = crate::config::solana_rpc_url();
+    match crate::config::solana_network().as_str() {
+        "mainnet" | "mainnet-beta" => mainnet_config(&rpc_url),
+        _ => devnet_config(&rpc_url),
     }
 }
 

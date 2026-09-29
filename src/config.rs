@@ -132,9 +132,8 @@ impl ServerConfig {
 // TODO: Solana's public devnet RPC is rate-limited and has no SLA. Switch to a
 // paid provider before production, keeping its API key out of the CCE policy,
 // which is public.
-/// Solana RPC endpoint. Hardcoded to devnet.
-/// To switch to mainnet, change this constant and rebuild.
-pub const SOLANA_RPC_URL: &str = "https://api.devnet.solana.com";
+/// Default Solana RPC endpoint. Override with `SOLANA_RPC_URL`.
+pub const DEFAULT_SOLANA_RPC_URL: &str = "https://api.devnet.solana.com";
 
 /// Solana's public RPC endpoints. They are rate-limited and have no SLA, so the
 /// server warns at startup when `SOLANA_RPC_URL` is one of them.
@@ -144,8 +143,25 @@ pub const PUBLIC_SOLANA_RPC_URLS: &[&str] = &[
     "https://api.mainnet-beta.solana.com",
 ];
 
-/// Solana network name. Hardcoded to devnet.
-pub const SOLANA_NETWORK: &str = "devnet";
+/// Default Solana network name. Override with `SOLANA_NETWORK` (`devnet` or
+/// `mainnet`).
+pub const DEFAULT_SOLANA_NETWORK: &str = "devnet";
+
+/// Solana RPC endpoint from `SOLANA_RPC_URL`, or the devnet default.
+pub fn solana_rpc_url() -> String {
+    env::var("SOLANA_RPC_URL")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| DEFAULT_SOLANA_RPC_URL.to_string())
+}
+
+/// Solana network name from `SOLANA_NETWORK`, or the devnet default.
+pub fn solana_network() -> String {
+    env::var("SOLANA_NETWORK")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| DEFAULT_SOLANA_NETWORK.to_string())
+}
 
 // ============================================================================
 // Background Indexer
