@@ -175,7 +175,7 @@ pub async fn estimate_fee(
     path = "/v1/wallets/{wallet_id}/send",
     tag = "Transactions",
     summary = "Send transaction",
-    description = "Sign a transfer with the wallet's private key (inside SGX) and broadcast to Solana.",
+    description = "Sign a transfer with the wallet's private key (inside the worker) and broadcast to Solana.",
     security(("bearer_auth" = [])),
     params(
         ("wallet_id" = String, Path, description = "Wallet UUID"),
@@ -208,7 +208,7 @@ pub async fn send_transaction(
         return Err(ApiError::bad_request("amount must be greater than zero"));
     }
 
-    // Load keypair (never leaves SGX memory) and verify it matches the wallet.
+    // Load keypair (never leaves the worker) and verify it matches the wallet.
     let keypair_bytes = repo.read_keypair(&wallet_id)?;
     let keypair = keypair_from_bytes_verified(&keypair_bytes, &wallet.public_address)?;
 

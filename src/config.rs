@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Relational Network
 
-//! Configuration constants for the relational-tee enclave service.
+//! Configuration for the relational-tee worker.
 //!
 //! Non-sensitive values are hardcoded here. Only values that **must** differ
 //! between environments use `env::var` with a default fallback.
 
 use std::env;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
 
 // ============================================================================
 // Auth (AVS JWT)
@@ -31,41 +33,97 @@ pub const AVS_ISSUER: &str = "attestation-verification-service";
 pub const JWKS_CACHE_TTL_SECS: u64 = 300;
 
 // ============================================================================
-// TLS (RA-TLS)
-// ============================================================================
-
-/// Fixed RA-TLS certificate location written by gramine-ratls (tmpfs).
-pub const DEFAULT_TLS_CERT_PATH: &str = "/tmp/ra-tls.crt.pem";
-
-/// Fixed RA-TLS key location written by gramine-ratls (tmpfs).
-pub const DEFAULT_TLS_KEY_PATH: &str = "/tmp/ra-tls.key.pem";
-
-// ============================================================================
 // Server
 // ============================================================================
 
-/// Bind address for the HTTPS server.
-///
-/// Defaults to loopback. The enclave must only be reached via the Caddy
-/// reverse proxy in production. Any deployment that binds the enclave to a
-/// public interface bypasses the edge security controls (TLS termination,
-/// CORS, future rate limiting). Override would require a code change
-/// (intentional — the manifest also pins this).
-pub const SERVER_HOST: [u8; 4] = [127, 0, 0, 1];
+/// Default listening port for HTTPS in the worker.
+pub const DEFAULT_PORT: u16 = 8443;
 
-/// Port for the HTTPS server.
-pub const SERVER_PORT: u16 = 8080;
+/// Default bind address. Dev builds listen on loopback because they may serve
+/// plain HTTP; release builds run in a container behind the load balancer.
+#[cfg(feature = "dev")]
+pub const DEFAULT_BIND_ADDR: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+#[cfg(not(feature = "dev"))]
+pub const DEFAULT_BIND_ADDR: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+
+/// Default storage directory.
+#[cfg(feature = "dev")]
+pub const DEFAULT_DATA_DIR: &str = "data";
+#[cfg(not(feature = "dev"))]
+pub const DEFAULT_DATA_DIR: &str = "/data";
 
 /// Maximum request body size (50 MiB).
 pub const MAX_BODY_SIZE: usize = 50 * 1024 * 1024;
 
-// ============================================================================
-// Storage
-// ============================================================================
+/// How the server speaks to clients.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Transport {
+    /// HTTPS with a PEM certificate chain and private key read from disk.
+    Tls {
+        cert_path: PathBuf,
+        key_path: PathBuf,
+    },
+    /// Plain HTTP. Not compiled into release builds.
+    #[cfg(feature = "dev")]
+    PlainHttp,
+}
 
-/// Encrypted data directory (Gramine mounts /data as encrypted FS).
-/// Hardcoded — the manifest always mounts encrypted FS at /data.
-pub const DATA_DIR: &str = "/data";
+/// Process configuration read once from the environment at startup.
+#[derive(Debug, Clone)]
+pub struct ServerConfig {
+    pub addr: SocketAddr,
+    pub data_dir: PathBuf,
+    pub transport: Transport,
+}
+
+impl ServerConfig {
+    /// Read `BIND_ADDR`, `PORT`, `DATA_DIR`, `TLS_CERT_PATH` and `TLS_KEY_PATH`.
+    pub fn from_env() -> Result<Self, String> {
+        Self::from_lookup(|key| env::var(key).ok().filter(|v| !v.is_empty()))
+    }
+
+    fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
+        let ip = match lookup("BIND_ADDR") {
+            Some(v) => v
+                .parse::<IpAddr>()
+                .map_err(|e| format!("BIND_ADDR {v:?} is not an IP address: {e}"))?,
+            None => DEFAULT_BIND_ADDR,
+        };
+        let port = match lookup("PORT") {
+            Some(v) => v
+                .parse::<u16>()
+                .map_err(|e| format!("PORT {v:?} is not a port number: {e}"))?,
+            None => DEFAULT_PORT,
+        };
+        let data_dir = PathBuf::from(lookup("DATA_DIR").unwrap_or_else(|| DEFAULT_DATA_DIR.into()));
+
+        let transport = match (lookup("TLS_CERT_PATH"), lookup("TLS_KEY_PATH")) {
+            (Some(cert), Some(key)) => Transport::Tls {
+                cert_path: cert.into(),
+                key_path: key.into(),
+            },
+            (None, None) => {
+                #[cfg(feature = "dev")]
+                {
+                    Transport::PlainHttp
+                }
+                #[cfg(not(feature = "dev"))]
+                {
+                    return Err("TLS_CERT_PATH and TLS_KEY_PATH are required: \
+                                release builds never serve plain HTTP"
+                        .into());
+                }
+            }
+            _ => return Err("set both TLS_CERT_PATH and TLS_KEY_PATH, or neither".into()),
+        };
+
+        Ok(Self {
+            addr: SocketAddr::new(ip, port),
+            data_dir,
+            transport,
+        })
+    }
+}
 
 // ============================================================================
 // Solana
@@ -147,10 +205,8 @@ pub fn drt_program_id() -> solana_pubkey::Pubkey {
 
 /// Whether plain HTTP is allowed for the JWKS URL.
 ///
-/// Hardcoded to `true` because the enclave and the AVS are co-located on
-/// localhost. In production the Caddy proxy terminates TLS externally.
-/// If a future deployment separates AVS onto a remote host, flip to `false`
-/// and rebuild.
+/// Hardcoded to `true` for a co-located AVS on localhost. Entra ID, which
+/// replaces the AVS, always serves its keys over HTTPS.
 pub const ALLOW_HTTP_JWKS: bool = true;
 
 /// Returns `true` when `url` is an `http://` URL whose host is the loopback
@@ -212,6 +268,63 @@ mod tests {
         assert!(!is_loopback_http_jwks(
             "http://example.com:8080/path?host=127.0.0.1"
         ));
+    }
+
+    fn config_from(vars: &[(&str, &str)]) -> Result<ServerConfig, String> {
+        ServerConfig::from_lookup(|key| {
+            vars.iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| v.to_string())
+        })
+    }
+
+    #[test]
+    fn server_config_reads_overrides() {
+        let config = config_from(&[
+            ("BIND_ADDR", "::1"),
+            ("PORT", "9443"),
+            ("DATA_DIR", "/var/lib/rt"),
+            ("TLS_CERT_PATH", "cert.pem"),
+            ("TLS_KEY_PATH", "key.pem"),
+        ])
+        .expect("valid config");
+        assert_eq!(config.addr, "[::1]:9443".parse().unwrap());
+        assert_eq!(config.data_dir, PathBuf::from("/var/lib/rt"));
+        assert_eq!(
+            config.transport,
+            Transport::Tls {
+                cert_path: "cert.pem".into(),
+                key_path: "key.pem".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn server_config_rejects_half_a_tls_pair_and_bad_values() {
+        assert!(config_from(&[("TLS_CERT_PATH", "cert.pem")]).is_err());
+        assert!(config_from(&[("TLS_KEY_PATH", "key.pem")]).is_err());
+        let tls = [("TLS_CERT_PATH", "c"), ("TLS_KEY_PATH", "k")];
+        assert!(config_from(&[tls[0], tls[1], ("PORT", "http")]).is_err());
+        assert!(config_from(&[tls[0], tls[1], ("BIND_ADDR", "localhost")]).is_err());
+    }
+
+    #[cfg(feature = "dev")]
+    #[test]
+    fn dev_build_defaults_to_plain_http_on_loopback() {
+        let config = config_from(&[]).expect("dev defaults");
+        assert_eq!(config.addr, "127.0.0.1:8443".parse().unwrap());
+        assert_eq!(config.data_dir, PathBuf::from("data"));
+        assert_eq!(config.transport, Transport::PlainHttp);
+    }
+
+    #[cfg(not(feature = "dev"))]
+    #[test]
+    fn release_build_requires_tls() {
+        assert!(config_from(&[]).is_err());
+        let config = config_from(&[("TLS_CERT_PATH", "c"), ("TLS_KEY_PATH", "k")])
+            .expect("release config with TLS");
+        assert_eq!(config.addr, "0.0.0.0:8443".parse().unwrap());
+        assert_eq!(config.data_dir, PathBuf::from("/data"));
     }
 
     #[test]

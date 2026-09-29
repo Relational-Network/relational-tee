@@ -422,7 +422,7 @@ fn count_csv_rows(csv_bytes: &[u8]) -> u64 {
 
 /// Upload a schema definition for a pool.
 ///
-/// Persists the schema to `/data/schemas/{schema_id}.json` so that subsequent
+/// Persists the schema to `{data_dir}/pools/{pool_pda}/schema.json` so that subsequent
 /// `/initialize` and `/issue` calls can validate CSV data against it.
 /// Must be called after on-chain pool creation and before `/initialize`.
 #[utoipa::path(
@@ -430,7 +430,7 @@ fn count_csv_rows(csv_bytes: &[u8]) -> u64 {
     path = "/v1/drt/pools/{pool_pda}/schema",
     tag = "Credentials",
     summary = "Upload schema for pool",
-    description = "Upload a CSV schema definition to the enclave. The schema is persisted under /data/schemas/ and used for CSV validation during pool initialization and credential issuance.",
+    description = "Upload a CSV schema definition for the pool. The schema is persisted with the pool and used for CSV validation during pool initialization and credential issuance.",
     security(("bearer_auth" = [])),
     params(
         ("pool_pda" = String, Path, description = "Pool PDA address (base58)"),
@@ -1417,7 +1417,7 @@ pub async fn pool_summary(
 
 /// List pools owned by a specific wallet.
 ///
-/// Scans the enclave's `/data/pools/` directory for pools where the
+/// Scans `{data_dir}/pools/` for pools where the
 /// `owner_wallet_id` matches. Enclave-side discovery only — no on-chain indexing.
 #[utoipa::path(
     get,
@@ -1485,7 +1485,7 @@ pub async fn list_pools_by_wallet(
 
 /// List all pools managed by the enclave (marketplace discovery).
 ///
-/// Scans `/data/pools/` and returns all pools with optional filtering,
+/// Scans `{data_dir}/pools/` and returns all pools with optional filtering,
 /// search, sorting, and pagination. Accessible by any authenticated user.
 #[utoipa::path(
     get,

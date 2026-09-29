@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-/// Encapsulates the `/data` directory structure.
+/// Encapsulates the `DATA_DIR` directory structure.
 #[derive(Debug, Clone)]
 pub struct StoragePaths {
     root: PathBuf,
@@ -19,80 +19,85 @@ impl StoragePaths {
         }
     }
 
-    /// Root data directory (`/data`).
+    /// Root data directory (`DATA_DIR`).
     pub fn root(&self) -> &Path {
         &self.root
     }
 
     // ── Wallets ──────────────────────────────────────────────────
 
-    /// `/data/wallets/`
+    /// `{data_dir}/wallets/`
     pub fn wallets_dir(&self) -> PathBuf {
         self.root.join("wallets")
     }
 
-    /// `/data/wallets/{wallet_id}/`
+    /// `{data_dir}/wallets/{wallet_id}/`
     pub fn wallet_dir(&self, wallet_id: &str) -> PathBuf {
         self.wallets_dir().join(wallet_id)
     }
 
-    /// `/data/wallets/{wallet_id}/meta.json`
+    /// `{data_dir}/wallets/{wallet_id}/meta.json`
     pub fn wallet_meta(&self, wallet_id: &str) -> PathBuf {
         self.wallet_dir(wallet_id).join("meta.json")
     }
 
-    /// `/data/wallets/{wallet_id}/keypair.json`
+    /// `{data_dir}/wallets/{wallet_id}/keypair.json`
     pub fn wallet_keypair(&self, wallet_id: &str) -> PathBuf {
         self.wallet_dir(wallet_id).join("keypair.json")
     }
 
     // ── Audit ────────────────────────────────────────────────────
 
-    /// `/data/audit/`
+    /// `{data_dir}/audit/`
     pub fn audit_dir(&self) -> PathBuf {
         self.root.join("audit")
     }
 
-    /// `/data/audit/{date}.jsonl` (e.g., `2026-02-24.jsonl`).
+    /// `{data_dir}/audit/{date}.jsonl` (e.g., `2026-02-24.jsonl`).
     pub fn audit_events_file(&self, date: &str) -> PathBuf {
         self.audit_dir().join(format!("{date}.jsonl"))
     }
 
+    /// `{data_dir}/audit/.hmac-key`
+    pub fn audit_hmac_key(&self) -> PathBuf {
+        self.audit_dir().join(".hmac-key")
+    }
+
     // ── Pools ─────────────────────────────────────────────────────
 
-    /// `/data/pools/`
+    /// `{data_dir}/pools/`
     pub fn pools_dir(&self) -> PathBuf {
         self.root.join("pools")
     }
 
-    /// `/data/pools/{pool_pda}/`
+    /// `{data_dir}/pools/{pool_pda}/`
     pub fn pool_dir(&self, pda: &str) -> PathBuf {
         self.pools_dir().join(pda)
     }
 
-    /// `/data/pools/{pool_pda}/dataset/`
+    /// `{data_dir}/pools/{pool_pda}/dataset/`
     pub fn pool_dataset_dir(&self, pda: &str) -> PathBuf {
         self.pool_dir(pda).join("dataset")
     }
 
-    /// `/data/pools/{pool_pda}/pool.meta.json`
+    /// `{data_dir}/pools/{pool_pda}/pool.meta.json`
     pub fn pool_meta(&self, pda: &str) -> PathBuf {
         self.pool_dir(pda).join("pool.meta.json")
     }
 
-    /// `/data/pools/{pool_pda}/revocations.jsonl`
+    /// `{data_dir}/pools/{pool_pda}/revocations.jsonl`
     pub fn pool_revocations(&self, pda: &str) -> PathBuf {
         self.pool_dir(pda).join("revocations.jsonl")
     }
 
-    /// `/data/pools/{pool_pda}/schema.json`
+    /// `{data_dir}/pools/{pool_pda}/schema.json`
     pub fn pool_schema(&self, pda: &str) -> PathBuf {
         self.pool_dir(pda).join("schema.json")
     }
 
     // ── Transaction DB ───────────────────────────────────────────
 
-    /// `/data/tx.redb`
+    /// `{data_dir}/tx.redb`
     pub fn tx_db_path(&self) -> PathBuf {
         self.root.join("tx.redb")
     }

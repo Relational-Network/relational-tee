@@ -1,16 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Relational Network
 
-//! Encrypted storage layer backed by Gramine's sealed filesystem.
+//! Local storage layer rooted at `DATA_DIR`.
 //!
-//! Gramine mounts `/data` as `type = "encrypted"` using AES-GCM with a key
-//! derived from the enclave signer identity (`_sgx_mrsigner`).  The Rust code
-//! uses **normal `std::fs`** — Gramine handles encryption transparently.
+//! Files are written with plain `std::fs` and are **not encrypted** on disk,
+//! so local storage holds synthetic data only, until it is replaced with
+//! envelope-encrypted Azure Blob and Table storage.
 //!
 //! # Layout
 //!
 //! ```text
-//! /data/
+//! {DATA_DIR}/
 //! ├── wallets/{wallet_id}/
 //! │   ├── meta.json
 //! │   └── keypair.json
@@ -23,6 +23,7 @@
 //! │   │   └── {uuid}.meta.json      # DatasetAnchor: sha256 + commitment + record_id
 //! │   └── revocations.jsonl
 //! ├── audit/
+//! │   ├── .hmac-key
 //! │   └── 2026-02-24.jsonl
 //! └── tx.redb
 //! ```

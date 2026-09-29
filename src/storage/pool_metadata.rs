@@ -46,7 +46,7 @@ pub struct DrtMetadata {
 }
 
 /// Enclave-side metadata for a DRT pool. Stored at
-/// `/data/pools/{pool_pda}/pool.meta.json`.
+/// `{data_dir}/pools/{pool_pda}/pool.meta.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PoolMetadata {
     /// Pool PDA (base58-encoded Solana address).

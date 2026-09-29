@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Relational Network
 
-//! Encrypted filesystem adapter.
+//! Local filesystem adapter.
 //!
-//! Gramine handles all encryption transparently — this module just provides
-//! structured JSON + raw I/O with atomic writes (write-to-temp then rename).
+//! Structured JSON + raw I/O with atomic writes (write-to-temp then rename).
+//! Files are plaintext on disk until envelope-encrypted Azure Storage
+//! replaces this module.
 
 use serde::{de::DeserializeOwned, Serialize};
 use std::fs;
@@ -78,17 +79,14 @@ impl From<StorageError> for crate::error::ApiError {
 /// Result alias for storage operations.
 pub type StorageResult<T> = Result<T, StorageError>;
 
-/// Encrypted storage backed by Gramine's sealed filesystem.
-///
-/// All file operations are normal `std::fs` calls — Gramine encrypts at the
-/// block layer transparently.
+/// Storage rooted at the configured data directory, using plain `std::fs`.
 pub struct EncryptedStorage {
     paths: StoragePaths,
 }
 
 impl EncryptedStorage {
-    /// Create storage at the given root directory (e.g., `/data`).
-    pub fn new(data_dir: &str) -> Self {
+    /// Create storage at the given root directory.
+    pub fn new(data_dir: impl AsRef<Path>) -> Self {
         Self {
             paths: StoragePaths::new(data_dir),
         }
@@ -157,11 +155,8 @@ impl EncryptedStorage {
     // ── File / directory helpers ───────────────────────────────────
 
     /// Check if a path exists.
-    ///
-    /// Uses `File::open` because Gramine's encrypted FS may fail `stat()` but
-    /// `open()` works reliably.
     pub fn exists(&self, path: impl AsRef<Path>) -> bool {
-        fs::File::open(path.as_ref()).is_ok()
+        path.as_ref().exists()
     }
 
     /// Create a directory (+ parents).

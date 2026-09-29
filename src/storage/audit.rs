@@ -3,7 +3,7 @@
 
 //! Audit event logging (daily JSONL append) with HMAC integrity.
 //!
-//! Each day's events are written to `/data/audit/{YYYY-MM-DD}.jsonl`.
+//! Each day's events are written to `{data_dir}/audit/{YYYY-MM-DD}.jsonl`.
 //! Events are **appended** (never overwritten) for tamper-evident logging.
 //! An HMAC-SHA256 tag is computed over each event's canonical JSON so that
 //! any post-hoc modification of the log file is detectable.
@@ -80,21 +80,17 @@ pub struct AuditEvent {
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// Stable 32-byte HMAC key, persisted at `/data/audit/.hmac-key`.
+/// Stable 32-byte HMAC key, persisted at `{data_dir}/audit/.hmac-key`.
 ///
 /// On first call the key is loaded from disk (or generated and saved if the
 /// file does not yet exist).  The result is cached for the lifetime of the
 /// process so the file is read at most once.
 static AUDIT_HMAC_KEY: OnceLock<[u8; 32]> = OnceLock::new();
 
-fn audit_hmac_key() -> [u8; 32] {
+fn audit_hmac_key(key_path: &std::path::Path) -> [u8; 32] {
     *AUDIT_HMAC_KEY.get_or_init(|| {
-        let key_path = std::path::Path::new(crate::config::DATA_DIR)
-            .join("audit")
-            .join(".hmac-key");
-
         // Try to read an existing key.
-        if let Ok(bytes) = std::fs::read(&key_path) {
+        if let Ok(bytes) = std::fs::read(key_path) {
             if bytes.len() == 32 {
                 let mut key = [0u8; 32];
                 key.copy_from_slice(&bytes);
@@ -110,7 +106,7 @@ fn audit_hmac_key() -> [u8; 32] {
         if let Some(parent) = key_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        if let Err(e) = std::fs::write(&key_path, key) {
+        if let Err(e) = std::fs::write(key_path, key) {
             tracing::error!(error = %e, "Failed to persist audit HMAC key — events will not survive restart");
         }
         key
@@ -118,8 +114,8 @@ fn audit_hmac_key() -> [u8; 32] {
 }
 
 /// Compute HMAC-SHA256 of a canonical JSON blob.
-fn compute_hmac(json_bytes: &[u8]) -> String {
-    let key = audit_hmac_key();
+fn compute_hmac(key_path: &std::path::Path, json_bytes: &[u8]) -> String {
+    let key = audit_hmac_key(key_path);
     let mut mac = HmacSha256::new_from_slice(&key).expect("HMAC can take key of any size");
     mac.update(json_bytes);
     hex::encode(mac.finalize().into_bytes())
@@ -220,7 +216,10 @@ impl<'a> AuditRepository<'a> {
         let signed = match serde_json::to_string(&canonical) {
             Ok(canonical_json) => {
                 let mut signed = event.clone();
-                signed.hmac = Some(compute_hmac(canonical_json.as_bytes()));
+                signed.hmac = Some(compute_hmac(
+                    &self.storage.paths().audit_hmac_key(),
+                    canonical_json.as_bytes(),
+                ));
                 signed
             }
             Err(e) => {
@@ -276,7 +275,10 @@ impl<'a> AuditRepository<'a> {
                 let mut canonical = event.clone();
                 canonical.hmac = None;
                 let canonical_json = serde_json::to_string(&canonical).ok()?;
-                let expected = compute_hmac(canonical_json.as_bytes());
+                let expected = compute_hmac(
+                    &self.storage.paths().audit_hmac_key(),
+                    canonical_json.as_bytes(),
+                );
                 if tag == &expected {
                     Some(event)
                 } else {

@@ -3,7 +3,7 @@
 
 //! Wallet metadata persistence backed by [`EncryptedStorage`].
 //!
-//! Each wallet lives in `/data/wallets/{wallet_id}/`:
+//! Each wallet lives in `{data_dir}/wallets/{wallet_id}/`:
 //! - `meta.json`    — public metadata (owner, address, status, label)
 //! - `keypair.json` — 64-byte Ed25519 seed+pubkey array (**never exposed via API**)
 

@@ -76,7 +76,7 @@ pub struct DeleteWalletResponse {
     path = "/v1/wallets",
     tag = "Wallets",
     summary = "Create wallet",
-    description = "Generate a new Solana keypair inside SGX, store encrypted on disk, return public address.",
+    description = "Generate a new Solana keypair inside the worker, store it, and return its public address.",
     security(("bearer_auth" = [])),
     request_body = CreateWalletRequest,
     responses(

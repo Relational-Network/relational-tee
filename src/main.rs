@@ -1,27 +1,18 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Relational Network
 
-//! Relational SDK - SGX Enclave Server with RA-TLS
+//! relational-tee: the IOB MicRes worker.
 //!
-//! This server runs inside an Intel SGX enclave and provides:
-//! - RA-TLS attestation binding enclave identity to public keys
+//! An Axum server for Use Case 1 credential pools and custodial Solana
+//! wallets, being migrated to Azure Confidential Containers. It provides:
 //! - JWT validation using AVS-issued tokens
 //! - Role-based access control (admin, user, read_only)
-//! - Encrypted data upload and query endpoints
-//!
-//! # Architecture
-//!
-//! ```text
-//! Browser → AVS → JWT + enclave public key
-//!                     ↓
-//! Browser encrypts data → Enclave (this server) decrypts inside SGX
-//! ```
+//! - Sealed CSV uploads decrypted inside the worker
 //!
 //! # Building & Running
 //!
 //! ```bash
-//! make SGX=1 RA_TYPE=dcap
-//! gramine-sgx relational-sdk
+//! just dev    # dev build: plain HTTP on 127.0.0.1:8443
 //! ```
 
 mod api;
@@ -38,7 +29,6 @@ mod http_client;
 mod indexer;
 mod state;
 mod storage;
-mod tls;
 
 use axum::{
     extract::DefaultBodyLimit,
@@ -56,13 +46,8 @@ use utoipa::{openapi::security::SecurityScheme, Modify, OpenApi};
 #[cfg(feature = "swagger-ui")]
 use utoipa_swagger_ui::SwaggerUi;
 
-use config::{
-    avs_jwks_url, AVS_AUDIENCE, DEFAULT_TLS_CERT_PATH, DEFAULT_TLS_KEY_PATH, MAX_BODY_SIZE,
-    SERVER_HOST, SERVER_PORT,
-};
+use config::{avs_jwks_url, ServerConfig, Transport, AVS_AUDIENCE, MAX_BODY_SIZE};
 
-// NOTE: CORS is handled by the Caddy reverse proxy (relational-proxy), not here.
-// The enclave only listens on localhost; browsers never connect directly.
 use crypto::enclave_key;
 use handlers::{
     admin_status, data_query, get_public_key, AdminStatusResponse, DataQueryRequest,
@@ -70,7 +55,6 @@ use handlers::{
 };
 use health::{health, liveness, readiness, HealthChecks, HealthResponse, ReadyResponse};
 use state::AppState;
-use tls::load_tls_config;
 
 /// Start time captured once for uptime reporting.
 static STARTED_AT: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
@@ -82,21 +66,13 @@ static STARTED_AT: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 #[derive(OpenApi)]
 #[openapi(
     info(
-        title = "Relational SDK API",
+        title = "relational-tee API",
         version = "0.1.0",
-        description = r#"SGX Enclave server with RA-TLS, JWT validation, and RBAC.
+        description = r#"IOB MicRes worker: Use Case 1 credential pools and custodial wallets, with JWT validation and RBAC.
 
 ## Authentication
 
-Protected endpoints require a JWT token from the Attestation Verification Service (AVS).
-
-### How to get a token:
-
-```bash
-curl -s -X POST http://127.0.0.1:9100/v1/attest \
-  -H 'Content-Type: application/json' \
-  -d '{"enclave_url":"https://127.0.0.1:8080"}' | jq -r '.token'
-```
+Protected endpoints require a JWT issued by the Attestation Verification Service (AVS), until Entra ID replaces it.
 
 ### How to use in Swagger UI:
 
@@ -110,14 +86,6 @@ curl -s -X POST http://127.0.0.1:9100/v1/attest \
 - **admin**: Full access to all endpoints
 - **user**: Can upload and query data
 - **read_only**: Can only query data
-
-To get a token with a specific role:
-
-```bash
-curl -s -X POST http://127.0.0.1:9100/v1/attest \
-  -H 'Content-Type: application/json' \
-  -d '{"enclave_url":"https://127.0.0.1:8080","role":"admin"}' | jq -r '.token'
-```
 "#
     ),
     paths(
@@ -292,13 +260,8 @@ async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
 // Application Entry Point
 // ============================================================================
 
-/// Service entrypoint: build router, set up TLS, and serve.
-///
-/// # Threading
-///
-/// Uses 2 worker threads to keep SGX thread budget predictable.
-/// Account for: 4 Gramine helper threads + 2 Tokio workers when setting `sgx.max_threads`.
-#[tokio::main(worker_threads = 2)]
+/// Service entrypoint: read configuration, build the router, and serve.
+#[tokio::main]
 async fn main() {
     // Initialize tracing with environment filter (RUST_LOG).
     tracing_subscriber::fmt()
@@ -311,6 +274,11 @@ async fn main() {
     // Capture process start for uptime reporting.
     let _ = STARTED_AT.set(Instant::now());
 
+    let server_config = ServerConfig::from_env().unwrap_or_else(|e| {
+        tracing::error!("Invalid configuration: {e}");
+        std::process::exit(2);
+    });
+
     // Install rustls crypto provider early — both axum-server and our
     // http_client (hyper-rustls) pick this up via process-global default.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
@@ -318,14 +286,17 @@ async fn main() {
     // Initialize enclave keypair.
     let _ = enclave_key();
 
-    // Initialize encrypted storage.
-    let data_dir = config::DATA_DIR;
+    // Initialize local storage.
+    let data_dir = server_config.data_dir.as_path();
     let mut encrypted_storage = storage::EncryptedStorage::new(data_dir);
     match encrypted_storage.initialize() {
-        Ok(()) => info!(data_dir = %data_dir, "Encrypted storage initialized"),
+        Ok(()) => warn!(
+            data_dir = %data_dir.display(),
+            "Local storage is plaintext on disk: synthetic data only until encrypted Azure Storage replaces it"
+        ),
         Err(e) => {
-            tracing::warn!(error = %e, data_dir = %data_dir,
-                "Failed to initialize encrypted storage — wallet endpoints will be unavailable");
+            tracing::warn!(error = %e, data_dir = %data_dir.display(),
+                "Failed to initialize local storage — wallet endpoints will be unavailable");
         }
     }
 
@@ -386,7 +357,7 @@ async fn main() {
     // Initialize transaction database (redb). Required — fail fast if it cannot open.
     let tx_db = Arc::new(
         storage::tx_database::TxDatabase::open(&storage::StoragePaths::new(data_dir).tx_db_path())
-            .expect("Failed to open transaction database — cannot start enclave without DB"),
+            .expect("Failed to open transaction database — cannot start without DB"),
     );
     info!("Transaction database opened");
 
@@ -486,41 +457,56 @@ async fn main() {
     #[cfg(feature = "swagger-ui")]
     let app = app.merge(SwaggerUi::new("/docs").url("/api-doc/openapi.json", ApiDoc::openapi()));
 
-    // Bind on all interfaces for VM access.
-    let addr = std::net::SocketAddr::from((SERVER_HOST, SERVER_PORT));
-    info!(%addr, "Starting HTTPS server");
+    let addr = server_config.addr;
 
-    // TLS is required for RA-TLS deployments.
-    let tls_paths_exist = std::path::Path::new(DEFAULT_TLS_CERT_PATH).exists()
-        && std::path::Path::new(DEFAULT_TLS_KEY_PATH).exists();
+    // Graceful shutdown: drain in-flight requests on SIGTERM/SIGINT.
+    let handle = axum_server::Handle::new();
+    let shutdown_handle = handle.clone();
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        info!("Shutdown signal received, draining connections (10s)...");
+        shutdown_handle.graceful_shutdown(Some(std::time::Duration::from_secs(10)));
+    });
 
-    if tls_paths_exist {
-        // Load TLS configuration.
-        let tls_config = load_tls_config(DEFAULT_TLS_CERT_PATH, DEFAULT_TLS_KEY_PATH)
-            .await
-            .expect("failed to load TLS cert/key");
-
-        // Graceful shutdown: drain in-flight requests on SIGTERM/SIGINT.
-        let handle = axum_server::Handle::new();
-        let shutdown_handle = handle.clone();
-        tokio::spawn(async move {
-            shutdown_signal().await;
-            info!("Shutdown signal received, draining connections (10s)...");
-            shutdown_handle.graceful_shutdown(Some(std::time::Duration::from_secs(10)));
-        });
-
-        // Start HTTPS server with graceful shutdown support.
-        axum_server::bind_rustls(addr, tls_config)
-            .handle(handle)
-            .serve(app.into_make_service())
-            .await
-            .expect("server error");
-    } else {
-        panic!("TLS cert/key not available; RA-TLS requires TLS");
+    match server_config.transport {
+        Transport::Tls {
+            cert_path,
+            key_path,
+        } => {
+            let tls_config =
+                axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert_path, &key_path)
+                    .await
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "failed to load TLS certificate {} and key {}: {e}",
+                            cert_path.display(),
+                            key_path.display()
+                        )
+                    });
+            info!(%addr, cert = %cert_path.display(), "Serving HTTPS");
+            axum_server::bind_rustls(addr, tls_config)
+                .handle(handle)
+                .serve(app.into_make_service())
+                .await
+                .expect("server error");
+        }
+        #[cfg(feature = "dev")]
+        Transport::PlainHttp => {
+            if addr.ip().is_loopback() {
+                warn!(%addr, "Serving plain HTTP (dev build)");
+            } else {
+                warn!(%addr, "Serving plain HTTP on a non-loopback address (dev build)");
+            }
+            axum_server::bind(addr)
+                .handle(handle)
+                .serve(app.into_make_service())
+                .await
+                .expect("server error");
+        }
     }
 }
 
-/// Wait for SIGINT (Ctrl-C) or SIGTERM for clean Kubernetes/systemd shutdown.
+/// Wait for SIGINT (Ctrl-C) or SIGTERM for clean shutdown.
 async fn shutdown_signal() {
     let ctrl_c = async {
         tokio::signal::ctrl_c()

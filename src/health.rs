@@ -1,28 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Relational Network
 
-//! Health check endpoints for Kubernetes probes and load balancers.
+//! Health check endpoints for container probes and load balancers.
 //!
 //! This module provides three health endpoints:
 //!
 //! - `/health` - Combined liveness and readiness check
 //! - `/health/live` - Liveness probe (always 200 if running)
 //! - `/health/ready` - Readiness probe (checks dependencies)
-//!
-//! # Kubernetes Integration
-//!
-//! Configure your pod with:
-//!
-//! ```yaml
-//! livenessProbe:
-//!   httpGet:
-//!     path: /health/live
-//!     port: 8080
-//! readinessProbe:
-//!   httpGet:
-//!     path: /health/ready
-//!     port: 8080
-//! ```
 
 use axum::{extract::State, http::StatusCode, Json};
 use serde::Serialize;
@@ -66,10 +51,8 @@ pub struct HealthResponse {
 
 /// Check if the data directory exists and is accessible.
 /// Uses async I/O to avoid blocking the Tokio runtime.
-async fn check_data_dir() -> Option<String> {
-    // Hardcoded — the encrypted FS is always mounted at DATA_DIR.
-    let dir = crate::config::DATA_DIR;
-    match tokio::fs::metadata(dir).await {
+async fn check_data_dir(state: &AppState) -> Option<String> {
+    match tokio::fs::metadata(state.storage.paths().root()).await {
         Ok(_) => Some("ok".to_string()),
         Err(_) => Some("missing".to_string()),
     }
@@ -89,8 +72,8 @@ async fn check_data_dir() -> Option<String> {
         (status = 503, description = "Service is unhealthy", body = ReadyResponse)
     )
 )]
-pub async fn health() -> (StatusCode, Json<ReadyResponse>) {
-    let data_dir = check_data_dir().await;
+pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<ReadyResponse>) {
+    let data_dir = check_data_dir(&state).await;
     let all_ok = data_dir.as_ref().map(|s| s == "ok").unwrap_or(true);
 
     let response = ReadyResponse {
@@ -149,7 +132,7 @@ pub async fn liveness() -> Json<HealthResponse> {
     )
 )]
 pub async fn readiness(State(state): State<AppState>) -> (StatusCode, Json<ReadyResponse>) {
-    let data_dir = check_data_dir().await;
+    let data_dir = check_data_dir(&state).await;
 
     // Check Solana RPC by calling a lightweight getHealth.
     let solana_rpc = match state.solana_client.rpc().get_health().await {
