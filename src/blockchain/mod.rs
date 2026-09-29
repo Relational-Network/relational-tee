@@ -5,6 +5,8 @@
 
 pub mod client;
 pub mod drt;
+#[cfg(test)]
+pub mod fake;
 pub mod rpc;
 pub mod signing;
 pub mod spl_token;

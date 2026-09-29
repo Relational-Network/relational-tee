@@ -81,6 +81,19 @@ impl<S: Send + Sync> FromRequestParts<S> for Idempotent {
     }
 }
 
+#[cfg(test)]
+impl Idempotent {
+    /// A `POST` as the extractor would read it.
+    pub(crate) fn post(key: &str, route: &str, path: &str) -> Self {
+        Self {
+            key: key.into(),
+            method: Method::POST,
+            route: route.into(),
+            path: path.into(),
+        }
+    }
+}
+
 /// A JSON body, and the bytes an idempotency fingerprint covers.
 pub struct JsonBody<T> {
     pub value: T,
@@ -334,12 +347,7 @@ mod tests {
     use crate::storage::tests::two_workers;
 
     fn request(key: &str, path: &str) -> Idempotent {
-        Idempotent {
-            key: key.into(),
-            method: Method::POST,
-            route: "/v1/drt/pools/{pool_pda}/revoke".into(),
-            path: path.into(),
-        }
+        Idempotent::post(key, "/v1/drt/pools/{pool_pda}/revoke", path)
     }
 
     const KEY: &str = "0f8fad5b-d9cb-469f-a165-70867728950e";
