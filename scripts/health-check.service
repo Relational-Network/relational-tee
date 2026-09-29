@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Relational Network
+#
+# Systemd service for periodic health checks
+#
+# Installation:
+#   sudo cp health-check.service /etc/systemd/system/
+#   sudo cp health-check.timer /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable health-check.timer
+#   sudo systemctl start health-check.timer
+#
+# Status:
+#   sudo systemctl status health-check.timer
+#   sudo systemctl list-timers health-check.timer
+
+[Unit]
+Description=Health Check for iob-micres Services
+After=network-online.target avs.service enclave.service caddy-docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/iob-micres/scripts/health-check.sh
+StandardOutput=journal
+StandardError=journal
+
+# Run as root to allow service restarts
+User=root
+
+# Don't fail if health check reports unhealthy (it already attempted restart)
+SuccessExitStatus=0 1

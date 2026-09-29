@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Relational Network
+
+[package]
+name = "drt-mean"
+version = "0.1.0"
+edition = "2021"
+description = "Sample DRT: compute the arithmetic mean of a numeric CSV column inside the enclave."
+license = "AGPL-3.0-or-later"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+# Optimise for speed, not size — Cranelift inlines through `lto = "fat"` and
+# the wasm is precompiled to native once at grant time, so the WASM file size
+# (~30–40 KiB) is a one-off network transfer that doesn't affect query latency.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+overflow-checks = false
+
+[dependencies]

@@ -1,0 +1,67 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Relational Network
+#
+# Systemd service for relational-sdk SGX enclave (Docker)
+#
+# The Docker image is pre-signed at build time (CI) — no signing key
+# needed on the deployment VM. The image tag is pinned to a commit SHA
+# via ENCLAVE_IMAGE_TAG in /opt/iob-micres/.env (written by the CD pipeline).
+#
+# Installation:
+#   sudo cp enclave.service /etc/systemd/system/enclave.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable enclave
+#   sudo systemctl start enclave
+#
+# Logs:
+#   sudo journalctl -u enclave -f
+#
+# Note: Requires Docker image to be pulled first (done by CD pipeline)
+
+[Unit]
+Description=Relational SDK SGX Enclave (Docker)
+After=docker.service aesmd.service avs.service network-online.target
+Requires=docker.service
+Wants=aesmd.service avs.service network-online.target
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=10
+StartLimitInterval=300
+StartLimitBurst=5
+TimeoutStartSec=120
+EnvironmentFile=/opt/iob-micres/.env
+
+# Stop and remove any existing container
+ExecStartPre=-/usr/bin/docker stop enclave
+ExecStartPre=-/usr/bin/docker rm enclave
+
+# Wait for AVS to be ready (enclave needs JWKS endpoint)
+ExecStartPre=/bin/bash -c 'for i in {1..60}; do curl -sf http://127.0.0.1:9100/.well-known/jwks.json >/dev/null 2>&1 && exit 0; sleep 1; done; echo "AVS JWKS not ready after 60s, continuing anyway..."'
+
+# Run the enclave container
+# - Image is pre-signed (no signing key needed on this VM)
+# - ENCLAVE_IMAGE_TAG is set by CD pipeline (e.g., sha-abc123def)
+# - Uses host networking for localhost AVS communication
+# - Passes through SGX devices for enclave execution
+# - Mounts data directory for persistent encrypted storage
+# - AVS RA-TLS trust anchor is baked into the image at /app/avs-ca.crt
+#   (measured into MRENCLAVE via sgx.trusted_files) — no runtime bind-mount.
+ExecStart=/usr/bin/docker run --rm --name enclave \
+    --network host \
+    --device /dev/sgx/enclave \
+    --device /dev/sgx/provision \
+    -v /opt/iob-micres/data:/data \
+    -e AVS_JWKS_URL \
+    -e SECRET_PROVISION_SERVERS=127.0.0.1:4433 \
+    -e RUST_LOG \
+    ghcr.io/relational-network/relational-sdk:${ENCLAVE_IMAGE_TAG}
+
+ExecStop=/usr/bin/docker stop enclave
+
+# Health check - non-fatal, just for observability
+ExecStartPost=/bin/bash -c 'for i in {1..60}; do sleep 2; curl -sfk https://127.0.0.1:8080/health && exit 0; done; echo "Enclave health check did not respond within 120s (non-fatal)"'
+
+[Install]
+WantedBy=multi-user.target

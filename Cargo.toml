@@ -1,0 +1,106 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Relational Network
+
+[package]
+name = "relational-sdk"
+version = "0.1.0"
+edition = "2021"
+authors = ["Relational Network"]
+description = "Enclave Microservice using Axum"
+license = "AGPL-3.0-or-later"
+rust-version = "1.92"
+
+[features]
+default = []
+dev = []
+swagger-ui = ["dep:utoipa-swagger-ui"]
+
+[dependencies]
+# ── Web framework ──────────────────────────────────────────────────
+axum = { version = "0.8.8", default-features =  false, features = ["multipart", "query", "json"] }
+axum-server = { version = "0.8.0", default-features = false, features = ["tls-rustls-no-provider"] }
+tower-http = { version = "0.6", default-features = false, features = ["set-header", "trace"] }
+tokio = { version = "1.49.0", default-features = false, features = ["macros", "rt-multi-thread", "signal"] }
+
+# ── Serialization ──────────────────────────────────────────────────
+serde = { version = "1.0.228", default-features = false }
+serde_json = { version = "1.0.149", default-features = false }
+
+# ── OpenAPI / Swagger ──────────────────────────────────────────────
+utoipa = { version = "5.4.0", default-features = false, features = ["chrono", "macros"]}
+utoipa-swagger-ui = { version = "9.0.2", default-features = false, features = ["axum"], optional = true }
+
+# ── TLS & Crypto ───────────────────────────────────────────────────
+rustls = { version = "0.23.36", default-features = false, features = ["aws-lc-rs"] }
+# CRITICAL: Only enable p256 for ES256 (ECDSA P-256) - NEVER use rust_crypto or rsa features!
+# The rsa crate has unfixed vulnerability RUSTSEC-2023-0071 (Marvin Attack)
+# aws_lc_rs provides CryptoProvider without the vulnerable rsa crate (uses AWS-LC/BoringSSL)
+jsonwebtoken = { version = "10.3.0", default-features = false, features = [ "p256", "aws_lc_rs"] }
+p256 = { version = "0.13.2", default-features = false , features = ["ecdh"]}
+sha2 = { version = "0.10.9", default-features = false }
+hmac = { version = "0.12", default-features = false }
+base64 = { version = "0.22.1", default-features = false }
+hkdf = { version = "0.12.4", default-features = false }
+aes-gcm = { version = "0.10.3", default-features = false, features = ["aes", "alloc"] }
+
+# ── HTTP client (hyper-direct, no reqwest) ────────────────────────
+# Hand-rolled minimal client in src/http_client.rs avoids the entire
+# url → idna → icu_* chain (~25 transitive crates of Unicode data
+# tables) that `reqwest` would otherwise pull in.
+hyper = { version = "1", default-features = false, features = ["client"] }
+hyper-util = { version = "0.1", default-features = false, features = ["client-legacy", "http1", "tokio"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1"] }
+http-body-util = { version = "0.1", default-features = false }
+bytes = { version = "1", default-features = false }
+rustls-pemfile = { version = "2", default-features = false, features = ["std"] }
+webpki-roots = { version = "1", default-features = false }
+
+# ── Observability ──────────────────────────────────────────────────
+tracing = { version = "0.1", default-features = false }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt"] }
+
+# ── Utilities ──────────────────────────────────────────────────────
+uuid = { version = "1.16", default-features = false, features = ["v4"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+csv = { version = "1.4.0", default-features = false }
+
+# ── Solana (granular) ──────────────────────────────────────────────
+# Replaces monolithic solana-sdk + solana-client + spl-token + spl-ata
+# with granular crates and inline instruction builders.
+# SPL crates replaced with ~40 lines in blockchain/spl_token.rs.
+solana-pubkey = { version = "4.1", default-features = false, features = ["curve25519", "borsh"] }
+solana-keypair = { version = "3.1", default-features = false }
+solana-signer = { version = "3", default-features = false }
+solana-signature = { version = "3.3", default-features = false }
+solana-hash = { version = "4.2", default-features = false }
+solana-instruction = { version = "3.2", default-features = false }
+solana-transaction = { version = "4", default-features = false, features = ["serde", "blake3"] }
+solana-message = { version = "4", default-features = false }
+solana-system-interface = { version = "3.1", default-features = false, features = ["bincode"] }
+bincode = { version = "1.3", default-features = false }
+# ── Borsh serialization (DRT smart contract) ─────────────────
+borsh = { version = "1", default-features = false }
+hex = { version = "0.4", default-features = false, features = ["alloc"] }
+# ── Embedded database ─────────────────────────────────────────────
+redb = { version = "3.1", default-features = false }
+
+# ── In-process cache ──────────────────────────────────────────────
+lru = { version = "0.16", default-features = false }
+dashmap = { version = "6", default-features = false }
+
+# ── WASM runtime for DRT script execution ─────────────────────────
+# Cranelift JIT through wasmtime. Two reasons over wasmi:
+#   1. Cranelift produces near-native code (~30–60× faster than wasmi's
+#      interpreter on CSV-bound DRT scripts).
+#   2. `precompile_module` lets us cache `.cwasm` artifacts on the
+#      Gramine encrypted FS so warm-path instantiation is ~free.
+#
+# Gramine ≥ 1.7 supports the W^X transitions Cranelift needs via
+# `sgx.allow_jit = true` in the manifest. If a deployment must run
+# without that flag (e.g. older Gramine), swap `Strategy::Cranelift`
+# for `Strategy::Pulley` in `src/drt/runtime.rs`.
+wasmtime = { version = "43.0.2", default-features = false, features = [
+    "runtime",
+    "cranelift",
+    "parallel-compilation",
+] }

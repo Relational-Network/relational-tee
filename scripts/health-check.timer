@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Relational Network
+#
+# Systemd timer for periodic health checks
+# Runs health check every 5 minutes
+#
+# Installation:
+#   sudo cp health-check.timer /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable health-check.timer
+#   sudo systemctl start health-check.timer
+#
+# Status:
+#   sudo systemctl status health-check.timer
+#   sudo journalctl -u health-check.service -f
+
+[Unit]
+Description=Periodic Health Check Timer for iob-micres
+Requires=health-check.service
+
+[Timer]
+# Run 2 minutes after boot (give services time to start)
+OnBootSec=2min
+
+# Run every 5 minutes
+OnUnitActiveSec=5min
+
+# If system was suspended/offline, catch up on missed runs
+Persistent=true
+
+[Install]
+WantedBy=timers.target

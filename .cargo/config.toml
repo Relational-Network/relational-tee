@@ -1,0 +1,46 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Relational Network
+
+# Emit the .d file with paths relative to the project directory, so that Make
+# understands that they refer to the same target that we wrote in the Makefile.
+
+[env]
+CC = "clang"
+CXX = "clang++"
+
+[alias]
+dev-check = "check --features dev"
+dev-build = "build --features dev"
+dev-test = "test --features dev"
+
+[target.x86_64-unknown-linux-gnu]
+# `rustix` (pulled in transitively by wasmtime + memfd) defaults to its
+# `linux_raw` backend on x86_64-linux, which issues raw SYSCALL instructions.
+# Inside Gramine SGX those bypass the patched-glibc fast path and hit the slow
+# #UD/seccomp emulation path ("Emulating a raw syscall instruction. This
+# degrades performance"), paid on every DRT execution (wasmtime instantiation
+# does mmap/mprotect/memfd_create/madvise via rustix). Forcing the libc backend
+# routes those through Gramine's patched glibc. This must be a `--cfg` rather
+# than the `use-libc` cargo feature: the cfg both selects the backend and makes
+# Cargo pull rustix's `libc` dependency (rustix Cargo.toml gates it on
+# `cfg(rustix_use_libc)`). NOTE: docker/Dockerfile sets RUSTFLAGS via env, which
+# overrides this whole block, so the same flag is mirrored there.
+rustflags = ["-C", "link-arg=-fuse-ld=lld", "--cfg", "rustix_use_libc"]
+
+[build]
+jobs = 4
+incremental = true
+rustc-wrapper = "sccache"
+dep-info-basedir = "."
+
+[profile.dev]
+opt-level = 0
+
+[profile.dev.build-override]
+opt-level = 3
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+opt-level = 3
+strip = true

@@ -1,0 +1,120 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Relational Network
+
+# =====================================================================
+# PRODUCTION Gramine manifest — used by Docker builds only.
+# sgx.debug = false is hardcoded; DNS + CA bundle are baked into MRENCLAVE.
+# For local SGX development on the dev VM, see the root-level
+# ../relational-sdk.manifest.template instead.
+# =====================================================================
+
+libos.entrypoint = "{{ entrypoint }}"
+
+loader.log_level = "{{ log_level }}"
+
+# Arguments for gramine-ratls:
+# -P writes the private key unencrypted (required by rustls).
+loader.argv = [
+    "gramine-ratls", "-P",
+    "/tmp/ra-tls.crt.pem",
+    "/tmp/ra-tls.key.pem",
+    "--",
+    "{{ self_exe }}"
+]
+
+loader.env.LD_LIBRARY_PATH = "/lib:{{ arch_libdir }}"
+loader.env.HOST = "0.0.0.0"
+loader.env.PORT = "8080"
+
+# See https://gramine.readthedocs.io/en/stable/performance.html#glibc-malloc-tuning
+loader.env.MALLOC_ARENA_MAX = "1"
+
+loader.env.RUST_BACKTRACE = "full"
+
+# ========== SECRET PROVISIONING (AVS-backed Gramine key fetch) ==========
+# libsecret_prov_attest.so runs in its LD_PRELOAD constructor before main()
+# and fetches the /data encryption key from AVS port 4433 over mutually-attested
+# RA-TLS. AVS verifies our SGX quote before releasing the key.
+loader.env.LD_PRELOAD = "/lib/libsecret_prov_attest.so"
+loader.env.SECRET_PROVISION_CONSTRUCTOR = "1"
+loader.env.SECRET_PROVISION_SET_KEY = "data_key"
+# AVS address: host:port of the secret-provisioning server. Per-environment, so passthrough.
+loader.env.SECRET_PROVISION_SERVERS = { passthrough = true }
+# CA cert that signs the AVS RA-TLS cert on port 4433. Baked into the image as
+# /app/avs-ca.crt, mounted into the enclave at /etc/ssl/certs/avs-ca.crt, and
+# measured into MRENCLAVE via sgx.trusted_files below. Rotating the AVS cert
+# requires rebuilding the image and updating measurements.toml.
+loader.env.SECRET_PROVISION_CA_CHAIN_PATH = "/etc/ssl/certs/avs-ca.crt"
+
+# AVS URL for JWT validation (per-environment, passthrough).
+loader.env.AVS_JWKS_URL = { passthrough = true }
+
+# ========== AZURE DCAP QUOTE PROVIDER ==========
+# Read by /lib/x86_64-linux-gnu/libdcap_quoteprov.so inside the enclave when
+# Gramine RA-TLS fetches PCK collateral from Azure PCS. Hardcoded (not passthrough)
+# so the values are measured into MRENCLAVE — any change re-bakes mr_enclave.
+loader.env.AZDCAP_COLLATERAL_VERSION = "v3"
+loader.env.AZDCAP_DEBUG_LOG_LEVEL = "Info"
+
+fs.mounts = [
+    { path = "/lib", uri = "file:{{ gramine.runtimedir() }}" },
+    { path = "{{ arch_libdir }}", uri = "file:{{ arch_libdir }}" },
+    # tmpfs for RA-TLS cert/key generation by gramine-ratls.
+    { path = "/tmp", type = "tmpfs" },
+    # gramine-ratls binary location (passed via -Dentrypoint).
+    { path = "{{ entrypoint }}", uri = "file:{{ entrypoint }}" },
+    # Application directory (self_exe binary).
+    { path = "{{ app_dir }}", uri = "file:{{ app_dir }}" },
+
+    # ========== DNS & CA (baked into image, measured into MRENCLAVE) ==========
+    # Static files shipped in the image — host cannot substitute them at runtime.
+    # Public resolvers because Docker's internal 127.0.0.11 DNS is a userspace
+    # proxy that is NOT reachable from inside a Gramine SGX enclave.
+    { path = "/etc/resolv.conf", uri = "file:/app/dns/resolv.conf" },
+    { path = "/etc/hosts", uri = "file:/app/dns/hosts" },
+    { path = "/etc/nsswitch.conf", uri = "file:/app/dns/nsswitch.conf" },
+    # CA bundle for libcurl inside libdcap_quoteprov.so (Azure PCS HTTPS) and
+    # for any outbound TLS from the Rust application (e.g. Solana RPC).
+    { path = "/etc/ssl/certs/ca-certificates.crt", uri = "file:/app/ca-certificates.crt" },
+    # AVS RA-TLS trust anchor for libsecret_prov_attest.so (port 4433).
+    # Measured into MRENCLAVE via sgx.trusted_files below.
+    { path = "/etc/ssl/certs/avs-ca.crt", uri = "file:/app/avs-ca.crt" },
+
+    # ========== ENCRYPTED PERSISTENT STORAGE ==========
+    # Transparent per-page encryption via Gramine. Key "data_key" is provisioned
+    # by AVS at startup (see SECRET_PROVISION_* above). Rust uses normal std::fs.
+    { path = "/data", uri = "file:{{ data_dir }}", type = "encrypted", key_name = "data_key" },
+]
+
+# SGX configuration — DCAP attestation only; debug mode is forbidden.
+sgx.debug = false
+sgx.enclave_size = "4G"
+sgx.remote_attestation = "{{ ra_type }}"
+sgx.isvprodid = {{ isvprodid }}
+sgx.isvsvn = {{ isvsvn }}
+# EDMM (per-page W→RX for the wasmtime JIT, src/drt/runtime.rs) needs an
+# EDMM-capable SGX driver, which this host's lacks — keep it + use_exinfo off.
+sgx.edmm_enable = false
+sgx.use_exinfo = false
+sgx.preheat_enclave = false
+
+# Trusted files are measured into MRENCLAVE. The Dockerfile rewrites this list
+# with an LC_ALL=C sorted, deduplicated enumeration of {{ gramine.runtimedir() }}
+# and {{ arch_libdir }} so MRENCLAVE does not depend on filesystem ordering.
+# The entries below are the seed list; the build-time rewrite keeps the same
+# four lines and appends the sorted runtime/arch lib files.
+sgx.trusted_files = [
+    "file:{{ self_exe }}",
+    "file:{{ gramine.runtimedir() }}/",
+    "file:{{ arch_libdir }}/",
+    "file:{{ entrypoint }}",
+    "file:/app/dns/resolv.conf",
+    "file:/app/dns/hosts",
+    "file:/app/dns/nsswitch.conf",
+    "file:/app/ca-certificates.crt",
+    "file:/app/avs-ca.crt",
+]
+
+# Account for the main thread + Tokio workers (worker_threads = 2 in main.rs)
+# + Gramine helper threads. 16 leaves room for indexer + background tasks.
+sgx.max_threads = 16

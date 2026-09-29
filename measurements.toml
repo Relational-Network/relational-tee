@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Relational Network
+
+[build]
+base_image = "ubuntu:20.04@sha256:8feb4d8ca5354def3d8fce243717141ce31e2c428701f6682bd2fafe15388214"
+ubuntu_snapshot = "20260210T000000Z"
+gramine = "1.8"
+rust = "1.92.0"
+sigstruct_date = "0000-00-00"
+
+[enclave]
+mr_enclave = "323103b313f495c3564fd9917ad1686a14b47c67224bbe6d75be4000fa2d011f"
+mr_signer = "777d23b75d3974a2a67224e49e78a45f65537861605cc0b86cb92e8d79a8d243"
+isv_prod_id = 0
+isv_svn = 0
+debug_enclave = false
+
+# mr_enclave: is the primary enclave measurement and the main CI release gate.
+# mr_signer: is the signer measurement derived from the RSA key used to sign the enclave.
+# isv_prod_id: is the enclave product identifier carried in the SIGSTRUCT.
+# isv_svn: is the enclave security version number carried in the SIGSTRUCT.
+# debug_enclave: shows whether the enclave was signed in debug mode or production mode.

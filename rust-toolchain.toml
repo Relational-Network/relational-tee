@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Relational Network
+#
+# Pins the exact Rust toolchain for both native `make` and Docker builds.
+# This is critical for MRENCLAVE reproducibility — same Rust version → same binary.
+#
+# To update: change the channel to the new version, then update the matching
+# Dockerfile ARG RUST_VERSION and rebuild.
+
+[toolchain]
+channel = "1.92.0"
+profile = "minimal"
+components = ["rustfmt", "clippy"]
