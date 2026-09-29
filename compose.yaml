@@ -1,0 +1,58 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Relational Network
+
+# The local stack (`just stack-up`): three workers behind a round-robin
+# proxy, sharing Azurite for storage and a fake SKR sidecar for keys and
+# attestation tokens. The workers run the aarch64-linux dev image from
+# `just image-dev`, with the same key release and storage code paths as in
+# production; only the endpoints differ.
+#
+# From the host: the proxy on 127.0.0.1:8443 (plain HTTP), and the fake
+# sidecar on 127.0.0.1:9000, whose /certs a dashboard can use as its
+# attestation authority. Data lives in memory and goes with `just stack-down`.
+
+name: relational-tee
+
+x-worker: &worker
+  image: relational-tee:dev
+  depends_on: [azurite, skr]
+  restart: unless-stopped
+  environment:
+    BIND_ADDR: 0.0.0.0
+    KEY_PROVIDER: skr
+    SKR_ENDPOINT: http://skr:9000
+    STORAGE_BACKEND: azurite
+    STORAGE_BLOB_URL: http://azurite:10000/devstoreaccount1
+    STORAGE_TABLE_URL: http://azurite:10002/devstoreaccount1
+    RUST_LOG: ${RUST_LOG:-info}
+
+services:
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite:latest
+    command: azurite --blobHost 0.0.0.0 --tableHost 0.0.0.0 --inMemoryPersistence --skipApiVersionCheck
+
+  skr:
+    image: relational-tee:dev
+    command: ["fake-skr"]
+    # The dev key files are readable by their owner only.
+    user: "${STACK_UID:-0}:${STACK_GID:-0}"
+    environment:
+      FAKE_SKR_ADDR: 0.0.0.0:9000
+      FAKE_MAA_ISSUER: http://localhost:9000
+      DEV_KEYS_DIR: /keys
+    volumes:
+      - ./dev/keys:/keys:ro
+    ports:
+      - 127.0.0.1:9000:9000
+
+  worker1: *worker
+  worker2: *worker
+  worker3: *worker
+
+  proxy:
+    image: haproxy:3.2-alpine
+    depends_on: [worker1, worker2, worker3]
+    volumes:
+      - ./dev/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    ports:
+      - 127.0.0.1:8443:8443

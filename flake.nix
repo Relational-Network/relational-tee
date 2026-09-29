@@ -123,10 +123,10 @@
         '';
 
       imageFor =
-        pkgs: server:
+        pkgs: tag: server:
         pkgs.dockerTools.buildLayeredImage {
           name = "relational-tee";
-          tag = "latest";
+          inherit tag;
           contents = [
             server
             pkgs.cacert
@@ -150,7 +150,7 @@
           in
           {
             inherit server;
-            image = imageFor pkgs server;
+            image = imageFor pkgs "latest" server;
             default = server;
           };
         aarch64-linux =
@@ -158,7 +158,7 @@
             pkgs = pkgsFor "aarch64-linux";
           in
           {
-            image-dev = imageFor pkgs (serverFor pkgs "dev");
+            image-dev = imageFor pkgs "dev" (serverFor pkgs "dev");
           };
       };
 

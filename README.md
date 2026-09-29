@@ -33,8 +33,9 @@ just            # list the recipes
 | `just test-azurite` | Run the storage conformance tests against Azurite, starting it first if needed |
 | `just check` | Run every gate: rustfmt, clippy (`-D warnings`, with and without all features), the tests, the banned-crate check and `cargo audit` |
 | `just spa` | Run the dashboard dev server from `../iob-pilot` (override with `IOB_PILOT_DIR`), using the host's Node and pnpm |
-| `just image` | Build the canonical x86_64-linux image with Nix and load it into Docker |
-| `just image-dev` | Build the aarch64-linux dev image and load it into Docker |
+| `just image` | Build the canonical x86_64-linux image with Nix and load it into Docker as `relational-tee:latest` |
+| `just image-dev` | Build the aarch64-linux dev image and load it into Docker as `relational-tee:dev` |
+| `just stack-up` | Start the local stack (needs `just image-dev`): Azurite, the fake SKR sidecar, three workers and a round-robin proxy on `127.0.0.1:8443`; `just stack-down` stops it |
 
 `just image` and `just image-dev` run Nix in a `nixos/nix` container with a cached `/nix` volume, so a Mac needs no separate Linux builder. On Apple Silicon the x86_64 image runs under emulation.
 
@@ -49,7 +50,15 @@ Dev builds include `relational-tee fake-skr`, a stand-in for Microsoft's SKR sid
 | `FAKE_MAA_TOKEN_SECS` | `28800` (8 hours) | Token lifetime |
 | `DEV_KEYS_DIR` | `dev/keys` | Dev keys to release and sign with |
 
-Not there yet: a container stack with several replicas and local fakes for storage and key release, a fault-injection suite for the idempotency work, and a debug-mode sandbox on Azure.
+Not there yet: a fault-injection suite for the idempotency work, and a debug-mode sandbox on Azure.
+
+### Running it locally
+
+- **Fastest:** `just dev` uses dev keys (`KEY_PROVIDER=local`) and in-memory storage, and needs nothing else running.
+- **Production code paths:** `just skr` and `just azurite` in other terminals, then `KEY_PROVIDER=skr STORAGE_BACKEND=azurite just dev`. The worker then releases keys and attests through the SKR client, and stores everything in Azurite through the Azure client.
+- **Several workers:** `just image-dev` once, then `just stack-up` ([`compose.yaml`](compose.yaml)). Three workers share Azurite and one fake SKR sidecar behind HAProxy on `127.0.0.1:8443`, which round-robins at layer 4 and probes `/health/ready` like the Azure load balancer. The fake sidecar's `/certs` is on `127.0.0.1:9000`.
+
+Authenticated endpoints still need AVS-issued tokens, which the local stack can't mint, so locally they answer 401 until Entra ID sign-in lands.
 
 ### Configuration
 

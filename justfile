@@ -4,9 +4,9 @@
 # Local development tasks. Run `nix develop` first for the pinned toolchain
 # and tools, or use your own installs of the same versions.
 #
-# Not here yet, because what they drive doesn't exist yet: stack-up and
-# stack-down (the container stack), faults (the idempotency fault-injection
-# suite) and sandbox (a debug-mode confidential group on Azure).
+# Not here yet, because what they drive doesn't exist yet: faults (the
+# idempotency fault-injection suite) and sandbox (a debug-mode confidential
+# group on Azure).
 
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
@@ -109,6 +109,16 @@ audit:
 # Run the dashboard dev server (override the path with IOB_PILOT_DIR).
 spa:
     cd {{ pilot }} && pnpm install --frozen-lockfile && pnpm dev
+
+# Start the local stack: Azurite, the fake SKR sidecar, three workers and a
+# round-robin proxy on 127.0.0.1:8443. Needs `just image-dev` first.
+stack-up: dev-keys
+    STACK_UID=$(id -u) STACK_GID=$(id -g) docker compose up -d --wait
+    @echo "workers: http://127.0.0.1:8443 (round robin)  fake SKR and MAA keys: http://127.0.0.1:9000"
+
+# Stop the local stack; its data is in memory and goes with it.
+stack-down:
+    docker compose down
 
 # Build the canonical x86_64-linux image and load it into Docker.
 image: (_nix-image "linux/amd64" "x86_64-linux" "image")
