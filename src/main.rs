@@ -33,7 +33,7 @@ use axum::{
     extract::DefaultBodyLimit,
     http::{header, HeaderValue},
     routing::get,
-    Json, Router,
+    Router,
 };
 use std::sync::Arc;
 use std::time::Instant;
@@ -227,8 +227,9 @@ impl Modify for SecurityAddon {
     }
 }
 
-async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
-    Json(ApiDoc::openapi())
+#[cfg(not(feature = "swagger-ui"))]
+async fn openapi_json() -> axum::Json<utoipa::openapi::OpenApi> {
+    axum::Json(ApiDoc::openapi())
 }
 
 // ============================================================================
@@ -402,7 +403,6 @@ async fn main() {
         // v1 API endpoints.
         .route("/v1/attestation/public-key", get(get_public_key))
         .route("/v1/admin/status", get(admin_status))
-        .route("/api-doc/openapi.json", get(openapi_json))
         // Wallet service routes.
         .merge(api::wallet_router())
         // DRT pool routes.
@@ -428,8 +428,11 @@ async fn main() {
         ))
         .with_state(state);
 
+    // SwaggerUi serves the OpenAPI document itself.
     #[cfg(feature = "swagger-ui")]
     let app = app.merge(SwaggerUi::new("/docs").url("/api-doc/openapi.json", ApiDoc::openapi()));
+    #[cfg(not(feature = "swagger-ui"))]
+    let app = app.route("/api-doc/openapi.json", get(openapi_json));
 
     let addr = server_config.addr;
 
