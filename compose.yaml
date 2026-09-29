@@ -23,13 +23,12 @@ x-worker: &worker
     SKR_ENDPOINT: http://skr:9000
     STORAGE_BACKEND: azurite
     STORAGE_BLOB_URL: http://azurite:10000/devstoreaccount1
-    STORAGE_TABLE_URL: http://azurite:10002/devstoreaccount1
     RUST_LOG: ${RUST_LOG:-info}
 
 services:
   azurite:
     image: mcr.microsoft.com/azure-storage/azurite:latest
-    command: azurite --blobHost 0.0.0.0 --tableHost 0.0.0.0 --inMemoryPersistence --skipApiVersionCheck
+    command: azurite-blob --blobHost 0.0.0.0 --inMemoryPersistence --skipApiVersionCheck
 
   skr:
     image: relational-tee:dev

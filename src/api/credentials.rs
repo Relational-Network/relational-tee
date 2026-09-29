@@ -3,6 +3,8 @@
 
 //! Credential issuance, revocation, and pool discovery endpoints.
 //!
+//! - `POST /v1/drt/pools/{pool_pda}/schema`     — replace the pool's schema
+//! - `GET  /v1/drt/pools/{pool_pda}/schema`     — the pool's schema
 //! - `POST /v1/drt/pools/{pool_pda}/initialize` — seed initial dataset
 //! - `POST /v1/drt/pools/{pool_pda}/issue`      — issue credentials (append-DRT gated)
 //! - `POST /v1/drt/pools/{pool_pda}/revoke`     — revoke credential(s)
@@ -12,7 +14,9 @@
 //! - `GET  /v1/drt/pools/list`                  — list all pools (marketplace discovery)
 //! - `GET  /v1/drt/pools/{pool_pda}/issuance-log` — list per-issuance records
 //!
-//! Lists page with signed cursors: pass `next_cursor` back as `cursor`.
+//! Everything here reads or changes the pool document (see
+//! [`crate::storage::pools`]). Lists page in memory: pass `next_cursor`
+//! back as `cursor`.
 
 use axum::{
     extract::{Multipart, Path, Query, State},
@@ -38,17 +42,13 @@ use crate::blockchain::drt::{
 use crate::error::ApiError;
 use crate::handlers::{parse_csv_payload, validate_payload};
 use crate::state::AppState;
-use crate::storage::pools::{Change, PoolKind, PoolState};
-use crate::storage::records::{RecordMeta, RecordStatus, StageOutcome};
-use crate::storage::store::Continuation;
+use crate::storage::pools::{PoolDoc, PoolState, Revocation, Upload, INITIAL};
+use crate::storage::Change;
 use crate::tee::KeyName;
 use sha2::{Digest, Sha256};
 
-use super::pools::{load_pool_meta, load_wallet_keypair, sign_and_send, verify_pool_ownership};
-use super::CursorQuery;
-
-/// A staged initialisation younger than this is assumed to be in progress.
-const STAGED_INIT_TIMEOUT: chrono::Duration = chrono::Duration::minutes(10);
+use super::pools::{load_pool, load_wallet_keypair, sign_and_send, verify_pool_ownership};
+use super::{page, CursorQuery};
 
 // ============================================================================
 // Request / Response types
@@ -85,7 +85,7 @@ pub struct IssueCredentialsResponse {
 pub struct RevokeCredentialsRequest {
     /// Wallet ID of the pool owner.
     pub wallet_id: String,
-    /// Credential record IDs to revoke (UUIDs from `/issue` responses).
+    /// Credential record IDs to revoke (`initial`, or UUIDs from `/issue` responses).
     pub credential_ids: Vec<String>,
     /// Optional reason for revocation.
     #[serde(default)]
@@ -138,6 +138,10 @@ pub struct PoolSummaryResponse {
     pub total_rows: u64,
     pub revoked_count: u64,
     pub created_at: String,
+    /// The `user_id` who created the pool.
+    pub created_by: String,
+    /// The transaction that created, registered and sealed the pool.
+    pub creation_signature: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub initialized_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -240,13 +244,14 @@ fn default_sort() -> String {
     "created_desc".to_string()
 }
 
-/// Single issuance record in the issuance log.
+/// Single upload in the issuance log: the initialisation or an issuance.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct IssuanceRecord {
     pub record_id: String,
     pub uploaded_by: String,
     pub rows: u64,
     pub uploaded_at: String,
+    /// The append-DRT burn, for an issuance.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub redeem_tx_signature: Option<String>,
 }
@@ -319,41 +324,17 @@ fn count_csv_rows(csv_bytes: &[u8]) -> u64 {
     }
 }
 
-/// Committed datasets stay immutable for this long.
-fn retain_until() -> chrono::DateTime<Utc> {
-    Utc::now() + chrono::Duration::days(crate::config::DATASET_RETENTION_DAYS)
-}
-
-/// A pool's totals, computed from its committed records and revocations.
-struct PoolTotals {
-    rows: u64,
-    revoked: u64,
-    last_issue_at: Option<chrono::DateTime<Utc>>,
-}
-
-async fn pool_totals(state: &AppState, pool_pda: &str) -> Result<PoolTotals, ApiError> {
-    let records = state.storage.records().totals(pool_pda).await?;
-    Ok(PoolTotals {
-        rows: records.rows,
-        revoked: state.storage.revocations().count(pool_pda).await?,
-        last_issue_at: records.last_issue_at,
-    })
-}
-
-fn kind_str(kind: PoolKind) -> &'static str {
-    match kind {
-        PoolKind::Malta => "malta",
-    }
-}
-
 fn validation_failed(errors: usize) -> ApiError {
     ApiError::bad_request(format!("CSV validation failed: {errors} error(s)"))
         .with_code("validation_failed")
 }
 
-fn initialization_in_progress() -> ApiError {
-    ApiError::conflict("pool initialization is already in progress — retry shortly")
-        .with_code("initialization_in_progress")
+fn pool_not_found(pool_pda: &str) -> ApiError {
+    ApiError::not_found(format!("pool metadata not found for {pool_pda}"))
+}
+
+fn parse_pda(pool_pda: &str) -> Result<Pubkey, ApiError> {
+    Pubkey::from_str(pool_pda).map_err(|_| ApiError::bad_request("invalid pool PDA address"))
 }
 
 // ============================================================================
@@ -391,9 +372,7 @@ pub async fn upload_schema(
     Path(pool_pda_str): Path<String>,
     Json(payload): Json<UploadSchemaRequest>,
 ) -> Result<Json<UploadSchemaResponse>, ApiError> {
-    // Validate the pool PDA format.
-    let pool_pda = Pubkey::from_str(&pool_pda_str)
-        .map_err(|_| ApiError::bad_request("invalid pool PDA address"))?;
+    let pool_pda = parse_pda(&pool_pda_str)?;
 
     // Validate schema_id is a safe identifier.
     if payload.schema_id.is_empty()
@@ -417,27 +396,24 @@ pub async fn upload_schema(
     let wallet = super::get_active_wallet_for_user(&state, &token.sub).await?;
     verify_pool_ownership(&pool, &wallet)?;
 
-    let fields_json = serde_json::to_value(&payload.fields)?;
     state
         .storage
         .pools()
-        .update(&pool_pda_str, |meta| {
-            if meta.schema_id != payload.schema_id {
+        .update(&pool_pda_str, |doc| {
+            if doc.schema_id != payload.schema_id {
                 return Err(ApiError::bad_request(format!(
                     "pool's schema_id is '{}', but you are uploading '{}'",
-                    meta.schema_id, payload.schema_id
+                    doc.schema_id, payload.schema_id
                 )));
             }
-            if serde_json::to_value(&meta.schema).ok().as_ref() == Some(&fields_json) {
+            if doc.schema == payload.fields {
                 return Ok(Change::Unchanged);
             }
-            meta.schema = payload.fields.clone();
+            doc.schema = payload.fields.clone();
             Ok(Change::Changed)
         })
         .await?
-        .ok_or_else(|| {
-            ApiError::not_found(format!("pool metadata not found for {pool_pda_str}"))
-        })?;
+        .ok_or_else(|| pool_not_found(&pool_pda_str))?;
 
     let field_count = payload.fields.len();
     info!(
@@ -475,8 +451,8 @@ pub async fn get_schema(
     State(state): State<AppState>,
     Path(pool_pda_str): Path<String>,
 ) -> Result<Json<GetSchemaResponse>, ApiError> {
-    let meta = load_pool_meta(&state, &pool_pda_str).await?;
-    if meta.schema.is_empty() {
+    let doc = load_pool(&state, &pool_pda_str).await?;
+    if doc.schema.is_empty() {
         return Err(ApiError::not_found(format!(
             "no schema uploaded yet for pool {pool_pda_str} — POST one to /v1/drt/pools/{{pda}}/schema"
         )));
@@ -484,17 +460,17 @@ pub async fn get_schema(
 
     Ok(Json(GetSchemaResponse {
         pool_pda: pool_pda_str,
-        schema_id: meta.schema_id,
-        fields: meta.schema,
+        schema_id: doc.schema_id,
+        fields: doc.schema,
     }))
 }
 
 /// Seed the initial dataset for a pool.
 ///
 /// The pool must be in `needs_init` state. No append DRT is required —
-/// this is the initial seeding by the pool creator. The dataset is staged,
-/// committed, and then the pool moves to `ready`; a retry after an
-/// interruption finishes the job.
+/// this is the initial seeding by the pool creator. The dataset is stored,
+/// then the pool document records it as the initial upload, which makes
+/// the pool `ready`.
 #[utoipa::path(
     post,
     path = "/v1/drt/pools/{pool_pda}/initialize",
@@ -511,7 +487,7 @@ pub async fn get_schema(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Not pool owner"),
         (status = 404, description = "Pool not found"),
-        (status = 409, description = "Initialization in progress, or a different initial dataset is already stored"),
+        (status = 409, description = "Another upload initialized the pool first"),
     )
 )]
 pub async fn initialize_pool(
@@ -522,18 +498,15 @@ pub async fn initialize_pool(
 ) -> Result<Json<InitializePoolResponse>, ApiError> {
     // Parse and decrypt the CSV payload.
     let parsed = parse_csv_payload(state.keys.get(KeyName::Transport), multipart).await?;
-
-    // Validate the pool PDA format.
-    let pool_pda = Pubkey::from_str(&pool_pda_str)
-        .map_err(|_| ApiError::bad_request("invalid pool PDA address"))?;
+    let pool_pda = parse_pda(&pool_pda_str)?;
 
     // Fetch on-chain pool to verify it exists and get ownership.
     let pool = fetch_pool(state.solana_client.rpc(), &pool_pda).await?;
     let wallet = super::get_active_wallet_for_user(&state, &token.sub).await?;
     verify_pool_ownership(&pool, &wallet)?;
 
-    let meta = load_pool_meta(&state, &pool_pda_str).await?;
-    if meta.state != PoolState::NeedsInit {
+    let doc = load_pool(&state, &pool_pda_str).await?;
+    if doc.state() != PoolState::NeedsInit {
         return Err(ApiError::bad_request(
             "pool is already initialized — use /issue to add credentials",
         ));
@@ -541,105 +514,71 @@ pub async fn initialize_pool(
 
     // Validate CSV against the pool's schema.
     let summary = validate_payload(
-        &meta.schema,
+        &doc.schema,
         &pool_pda_str,
         &parsed.csv_bytes,
-        meta.validation_mode,
+        doc.validation_mode,
     )?;
     if !summary.valid {
         return Err(validation_failed(summary.errors.len()));
     }
 
-    let record = RecordMeta {
-        record_id: "initial".to_string(),
+    let upload = Upload {
+        record_id: INITIAL.to_string(),
+        upload_id: Uuid::new_v4().to_string(),
         sha256: sha256_hex(&parsed.csv_bytes),
         rows: count_csv_rows(&parsed.csv_bytes),
         uploaded_by: token.sub.clone(),
         uploaded_at: Utc::now(),
-        status: RecordStatus::Staged,
-        redeem_tx_signature: None,
+        signature: None,
         commitment: None,
-        committed_at: None,
     };
-
-    // One `initial` record per pool: stage it, or finish the one an
-    // interrupted request left behind.
-    let records = state.storage.records();
-    let mut outcome = records
-        .stage(&pool_pda_str, record.clone(), &parsed.csv_bytes)
-        .await?;
-    if let StageOutcome::Exists(existing) = &outcome {
-        if existing.status == RecordStatus::Staged {
-            if Utc::now() - existing.uploaded_at < STAGED_INIT_TIMEOUT {
-                return Err(initialization_in_progress());
-            }
-            warn!(pool = %pool_pda_str, "Discarding an abandoned initialization");
-            records.discard_abandoned(&pool_pda_str, "initial").await?;
-            outcome = records
-                .stage(&pool_pda_str, record.clone(), &parsed.csv_bytes)
-                .await?;
-        }
-    }
-    let committed = match outcome {
-        StageOutcome::Staged(staged) => {
-            records
-                .commit(&pool_pda_str, staged, None, None, retain_until())
-                .await?
-        }
-        StageOutcome::Exists(existing) if existing.status == RecordStatus::Committed => existing,
-        StageOutcome::Exists(_) => return Err(initialization_in_progress()),
-    };
-
-    // Move the pool to ready.
-    let now = Utc::now();
     state
         .storage
         .pools()
-        .update::<ApiError>(&pool_pda_str, |m| {
-            if m.state == PoolState::Ready {
-                return Ok(Change::Unchanged);
+        .put_dataset(&pool_pda_str, &upload.upload_id, &parsed.csv_bytes)
+        .await?;
+    state
+        .storage
+        .pools()
+        .update(&pool_pda_str, |doc| match &doc.initial {
+            None => {
+                doc.initial = Some(upload.clone());
+                Ok(Change::Changed)
             }
-            m.state = PoolState::Ready;
-            m.initialized_at = Some(now);
-            Ok(Change::Changed)
+            Some(initial) if initial.upload_id == upload.upload_id => Ok(Change::Unchanged),
+            Some(_) => Err(ApiError::conflict(
+                "another upload already initialized this pool — use /issue to add credentials",
+            )),
         })
         .await?
-        .ok_or_else(|| {
-            ApiError::not_found(format!("pool metadata not found for {pool_pda_str}"))
-        })?;
-
-    if committed.sha256 != record.sha256 {
-        return Err(ApiError::conflict(
-            "an earlier request already stored a different initial dataset for this pool",
-        ));
-    }
-    audit::upload(&committed.record_id, committed.rows);
+        .ok_or_else(|| pool_not_found(&pool_pda_str))?;
+    audit::upload(INITIAL, upload.rows);
 
     info!(
         pool = %pool_pda_str,
-        rows = committed.rows,
-        schema = %meta.schema_id,
+        rows = upload.rows,
+        schema = %doc.schema_id,
         "Pool dataset initialized"
     );
 
     Ok(Json(InitializePoolResponse {
-        rows: committed.rows,
-        record_id: committed.record_id,
+        rows: upload.rows,
+        record_id: INITIAL.to_string(),
         state: PoolState::Ready.as_str().to_string(),
     }))
 }
 
 /// Issue credentials to a pool (append-DRT gated).
 ///
-/// Stages the dataset, burns 1 append DRT on-chain, then commits the record.
-/// If the burn never reached the chain the staged dataset is removed; if it
-/// did but wasn't confirmed, the record stays staged for reconciliation.
+/// Stores the dataset, burns 1 append DRT on-chain, then adds the upload,
+/// with the burn's signature, to the pool's issuance log.
 #[utoipa::path(
     post,
     path = "/v1/drt/pools/{pool_pda}/issue",
     tag = "Credentials",
     summary = "Issue credentials",
-    description = "Issue credentials by redeeming an append DRT and storing the encrypted CSV data. Validates ownership, DRT balance and the CSV schema, stages the dataset, burns 1 append DRT, then commits the record.",
+    description = "Issue credentials by redeeming an append DRT and storing the encrypted CSV data. Validates ownership, DRT balance and the CSV schema, stores the dataset, burns 1 append DRT, then records the upload in the pool's issuance log.",
     security(("bearer_auth" = [])),
     params(
         ("pool_pda" = String, Path, description = "Pool PDA address (base58)"),
@@ -649,6 +588,7 @@ pub async fn initialize_pool(
         (status = 400, description = "Validation error or insufficient DRTs"),
         (status = 401, description = "Unauthorized"),
         (status = 404, description = "Pool not found"),
+        (status = 409, description = "The pool changed concurrently; retry"),
         (status = 503, description = "Solana RPC unavailable"),
     )
 )]
@@ -662,20 +602,18 @@ pub async fn issue_credentials(
 
     // Parse and decrypt the CSV payload.
     let parsed = parse_csv_payload(state.keys.get(KeyName::Transport), multipart).await?;
+    let pool_pda = parse_pda(&pool_pda_str)?;
 
-    let pool_pda = Pubkey::from_str(&pool_pda_str)
-        .map_err(|_| ApiError::bad_request("invalid pool PDA address"))?;
-
-    // Load pool metadata — must be in Ready state.
-    let meta = load_pool_meta(&state, &pool_pda_str).await?;
-    if meta.state != PoolState::Ready {
+    // The pool must be ready.
+    let doc = load_pool(&state, &pool_pda_str).await?;
+    if doc.state() != PoolState::Ready {
         return Err(ApiError::bad_request(
             "pool not initialized — call /initialize first",
         ));
     }
 
-    // The append DRT's right_id and mint are only in the pool's metadata.
-    let append_meta = meta
+    // The append DRT's right_id and mint are only in the pool's document.
+    let append_meta = doc
         .drts
         .get(APPEND_DRT_NAME)
         .ok_or_else(|| ApiError::internal("pool metadata missing 'append' DRT"))?;
@@ -685,7 +623,7 @@ pub async fn issue_credentials(
     let (drt_config_pda, _) = derive_drt_config_pda(&pool_pda, &append_right_id);
 
     // Decode the pool uuid for the commitment hash.
-    let pool_uuid = decode_right_id(&meta.pool_uuid_hex)?;
+    let pool_uuid = decode_right_id(&doc.pool_uuid_hex)?;
 
     // Load caller's wallet (admin only — endpoint is `AdminToken`-gated).
     let caller_wallet = super::get_active_wallet_for_user(&state, &token.sub).await?;
@@ -722,10 +660,10 @@ pub async fn issue_credentials(
 
     // Validate CSV against pool's schema.
     let summary = validate_payload(
-        &meta.schema,
+        &doc.schema,
         &pool_pda_str,
         &parsed.csv_bytes,
-        meta.validation_mode,
+        doc.validation_mode,
     )?;
     if !summary.valid {
         return Err(validation_failed(summary.errors.len()));
@@ -733,38 +671,21 @@ pub async fn issue_credentials(
 
     let row_count = count_csv_rows(&parsed.csv_bytes);
 
-    // ── STAGE ─────────────────────────────────────────────────────
+    // ── STORE THE DATASET ─────────────────────────────────────────
 
     // The commitment is unique per upload (record_id || pool_uuid ||
     // append_right_id), and its Grant PDA is the on-chain receipt.
     let record_id = Uuid::new_v4().to_string();
     let commitment = compute_commitment(&record_id, &pool_uuid, &append_right_id);
-    let records = state.storage.records();
-    let staged = match records
-        .stage(
-            &pool_pda_str,
-            RecordMeta {
-                record_id: record_id.clone(),
-                sha256: sha256_hex(&parsed.csv_bytes),
-                rows: row_count,
-                uploaded_by: token.sub.clone(),
-                uploaded_at: Utc::now(),
-                status: RecordStatus::Staged,
-                redeem_tx_signature: None,
-                commitment: None,
-                committed_at: None,
-            },
-            &parsed.csv_bytes,
-        )
-        .await?
-    {
-        StageOutcome::Staged(staged) => staged,
-        StageOutcome::Exists(_) => return Err(ApiError::internal("record ID collision")),
-    };
+    state
+        .storage
+        .pools()
+        .put_dataset(&pool_pda_str, &record_id, &parsed.csv_bytes)
+        .await?;
+    audit::upload(&record_id, row_count);
 
     // ── BURN (irreversible) ───────────────────────────────────────
 
-    audit::upload(&record_id, row_count);
     let ix = build_grant_right(
         &pool_pda,
         &drt_config_pda,
@@ -772,46 +693,45 @@ pub async fn issue_credentials(
         &keypair.pubkey(),
         &commitment,
     );
-    let sig_str = match sign_and_send(&state, &keypair, vec![ix], "finalized").await {
-        Ok(sig) => sig,
-        Err(failure) => {
-            match &failure.sent {
-                // Nothing reached the chain, so no DRT was burned.
-                None => {
-                    if let Err(e) = records.discard(&pool_pda_str, &staged).await {
-                        warn!(pool = %pool_pda_str, record_id = %record_id, error = %e,
-                                "Couldn't discard a staged record");
-                    }
-                }
-                Some(sig) => warn!(pool = %pool_pda_str, record_id = %record_id, sig = %sig,
-                        "Append-DRT burn sent but not confirmed; the record stays staged for reconciliation"),
-            }
-            return Err(failure.error);
-        }
-    };
+    let sig_str = sign_and_send(&state, &keypair, vec![ix], "finalized").await?;
     audit::signature(&sig_str);
 
-    // ── COMMIT ────────────────────────────────────────────────────
+    // ── RECORD ────────────────────────────────────────────────────
 
-    if let Err(e) = records
-        .commit(
-            &pool_pda_str,
-            staged,
-            Some(sig_str.clone()),
-            Some(hex::encode(commitment)),
-            retain_until(),
-        )
-        .await
-    {
-        warn!(pool = %pool_pda_str, record_id = %record_id, redeem_sig = %sig_str, error = %e,
-            "DRT burned but the record couldn't be committed");
-        return Err(ApiError::internal(format!(
-            "the append DRT was burned (sig: {sig_str}) but the record couldn't be committed; it stays staged for reconciliation"
-        )));
-    }
+    let upload = Upload {
+        record_id: record_id.clone(),
+        upload_id: record_id.clone(),
+        sha256: sha256_hex(&parsed.csv_bytes),
+        rows: row_count,
+        uploaded_by: token.sub.clone(),
+        uploaded_at: Utc::now(),
+        signature: Some(sig_str.clone()),
+        commitment: Some(hex::encode(commitment)),
+    };
+    let updated = state
+        .storage
+        .pools()
+        .update::<ApiError>(&pool_pda_str, |doc| {
+            if doc.upload(&upload.record_id).is_some() {
+                return Ok(Change::Unchanged);
+            }
+            doc.issuances.push(upload.clone());
+            Ok(Change::Changed)
+        })
+        .await;
+    let doc = match updated {
+        Ok(Some(doc)) => doc,
+        Ok(None) => return Err(pool_not_found(&pool_pda_str)),
+        Err(e) => {
+            warn!(pool = %pool_pda_str, record_id = %record_id, redeem_sig = %sig_str, error = %e,
+                "DRT burned but the issuance couldn't be recorded");
+            return Err(ApiError::internal(format!(
+                "the append DRT was burned (sig: {sig_str}) but the issuance couldn't be recorded"
+            )));
+        }
+    };
 
-    let totals = pool_totals(&state, &pool_pda_str).await?;
-
+    let total_rows = doc.totals().rows;
     let explorer_url = state.solana_client.network().explorer_tx_url(&sig_str);
 
     info!(
@@ -819,7 +739,7 @@ pub async fn issue_credentials(
         record_id = %record_id,
         rows = row_count,
         redeem_sig = %sig_str,
-        total = totals.rows,
+        total = total_rows,
         "Credentials issued"
     );
 
@@ -827,21 +747,21 @@ pub async fn issue_credentials(
         record_id,
         rows_issued: row_count,
         redeem_signature: sig_str,
-        total_rows: totals.rows,
+        total_rows,
         explorer_url,
     }))
 }
 
 /// Revoke credential(s) from a pool.
 ///
-/// Each revocation is appended to the pool's revocation log, then indexed.
-/// Revoking an already revoked credential changes nothing.
+/// Each revocation is recorded in the pool's document, with who revoked it,
+/// when and why. Revoking an already revoked credential changes nothing.
 #[utoipa::path(
     post,
     path = "/v1/drt/pools/{pool_pda}/revoke",
     tag = "Credentials",
     summary = "Revoke credentials",
-    description = "Revoke one or more credentials by record ID. Revocations go to the pool's append-only revocation log. Admin only.",
+    description = "Revoke one or more credentials by record ID. Revocations are recorded in the pool's document. Admin only.",
     security(("bearer_auth" = [])),
     params(
         ("pool_pda" = String, Path, description = "Pool PDA address (base58)"),
@@ -853,6 +773,7 @@ pub async fn issue_credentials(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Not pool owner"),
         (status = 404, description = "Pool or credential not found"),
+        (status = 409, description = "The pool changed concurrently; retry"),
     )
 )]
 pub async fn revoke_credentials(
@@ -864,15 +785,12 @@ pub async fn revoke_credentials(
     if payload.credential_ids.is_empty() {
         return Err(ApiError::bad_request("credential_ids must not be empty"));
     }
-
-    let pool_pda = Pubkey::from_str(&pool_pda_str)
-        .map_err(|_| ApiError::bad_request("invalid pool PDA address"))?;
+    let pool_pda = parse_pda(&pool_pda_str)?;
 
     // Verify ownership.
     let (wallet, _) = load_wallet_keypair(&state, &payload.wallet_id, &token.sub).await?;
     let pool = fetch_pool(state.solana_client.rpc(), &pool_pda).await?;
     verify_pool_ownership(&pool, &wallet)?;
-    load_pool_meta(&state, &pool_pda_str).await?;
 
     let mut credential_ids: Vec<String> = Vec::with_capacity(payload.credential_ids.len());
     for cid in &payload.credential_ids {
@@ -881,29 +799,38 @@ pub async fn revoke_credentials(
         }
     }
 
-    // Every credential must be a committed record of this pool.
-    for cid in &credential_ids {
-        match state.storage.records().get(&pool_pda_str, cid).await? {
-            Some(record) if record.status == RecordStatus::Committed => {}
-            _ => {
-                return Err(ApiError::not_found(format!(
-                    "credential record '{cid}' not found in pool"
-                )))
-            }
-        }
-    }
-
+    let now = Utc::now();
     let mut newly_revoked = 0;
-    for cid in &credential_ids {
-        if state
-            .storage
-            .revocations()
-            .revoke(&pool_pda_str, cid, &token.sub, payload.reason.as_deref())
-            .await?
-        {
-            newly_revoked += 1;
-        }
-    }
+    state
+        .storage
+        .pools()
+        .update(&pool_pda_str, |doc| {
+            // Every credential must be an upload of this pool.
+            if let Some(unknown) = credential_ids.iter().find(|c| doc.upload(c).is_none()) {
+                return Err(ApiError::not_found(format!(
+                    "credential record '{unknown}' not found in pool"
+                )));
+            }
+            newly_revoked = 0;
+            for cid in &credential_ids {
+                if !doc.is_revoked(cid) {
+                    doc.revocations.push(Revocation {
+                        credential_id: cid.clone(),
+                        revoked_by: token.sub.clone(),
+                        revoked_at: now,
+                        reason: payload.reason.clone(),
+                    });
+                    newly_revoked += 1;
+                }
+            }
+            Ok(if newly_revoked == 0 {
+                Change::Unchanged
+            } else {
+                Change::Changed
+            })
+        })
+        .await?
+        .ok_or_else(|| pool_not_found(&pool_pda_str))?;
 
     info!(
         pool = %pool_pda_str,
@@ -923,7 +850,7 @@ pub async fn revoke_credentials(
     path = "/v1/drt/pools/{pool_pda}/revocations",
     tag = "Credentials",
     summary = "List revocations",
-    description = "List a pool's revocations, one cursor page at a time. Admin only.",
+    description = "List a pool's revocations in credential ID order, one cursor page at a time. Admin only.",
     security(("bearer_auth" = [])),
     params(
         ("pool_pda" = String, Path, description = "Pool PDA address (base58)"),
@@ -933,6 +860,7 @@ pub async fn revoke_credentials(
         (status = 200, description = "Revocation list", body = RevocationsResponse),
         (status = 400, description = "Invalid cursor"),
         (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Pool not found"),
     )
 )]
 pub async fn list_revocations(
@@ -942,18 +870,18 @@ pub async fn list_revocations(
     Query(query): Query<CursorQuery>,
 ) -> Result<Json<RevocationsResponse>, ApiError> {
     // Any admin can view revocations (no ownership check).
-    let scope = format!("revocations:{pool_pda_str}");
-    let page = state.storage.page_from(&scope, query.cursor.as_deref())?;
-    let got = state
-        .storage
-        .revocations()
-        .list(&pool_pda_str, query.clamped_limit(), page)
-        .await?;
+    let mut revocations = load_pool(&state, &pool_pda_str).await?.revocations;
+    revocations.sort_by(|a, b| a.credential_id.cmp(&b.credential_id));
+    let (items, next_cursor) = page(
+        revocations,
+        |r| &r.credential_id,
+        query.cursor.as_deref(),
+        query.clamped_limit(),
+    )?;
 
     Ok(Json(RevocationsResponse {
         pool_pda: pool_pda_str,
-        revocations: got
-            .items
+        revocations: items
             .into_iter()
             .map(|r| RevocationEntry {
                 credential_id: r.credential_id,
@@ -962,9 +890,7 @@ pub async fn list_revocations(
                 reason: r.reason,
             })
             .collect(),
-        next_cursor: got
-            .next
-            .map(|next| state.storage.sign_cursor(&scope, &next)),
+        next_cursor,
     }))
 }
 
@@ -974,7 +900,7 @@ pub async fn list_revocations(
     path = "/v1/drt/pools/{pool_pda}/summary",
     tag = "Credentials",
     summary = "Pool summary",
-    description = "Combined view of pool enclave metadata and on-chain DRT state.",
+    description = "Combined view of the pool's document (who created it, with the creation signature; totals) and its on-chain DRT state.",
     security(("bearer_auth" = [])),
     params(
         ("pool_pda" = String, Path, description = "Pool PDA address (base58)"),
@@ -990,16 +916,14 @@ pub async fn pool_summary(
     State(state): State<AppState>,
     Path(pool_pda_str): Path<String>,
 ) -> Result<Json<PoolSummaryResponse>, ApiError> {
-    let pool_pda = Pubkey::from_str(&pool_pda_str)
-        .map_err(|_| ApiError::bad_request("invalid pool PDA address"))?;
-
-    let meta = load_pool_meta(&state, &pool_pda_str).await?;
+    let pool_pda = parse_pda(&pool_pda_str)?;
+    let doc = load_pool(&state, &pool_pda_str).await?;
     let pool = fetch_pool(state.solana_client.rpc(), &pool_pda).await?;
 
-    // DRT configs live only in the pool's metadata. `remaining_supply` is a
-    // best-effort RPC lookup that falls back to the recorded supply.
-    let mut drts: Vec<DrtConfigResponseCompact> = Vec::with_capacity(meta.drts.len());
-    for (name, d) in meta.drts.iter() {
+    // `remaining_supply` is a best-effort RPC lookup that falls back to the
+    // recorded supply.
+    let mut drts: Vec<DrtConfigResponseCompact> = Vec::with_capacity(doc.drts.len());
+    for (name, d) in doc.drts.iter() {
         let remaining_supply = match Pubkey::from_str(&d.mint) {
             Ok(mint_pk) => match state.solana_client.rpc().get_token_supply(&mint_pk).await {
                 Ok(amt) => amt.amount.parse::<u64>().unwrap_or(d.supply),
@@ -1015,22 +939,36 @@ pub async fn pool_summary(
         });
     }
 
-    let totals = pool_totals(&state, &pool_pda_str).await?;
-
+    let totals = doc.totals();
     Ok(Json(PoolSummaryResponse {
+        state: doc.state().as_str().to_string(),
+        initialized_at: doc.initial.as_ref().map(|u| u.uploaded_at.to_rfc3339()),
         pool_pda: pool_pda_str,
-        pool_name: meta.pool_name,
+        pool_name: doc.pool_name,
         owner: pool.owner.to_string(),
-        schema_id: meta.schema_id,
-        validation_mode: meta.validation_mode,
-        state: meta.state.as_str().to_string(),
+        schema_id: doc.schema_id,
+        validation_mode: doc.validation_mode,
         total_rows: totals.rows,
         revoked_count: totals.revoked,
-        created_at: meta.created_onchain_at.to_rfc3339(),
-        initialized_at: meta.initialized_at.map(|d| d.to_rfc3339()),
+        created_at: doc.created_at.to_rfc3339(),
+        created_by: doc.created_by,
+        creation_signature: doc.creation_signature,
         last_issue_at: totals.last_issue_at.map(|d| d.to_rfc3339()),
         drts,
     }))
+}
+
+fn list_entry(doc: &PoolDoc) -> PoolListEntry {
+    let totals = doc.totals();
+    PoolListEntry {
+        pool_pda: doc.pool_pda.clone(),
+        pool_name: doc.pool_name.clone(),
+        total_rows: totals.rows,
+        revoked_count: totals.revoked,
+        schema_id: doc.schema_id.clone(),
+        state: doc.state().as_str().to_string(),
+        created_at: doc.created_at.to_rfc3339(),
+    }
 }
 
 /// List pools owned by a specific wallet.
@@ -1039,7 +977,7 @@ pub async fn pool_summary(
     path = "/v1/drt/pools/by-wallet/{wallet_id}",
     tag = "Credentials",
     summary = "List pools by wallet",
-    description = "List the pools a wallet owns, one cursor page at a time. The caller must own the wallet.",
+    description = "List the pools a wallet owns, in pool PDA order, one cursor page at a time. The caller must own the wallet.",
     security(("bearer_auth" = [])),
     params(
         ("wallet_id" = String, Path, description = "Wallet UUID"),
@@ -1062,34 +1000,25 @@ pub async fn list_pools_by_wallet(
     let wallet = super::load_wallet(&state, &wallet_id).await?;
     super::enforce_owner(&wallet, &token.sub)?;
 
-    let scope = format!("pools-by-wallet:{wallet_id}");
-    let page = state.storage.page_from(&scope, query.cursor.as_deref())?;
-    let got = state
+    let owned: Vec<PoolDoc> = state
         .storage
         .pools()
-        .owned_by(&wallet_id, query.clamped_limit(), page)
-        .await?;
-
-    let mut pools = Vec::with_capacity(got.items.len());
-    for meta in got.items {
-        let totals = pool_totals(&state, &meta.pool_pda).await?;
-        pools.push(PoolListEntry {
-            state: meta.state.as_str().to_string(),
-            created_at: meta.created_onchain_at.to_rfc3339(),
-            pool_pda: meta.pool_pda,
-            pool_name: meta.pool_name,
-            total_rows: totals.rows,
-            revoked_count: totals.revoked,
-            schema_id: meta.schema_id,
-        });
-    }
+        .all()
+        .await?
+        .into_iter()
+        .filter(|p| p.owner_wallet_id == wallet_id)
+        .collect();
+    let (items, next_cursor) = page(
+        owned,
+        |p| &p.pool_pda,
+        query.cursor.as_deref(),
+        query.clamped_limit(),
+    )?;
 
     Ok(Json(PoolsByWalletResponse {
         wallet_id,
-        pools,
-        next_cursor: got
-            .next
-            .map(|next| state.storage.sign_cursor(&scope, &next)),
+        pools: items.iter().map(list_entry).collect(),
+        next_cursor,
     }))
 }
 
@@ -1118,22 +1047,22 @@ pub async fn list_all_pools(
 ) -> Result<Json<AllPoolsResponse>, ApiError> {
     let search = query.search.as_deref().map(str::to_lowercase);
     let mut entries: Vec<MarketplacePoolEntry> = Vec::new();
-    for meta in state.storage.pools().all().await? {
-        let state_str = meta.state.as_str();
+    for doc in state.storage.pools().all().await? {
+        let state_str = doc.state().as_str();
         if query.state.as_deref().is_some_and(|s| s != state_str) {
             continue;
         }
         if search
             .as_deref()
-            .is_some_and(|s| !meta.pool_name.to_lowercase().contains(s))
+            .is_some_and(|s| !doc.pool_name.to_lowercase().contains(s))
         {
             continue;
         }
 
-        let totals = pool_totals(&state, &meta.pool_pda).await?;
+        let totals = doc.totals();
         // `remaining_supply == supply` keeps this listing off the RPC; the
         // per-pool summary looks up the live remaining supply.
-        let pool_drts: Vec<MarketplaceDrtEntry> = meta
+        let pool_drts: Vec<MarketplaceDrtEntry> = doc
             .drts
             .iter()
             .map(|(name, d)| MarketplaceDrtEntry {
@@ -1143,20 +1072,17 @@ pub async fn list_all_pools(
             })
             .collect();
         entries.push(MarketplacePoolEntry {
-            kind: kind_str(meta.kind).to_string(),
-            owner: meta
-                .owner_pubkey
-                .clone()
-                .unwrap_or_else(|| "unknown".to_string()),
+            kind: doc.kind.as_str().to_string(),
+            owner: doc.owner_pubkey.clone(),
             state: state_str.to_string(),
             total_rows: totals.rows,
             revoked_count: totals.revoked,
-            created_at: meta.created_onchain_at.to_rfc3339(),
+            created_at: doc.created_at.to_rfc3339(),
             drt_count: pool_drts.len(),
             drts: pool_drts,
-            pool_pda: meta.pool_pda,
-            pool_name: meta.pool_name,
-            schema_id: meta.schema_id,
+            pool_pda: doc.pool_pda,
+            pool_name: doc.pool_name,
+            schema_id: doc.schema_id,
         });
     }
 
@@ -1179,27 +1105,12 @@ pub async fn list_all_pools(
     }
 
     // The cursor names the last pool of the previous page.
-    let scope = format!(
-        "pools:{}:{}:{}",
-        query.state.as_deref().unwrap_or(""),
-        query.search.as_deref().unwrap_or(""),
-        query.sort
-    );
-    let start = match state.storage.page_from(&scope, query.cursor.as_deref())? {
-        Some(Continuation(last)) => entries
-            .iter()
-            .position(|e| e.pool_pda == last)
-            .map_or(entries.len(), |i| i + 1),
-        None => 0,
-    };
-    let limit = query.limit.clamp(1, 100);
-    let end = (start + limit).min(entries.len());
-    let next_cursor = (end < entries.len()).then(|| {
-        state
-            .storage
-            .sign_cursor(&scope, &Continuation(entries[end - 1].pool_pda.clone()))
-    });
-    let pools = entries.drain(start..end).collect();
+    let (pools, next_cursor) = page(
+        entries,
+        |e| &e.pool_pda,
+        query.cursor.as_deref(),
+        query.limit.clamp(1, 100),
+    )?;
 
     Ok(Json(AllPoolsResponse { pools, next_cursor }))
 }
@@ -1210,7 +1121,7 @@ pub async fn list_all_pools(
     path = "/v1/drt/pools/{pool_pda}/issuance-log",
     tag = "Credentials",
     summary = "Pool issuance log",
-    description = "A pool's committed uploads (initialisation and issuances), newest first, one cursor page at a time. Admin only.",
+    description = "A pool's uploads (initialisation and issuances, with each burn's signature), newest first, one cursor page at a time. Admin only.",
     security(("bearer_auth" = [])),
     params(
         ("pool_pda" = String, Path, description = "Pool PDA address (base58)"),
@@ -1220,6 +1131,7 @@ pub async fn list_all_pools(
         (status = 200, description = "Issuance log", body = IssuanceLogResponse),
         (status = 400, description = "Invalid cursor"),
         (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Pool not found"),
     )
 )]
 pub async fn get_issuance_log(
@@ -1229,29 +1141,27 @@ pub async fn get_issuance_log(
     Query(query): Query<CursorQuery>,
 ) -> Result<Json<IssuanceLogResponse>, ApiError> {
     // Any admin can view issuance log (no ownership check).
-    let scope = format!("issuance-log:{pool_pda_str}");
-    let page = state.storage.page_from(&scope, query.cursor.as_deref())?;
-    let got = state
-        .storage
-        .records()
-        .log(&pool_pda_str, query.clamped_limit(), page)
-        .await?;
+    let doc = load_pool(&state, &pool_pda_str).await?;
+    let newest_first: Vec<Upload> = doc.uploads().rev().cloned().collect();
+    let (items, next_cursor) = page(
+        newest_first,
+        |u| &u.record_id,
+        query.cursor.as_deref(),
+        query.clamped_limit(),
+    )?;
 
     Ok(Json(IssuanceLogResponse {
         pool_pda: pool_pda_str,
-        records: got
-            .items
+        records: items
             .into_iter()
-            .map(|r| IssuanceRecord {
-                record_id: r.record_id,
-                uploaded_by: r.uploaded_by,
-                rows: r.rows,
-                uploaded_at: r.uploaded_at.to_rfc3339(),
-                redeem_tx_signature: r.redeem_tx_signature,
+            .map(|u| IssuanceRecord {
+                record_id: u.record_id,
+                uploaded_by: u.uploaded_by,
+                rows: u.rows,
+                uploaded_at: u.uploaded_at.to_rfc3339(),
+                redeem_tx_signature: u.signature,
             })
             .collect(),
-        next_cursor: got
-            .next
-            .map(|next| state.storage.sign_cursor(&scope, &next)),
+        next_cursor,
     }))
 }

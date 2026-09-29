@@ -13,7 +13,7 @@ pub const MAX_VALIDATION_ERRORS: usize = 100;
 
 /// How strictly a pool's CSV uploads are checked.
 ///
-/// Set per pool at creation time (see `PoolMetadata::validation_mode`). The
+/// Set per pool at creation time (see `PoolDoc::validation_mode`). The
 /// dashboard infers a schema from the first CSV; users pick a mode that fits
 /// their ingestion source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
@@ -31,7 +31,7 @@ pub enum ValidationMode {
 }
 
 /// Field type constraints supported by the CSV validator.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum FieldType {
     Char(usize),
@@ -43,7 +43,7 @@ pub enum FieldType {
 }
 
 /// Schema definition for a single CSV column.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct FieldSchema {
     pub name: String,
     pub field_type: FieldType,

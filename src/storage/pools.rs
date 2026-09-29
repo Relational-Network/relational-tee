@@ -1,30 +1,29 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Relational Network
 
-//! Credential pools, in Table `pools`:
+//! Credential pools: one sealed document per pool, `pools/{pool_pda}.json`,
+//! holding its metadata, schema, who created it with the creation
+//! signature, the initial upload, the issuance log and the revocations. It
+//! is the pool's audit trail. Every pool view reads this one document, and
+//! every change is a compare-and-swap on it.
 //!
-//! - `pool` / `{pool_pda}`: the pool's metadata and schema.
-//! - `owner:{owner_wallet_id}` / `{pool_pda}`: the owner index, a pointer
-//!   whose target is checked on read.
+//! Each uploaded CSV is its own create-only object,
+//! `pools/{pool_pda}/datasets/{upload_id}`.
 //!
-//! Changes are compare-and-swap writes on the pool row, so no worker needs a
-//! lock. Totals (rows issued, revocations) aren't stored here: they're
-//! computed from the committed records and the revocation index.
+//! Totals aren't stored: they're computed from the document's own entries,
+//! so they can't drift.
 
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use super::store::{
-    Continuation, ETag, Entity, InsertOutcome, Page, Prop, RkRange, StoreError, Table,
-};
-use super::wallets::{cas_backoff, CAS_ATTEMPTS};
-use super::Storage;
+use super::{id, Change, Storage, StoreError};
 use crate::data_validation::{FieldSchema, ValidationMode};
+use crate::store::Created;
 
-const POOL_PK: &str = "pool";
-const PAYLOAD_VERSION: u32 = 1;
+/// The record ID of a pool's initial upload.
+pub const INITIAL: &str = "initial";
 
 /// Operational shape of the pool.
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,9 +34,16 @@ pub enum PoolKind {
     Malta,
 }
 
+impl PoolKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PoolKind::Malta => "malta",
+        }
+    }
+}
+
 /// Pool lifecycle state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PoolState {
     NeedsInit,
     Ready,
@@ -68,9 +74,40 @@ pub struct DrtMetadata {
     pub code_hash_hex: String,
 }
 
-/// A pool: the encrypted payload of its `pool` row.
+/// One uploaded dataset: the initialisation or an issuance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Upload {
+    /// [`INITIAL`] for the initialisation; the `upload_id` for an issuance.
+    pub record_id: String,
+    /// Names the dataset object.
+    pub upload_id: String,
+    /// SHA-256 of the CSV bytes, hex.
+    pub sha256: String,
+    /// CSV rows, excluding the header.
+    pub rows: u64,
+    pub uploaded_by: String,
+    pub uploaded_at: DateTime<Utc>,
+    /// The append-DRT burn, for an issuance: the on-chain anchor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    /// The grant commitment of that burn, hex.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commitment: Option<String>,
+}
+
+/// A revoked credential.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Revocation {
+    pub credential_id: String,
+    pub revoked_by: String,
+    pub revoked_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// The pool document.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PoolMetadata {
+pub struct PoolDoc {
     /// Pool PDA (base58-encoded Solana address).
     pub pool_pda: String,
     /// Human-readable pool name (not on-chain).
@@ -83,25 +120,77 @@ pub struct PoolMetadata {
     /// Wallet ID of the pool owner.
     pub owner_wallet_id: String,
     /// Solana public key of the pool owner (base58).
-    pub owner_pubkey: Option<String>,
+    pub owner_pubkey: String,
     /// Schema id label.
     pub schema_id: String,
     /// The CSV schema uploads are validated against.
     pub schema: Vec<FieldSchema>,
     /// CSV validation strictness.
     pub validation_mode: ValidationMode,
-    pub state: PoolState,
-    pub created_onchain_at: DateTime<Utc>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub initialized_at: Option<DateTime<Utc>>,
-    /// Incremented on every update.
-    pub version: u64,
+    /// The `user_id` who created the pool.
+    pub created_by: String,
+    pub created_at: DateTime<Utc>,
+    /// The transaction that created, registered and sealed the pool.
+    pub creation_signature: String,
+    /// Set once: the pool is `ready` from then on.
+    #[serde(default)]
+    pub initial: Option<Upload>,
+    /// The issuance log, oldest first.
+    #[serde(default)]
+    pub issuances: Vec<Upload>,
+    #[serde(default)]
+    pub revocations: Vec<Revocation>,
 }
 
-/// Whether an update changed the pool.
-pub enum Change {
-    Changed,
-    Unchanged,
+/// Totals computed from a pool document.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Totals {
+    /// CSV rows across every upload, initialisation included.
+    pub rows: u64,
+    pub revoked: u64,
+    /// When the newest issuance (not the initialisation) was uploaded.
+    pub last_issue_at: Option<DateTime<Utc>>,
+}
+
+impl PoolDoc {
+    pub fn state(&self) -> PoolState {
+        if self.initial.is_some() {
+            PoolState::Ready
+        } else {
+            PoolState::NeedsInit
+        }
+    }
+
+    pub fn totals(&self) -> Totals {
+        Totals {
+            rows: self.uploads().map(|u| u.rows).sum(),
+            revoked: self.revocations.len() as u64,
+            last_issue_at: self.issuances.iter().map(|u| u.uploaded_at).max(),
+        }
+    }
+
+    /// The initial upload, then every issuance, oldest first.
+    pub fn uploads(&self) -> impl DoubleEndedIterator<Item = &Upload> {
+        self.initial.iter().chain(&self.issuances)
+    }
+
+    pub fn upload(&self, record_id: &str) -> Option<&Upload> {
+        self.uploads().find(|u| u.record_id == record_id)
+    }
+
+    pub fn is_revoked(&self, credential_id: &str) -> bool {
+        self.revocations
+            .iter()
+            .any(|r| r.credential_id == credential_id)
+    }
+}
+
+fn doc_path(pool_pda: &str) -> String {
+    format!("pools/{pool_pda}.json")
+}
+
+fn dataset_path(pool_pda: &str, upload_id: &str) -> String {
+    format!("pools/{pool_pda}/datasets/{upload_id}")
 }
 
 /// Pool storage.
@@ -109,130 +198,78 @@ pub struct Pools<'a> {
     s: &'a Storage,
 }
 
-fn owner_pk(wallet_id: &str) -> String {
-    format!("owner:{wallet_id}")
-}
-
 impl<'a> Pools<'a> {
     pub(crate) fn new(s: &'a Storage) -> Self {
         Self { s }
     }
 
-    fn pool_row(&self, meta: &PoolMetadata) -> Result<super::store::Entity, StoreError> {
-        Ok(self
-            .s
-            .sealed_row(Table::Pools, POOL_PK, &meta.pool_pda, PAYLOAD_VERSION, meta)?
-            .with("state", Prop::Str(meta.state.as_str().into()))
-            .with(
-                "created_at",
-                Prop::Str(meta.created_onchain_at.to_rfc3339()),
-            ))
-    }
-
-    /// Store a new pool and its owner index row.
-    pub async fn create(&self, meta: &PoolMetadata) -> Result<(), StoreError> {
-        if self
-            .s
-            .index()
-            .insert(Table::Pools, self.pool_row(meta)?)
-            .await?
-            == InsertOutcome::Conflict
-        {
-            return Err(StoreError::Conflict);
-        }
-        let pointer = Entity::new(owner_pk(&meta.owner_wallet_id), &meta.pool_pda);
-        self.s.index().upsert(Table::Pools, pointer).await?;
-        Ok(())
-    }
-
-    /// The pool and its row's ETag.
-    pub async fn get(&self, pool_pda: &str) -> Result<Option<PoolMetadata>, StoreError> {
-        Ok(self.get_versioned(pool_pda).await?.map(|(meta, _)| meta))
-    }
-
-    async fn get_versioned(
-        &self,
-        pool_pda: &str,
-    ) -> Result<Option<(PoolMetadata, ETag)>, StoreError> {
+    /// Store a new pool document; `AlreadyExists` if the pool has one.
+    pub async fn create(&self, doc: &PoolDoc) -> Result<Created, StoreError> {
         self.s
-            .get_sealed(Table::Pools, POOL_PK, pool_pda, PAYLOAD_VERSION)
+            .state()
+            .create_json(&doc_path(&doc.pool_pda), doc)
             .await
     }
 
-    /// Apply `change` to the pool by compare-and-swap, retrying on a lost
-    /// race. `change` runs again on each retry, against the fresh row, and
-    /// may refuse the update by returning an error. Returns `None` if the
-    /// pool doesn't exist.
+    /// The pool's document, or `None` if there's none (or the PDA can't be one).
+    pub async fn get(&self, pool_pda: &str) -> Result<Option<PoolDoc>, StoreError> {
+        let Some(pda) = id(pool_pda) else {
+            return Ok(None);
+        };
+        Ok(self
+            .s
+            .state()
+            .get_json(&doc_path(pda))
+            .await?
+            .map(|(doc, _)| doc))
+    }
+
+    /// Apply `change` to the pool's document by compare-and-swap (see
+    /// [`crate::store::sealed::Sealed::update_json`]). Returns `None` if the
+    /// pool has no document.
     pub async fn update<E: From<StoreError>>(
         &self,
         pool_pda: &str,
-        mut change: impl FnMut(&mut PoolMetadata) -> Result<Change, E>,
-    ) -> Result<Option<PoolMetadata>, E> {
-        let mut attempt = 0;
-        loop {
-            attempt += 1;
-            let Some((mut meta, etag)) = self.get_versioned(pool_pda).await? else {
-                return Ok(None);
-            };
-            if let Change::Unchanged = change(&mut meta)? {
-                return Ok(Some(meta));
-            }
-            meta.version += 1;
-            match self
-                .s
-                .index()
-                .update_if_match(Table::Pools, self.pool_row(&meta)?, &etag)
-                .await
-            {
-                Ok(_) => return Ok(Some(meta)),
-                Err(StoreError::PreconditionFailed) if attempt < CAS_ATTEMPTS => {
-                    cas_backoff(attempt).await
-                }
-                Err(e) => return Err(e.into()),
-            }
-        }
+        change: impl FnMut(&mut PoolDoc) -> Result<Change, E>,
+    ) -> Result<Option<PoolDoc>, E> {
+        let Some(pda) = id(pool_pda) else {
+            return Ok(None);
+        };
+        self.s.state().update_json(&doc_path(pda), change).await
     }
 
-    /// Every pool.
-    pub async fn all(&self) -> Result<Vec<PoolMetadata>, StoreError> {
+    /// Every pool, in PDA order.
+    pub async fn all(&self) -> Result<Vec<PoolDoc>, StoreError> {
         self.s
-            .query_all(Table::Pools, POOL_PK, RkRange::all())
-            .await?
-            .iter()
-            .map(|e| self.s.open_row(Table::Pools, PAYLOAD_VERSION, e))
-            .collect()
+            .state()
+            .list_json("pools/", |p| p.ends_with(".json"))
+            .await
     }
 
-    /// One page of the pools a wallet owns, in pool PDA order.
-    pub async fn owned_by(
+    /// Store an uploaded CSV, create-only. The worker never reads datasets
+    /// back, so they aren't cached.
+    pub async fn put_dataset(
         &self,
-        wallet_id: &str,
-        limit: usize,
-        page: Option<Continuation>,
-    ) -> Result<Page<PoolMetadata>, StoreError> {
-        let pointers = self
+        pool_pda: &str,
+        upload_id: &str,
+        csv: &[u8],
+    ) -> Result<Created, StoreError> {
+        let path = dataset_path(pool_pda, upload_id);
+        self.s.state().create_uncached(&path, csv).await
+    }
+
+    #[cfg(test)]
+    pub async fn read_dataset(
+        &self,
+        pool_pda: &str,
+        upload_id: &str,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        Ok(self
             .s
-            .query_rows(
-                Table::Pools,
-                &owner_pk(wallet_id),
-                RkRange::all(),
-                limit,
-                page,
-            )
-            .await?;
-        let mut items = Vec::with_capacity(pointers.items.len());
-        for pointer in &pointers.items {
-            // The index row isn't authenticated; the pool row decides.
-            if let Some(meta) = self.get(&pointer.rk).await? {
-                if meta.owner_wallet_id == wallet_id {
-                    items.push(meta);
-                }
-            }
-        }
-        Ok(Page {
-            items,
-            next: pointers.next,
-        })
+            .state()
+            .read(&dataset_path(pool_pda, upload_id))
+            .await?
+            .map(|doc| doc.plain.to_vec()))
     }
 }
 
@@ -240,17 +277,17 @@ impl<'a> Pools<'a> {
 pub(crate) mod tests {
     use super::*;
     use crate::data_validation::FieldType;
-    use crate::storage::tests::memory_storage;
+    use crate::storage::tests::{files_storage, two_workers};
 
-    pub(crate) fn pool(pda: &str, owner: &str) -> PoolMetadata {
-        PoolMetadata {
+    pub(crate) fn pool(pda: &str, owner: &str) -> PoolDoc {
+        PoolDoc {
             pool_pda: pda.into(),
             pool_name: format!("Pool {pda}"),
             kind: PoolKind::Malta,
             pool_uuid_hex: "00".repeat(16),
             drts: BTreeMap::new(),
             owner_wallet_id: owner.into(),
-            owner_pubkey: Some("OwnerPubkey".into()),
+            owner_pubkey: "OwnerPubkey".into(),
             schema_id: "s1".into(),
             schema: vec![FieldSchema {
                 name: "id".into(),
@@ -258,38 +295,65 @@ pub(crate) mod tests {
                 nullable: false,
             }],
             validation_mode: ValidationMode::HeadersOnly,
-            state: PoolState::NeedsInit,
-            created_onchain_at: Utc::now(),
-            initialized_at: None,
-            version: 0,
+            created_by: "alice".into(),
+            created_at: Utc::now(),
+            creation_signature: "sig-create".into(),
+            initial: None,
+            issuances: Vec::new(),
+            revocations: Vec::new(),
+        }
+    }
+
+    pub(crate) fn upload(record_id: &str, rows: u64) -> Upload {
+        Upload {
+            record_id: record_id.into(),
+            upload_id: format!("u-{record_id}"),
+            sha256: "00".repeat(32),
+            rows,
+            uploaded_by: "alice".into(),
+            uploaded_at: Utc::now(),
+            signature: None,
+            commitment: None,
         }
     }
 
     #[tokio::test]
-    async fn pools_are_created_once_and_updated_by_compare_and_swap() {
-        let s = memory_storage();
+    async fn a_pool_is_created_once_and_its_totals_are_computed() {
+        let s = files_storage();
         let pools = s.pools();
-        pools.create(&pool("P1", "w1")).await.unwrap();
         assert!(matches!(
-            pools.create(&pool("P1", "w1")).await,
-            Err(StoreError::Conflict)
+            pools.create(&pool("P1", "w1")).await.unwrap(),
+            Created::New(_)
         ));
+        assert_eq!(
+            pools.create(&pool("P1", "w1")).await.unwrap(),
+            Created::AlreadyExists
+        );
 
-        let updated = pools
-            .update::<StoreError>("P1", |m| {
-                m.state = PoolState::Ready;
+        let doc = pools
+            .update::<StoreError>("P1", |d| {
+                d.initial = Some(upload(INITIAL, 3));
+                d.issuances.push(upload("r1", 2));
+                d.revocations.push(Revocation {
+                    credential_id: "r1".into(),
+                    revoked_by: "bob".into(),
+                    revoked_at: Utc::now(),
+                    reason: None,
+                });
                 Ok(Change::Changed)
             })
             .await
             .unwrap()
             .unwrap();
-        assert_eq!((updated.state, updated.version), (PoolState::Ready, 1));
-        let same = pools
-            .update::<StoreError>("P1", |_| Ok(Change::Unchanged))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(same.version, 1, "no-op updates don't write");
+        assert_eq!(doc.state(), PoolState::Ready);
+        let totals = doc.totals();
+        assert_eq!((totals.rows, totals.revoked), (5, 1));
+        assert_eq!(totals.last_issue_at, Some(doc.issuances[0].uploaded_at));
+        let ids: Vec<_> = doc.uploads().rev().map(|u| u.record_id.as_str()).collect();
+        assert_eq!(ids, ["r1", INITIAL]);
+        assert!(doc.is_revoked("r1") && !doc.is_revoked(INITIAL));
+
+        assert!(pools.get("../wallets/x").await.unwrap().is_none());
         assert!(pools
             .update::<StoreError>("nope", |_| Ok(Change::Changed))
             .await
@@ -298,52 +362,29 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn concurrent_updates_both_land() {
-        let (a, b) = crate::storage::tests::two_workers();
-        a.pools().create(&pool("P1", "w1")).await.unwrap();
-        let rename = |name: &'static str| {
-            move |m: &mut PoolMetadata| -> Result<Change, StoreError> {
-                m.pool_name.push_str(name);
-                Ok(Change::Changed)
-            }
-        };
-        let (pools_a, pools_b) = (a.pools(), b.pools());
-        let (x, y) = tokio::join!(
-            pools_a.update("P1", rename("-a")),
-            pools_b.update("P1", rename("-b"))
-        );
-        x.unwrap();
-        y.unwrap();
-        let meta = a.pools().get("P1").await.unwrap().unwrap();
-        assert_eq!(meta.version, 2);
-        assert!(meta.pool_name.contains("-a") && meta.pool_name.contains("-b"));
-    }
-
-    #[tokio::test]
-    async fn owner_listing_pages_and_ignores_forged_pointers() {
-        let s = memory_storage();
-        for i in 0..3 {
-            s.pools()
-                .create(&pool(&format!("P{i}"), "w1"))
-                .await
-                .unwrap();
+    async fn every_worker_sees_the_same_pools_and_datasets_open_only_in_place() {
+        let (a, b, _files) = two_workers();
+        for pda in ["P2", "P1"] {
+            a.pools().create(&pool(pda, "w1")).await.unwrap();
         }
-        s.pools().create(&pool("Q", "w2")).await.unwrap();
-        // A pointer for w1 to a pool w1 doesn't own.
-        s.index()
-            .upsert(Table::Pools, Entity::new(owner_pk("w1"), "Q"))
+        let pdas: Vec<_> = b
+            .pools()
+            .all()
             .await
-            .unwrap();
-
-        let first = s.pools().owned_by("w1", 2, None).await.unwrap();
-        let second = s.pools().owned_by("w1", 2, first.next).await.unwrap();
-        let pdas: Vec<_> = first
-            .items
-            .iter()
-            .chain(&second.items)
-            .map(|p| p.pool_pda.as_str())
+            .unwrap()
+            .into_iter()
+            .map(|p| p.pool_pda)
             .collect();
-        assert_eq!(pdas, ["P0", "P1", "P2"]);
-        assert_eq!(s.pools().all().await.unwrap().len(), 4);
+        assert_eq!(pdas, ["P1", "P2"]);
+
+        a.pools().put_dataset("P1", "u1", b"id\n1\n").await.unwrap();
+        assert_eq!(
+            a.pools().put_dataset("P1", "u1", b"id\n2\n").await.unwrap(),
+            Created::AlreadyExists
+        );
+        assert_eq!(
+            b.pools().read_dataset("P1", "u1").await.unwrap().unwrap(),
+            b"id\n1\n"
+        );
     }
 }

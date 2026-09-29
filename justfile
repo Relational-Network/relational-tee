@@ -13,7 +13,7 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 # Dashboard checkout used by `just spa`.
 pilot := env_var_or_default("IOB_PILOT_DIR", "../iob-pilot")
 
-# Azurite, the local Azure Storage emulator, runs in Docker.
+# Azurite, the local Azure Storage emulator (its Blob service), runs in Docker.
 azurite_image := "mcr.microsoft.com/azure-storage/azurite:latest"
 azurite_name := "relational-tee-azurite"
 
@@ -54,7 +54,7 @@ test *args:
     cargo nextest run {{ args }}
     cargo nextest run --features dev {{ args }}
 
-# Start Azurite (Blob on 127.0.0.1:10000, Table on :10002), keeping data in memory.
+# Start Azurite's Blob service on 127.0.0.1:10000, keeping data in memory.
 azurite:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -63,16 +63,16 @@ azurite:
         exit 0
     fi
     docker run -d --rm --name {{ azurite_name }} \
-        -p 127.0.0.1:10000:10000 -p 127.0.0.1:10002:10002 \
+        -p 127.0.0.1:10000:10000 \
         {{ azurite_image }} \
-        azurite --blobHost 0.0.0.0 --tableHost 0.0.0.0 --inMemoryPersistence --skipApiVersionCheck
+        azurite-blob --blobHost 0.0.0.0 --inMemoryPersistence --skipApiVersionCheck
     sleep 2
 
 # Stop Azurite; its data goes with it.
 azurite-stop:
     docker stop {{ azurite_name }}
 
-# Run the storage tests against Azurite, starting it first if needed.
+# Run the store conformance tests against Azurite, starting it first if needed.
 test-azurite: azurite
     cargo nextest run --features dev --run-ignored only -E 'test(azurite)'
 

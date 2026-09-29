@@ -30,7 +30,7 @@ pub struct AppState {
     pub jwks_cache: Arc<tokio::sync::RwLock<Option<JwksCache>>>,
 
     // ── Storage ─────────────────────────────────────────────────
-    /// Encrypted Blob and Table storage.
+    /// Sealed documents in Blob storage.
     pub storage: Arc<Storage>,
 
     // ── Chain ───────────────────────────────────────────────────
@@ -42,8 +42,8 @@ pub struct AppState {
 
 #[cfg(test)]
 impl AppState {
-    /// A worker with test keys, in-memory storage, and a Solana client that
-    /// nothing answers.
+    /// A worker with test keys, storage in a temporary directory, and a
+    /// Solana client that nothing answers.
     pub fn for_tests() -> Self {
         use crate::health::Certificate;
         use crate::tee::KeyName;
@@ -61,7 +61,7 @@ impl AppState {
             health,
             audience: crate::config::AVS_AUDIENCE.to_string(),
             jwks_cache: Arc::new(tokio::sync::RwLock::new(None)),
-            storage: Arc::new(crate::storage::tests::memory_storage()),
+            storage: Arc::new(crate::storage::tests::files_storage()),
             solana_client: Arc::new(SolanaClient::new(
                 unreachable,
                 crate::blockchain::types::devnet_config(unreachable),

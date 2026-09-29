@@ -35,8 +35,8 @@ fn default_page_limit() -> usize {
 }
 
 /// Cursor pagination: pass the previous response's `next_cursor` as
-/// `cursor` to get the next page. Cursors are signed, and any worker
-/// accepts them.
+/// `cursor` to get the next page. A cursor is the key of the last item
+/// shown, so any worker continues it.
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct CursorQuery {
     /// `next_cursor` from the previous page; omit for the first page.
@@ -51,6 +51,35 @@ impl CursorQuery {
     pub fn clamped_limit(&self) -> usize {
         self.limit.clamp(1, 200)
     }
+}
+
+/// One page of `items`, which are in list order: up to `limit` items after
+/// the one whose key is `cursor`, and the next page's cursor if there's
+/// more. A cursor that names no item is refused.
+pub(crate) fn page<T>(
+    items: Vec<T>,
+    key: impl Fn(&T) -> &str,
+    cursor: Option<&str>,
+    limit: usize,
+) -> Result<(Vec<T>, Option<String>), ApiError> {
+    let start = match cursor.filter(|c| !c.is_empty()) {
+        None => 0,
+        Some(cursor) => items
+            .iter()
+            .position(|item| key(item) == cursor)
+            .map(|i| i + 1)
+            .ok_or_else(|| {
+                ApiError::bad_request("invalid pagination cursor").with_code("invalid_cursor")
+            })?,
+    };
+    let end = start.saturating_add(limit.max(1)).min(items.len());
+    let next = (end < items.len()).then(|| key(&items[end - 1]).to_string());
+    let page = items
+        .into_iter()
+        .skip(start)
+        .take(end.saturating_sub(start))
+        .collect();
+    Ok((page, next))
 }
 
 /// Reject callers who don't own the wallet.
@@ -213,4 +242,30 @@ pub fn drt_router() -> Router<AppState> {
         )
         // ── Marketplace discovery ────────────────────────────────
         .route("/v1/drt/pools/list", get(credentials::list_all_pools))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::page;
+
+    #[test]
+    fn pages_continue_after_the_cursor_and_refuse_unknown_ones() {
+        let items: Vec<String> = ["a", "b", "c", "d", "e"].map(String::from).to_vec();
+        let (first, next) = page(items.clone(), |s| s, None, 2).unwrap();
+        assert_eq!(
+            (first, next.as_deref()),
+            (vec!["a".into(), "b".into()], Some("b"))
+        );
+        let (second, next) = page(items.clone(), |s| s, Some("b"), 2).unwrap();
+        assert_eq!(
+            (second, next.as_deref()),
+            (vec!["c".into(), "d".into()], Some("d"))
+        );
+        let (last, next) = page(items.clone(), |s| s, Some("d"), 2).unwrap();
+        assert_eq!((last, next), (vec!["e".to_string()], None));
+        let (none, next) = page(items.clone(), |s| s, Some("e"), 2).unwrap();
+        assert!(none.is_empty() && next.is_none());
+        let err = page(items, |s| s, Some("zz"), 2).unwrap_err();
+        assert_eq!(err.code, "invalid_cursor");
+    }
 }

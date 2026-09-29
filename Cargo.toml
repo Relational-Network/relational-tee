@@ -45,7 +45,6 @@ base64 = { version = "0.22.1", default-features = false }
 hkdf = { version = "0.12.4", default-features = false }
 aes-gcm = { version = "0.10.3", default-features = false, features = ["aes", "alloc"] }
 zeroize = { version = "1.8", default-features = false, features = ["alloc"] }
-aes-kw = { version = "0.2", default-features = false, features = ["alloc"] }
 percent-encoding = { version = "2.3", default-features = false, features = ["alloc"] }
 # Dev builds only: the fake MAA signs RS256 tokens with aws-lc-rs, which rustls
 # and jsonwebtoken already use; the rsa crate stays banned.

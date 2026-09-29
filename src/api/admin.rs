@@ -23,10 +23,7 @@ use crate::error::ApiError;
 use crate::state::AppState;
 use crate::storage::wallets::{WalletResponse, WalletStatus};
 
-use super::{load_wallet, CursorQuery};
-
-/// The cursor scope of the admin wallet list.
-const WALLETS_SCOPE: &str = "wallets";
+use super::{load_wallet, page, CursorQuery};
 
 // ============================================================================
 // Response types
@@ -140,7 +137,7 @@ pub async fn get_wallet_stats(
     path = "/v1/admin/wallets",
     tag = "Admin",
     summary = "List all wallets (admin)",
-    description = "Returns all wallets across all users, one cursor page at a time. Admin only.",
+    description = "Returns all wallets across all users, in wallet ID order, one cursor page at a time. Admin only.",
     security(("bearer_auth" = [])),
     params(CursorQuery),
     responses(
@@ -155,16 +152,13 @@ pub async fn list_all_wallets(
     State(state): State<AppState>,
     Query(query): Query<CursorQuery>,
 ) -> Result<Json<AdminListWalletsResponse>, ApiError> {
-    let page = state
-        .storage
-        .page_from(WALLETS_SCOPE, query.cursor.as_deref())?;
-    let got = state
-        .storage
-        .wallets()
-        .list(query.clamped_limit(), page)
-        .await?;
-    let entries: Vec<AdminWalletEntry> = got
-        .items
+    let (wallets, next_cursor) = page(
+        state.storage.wallets().all().await?,
+        |w| &w.wallet_id,
+        query.cursor.as_deref(),
+        query.clamped_limit(),
+    )?;
+    let entries: Vec<AdminWalletEntry> = wallets
         .into_iter()
         .map(|w| AdminWalletEntry {
             owner_user_id: w.owner_user_id.clone(),
@@ -174,9 +168,7 @@ pub async fn list_all_wallets(
 
     Ok(Json(AdminListWalletsResponse {
         wallets: entries,
-        next_cursor: got
-            .next
-            .map(|next| state.storage.sign_cursor(WALLETS_SCOPE, &next)),
+        next_cursor,
     }))
 }
 

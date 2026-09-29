@@ -4,7 +4,7 @@
 /target
 drt-examples/mean/target
 
-# Local storage left by older builds
+# Local files of dev builds (STORAGE_BACKEND=files)
 /data/
 
 SPRINT*

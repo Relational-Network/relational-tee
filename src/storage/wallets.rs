@@ -3,36 +3,28 @@
 
 //! Custodial wallets.
 //!
-//! - Blob `wallets/{wallet_id}/keypair.enc`: the Ed25519 keypair in an
-//!   envelope; create-only. Key Vault has no Ed25519 keys, so the worker
-//!   encrypts them itself.
-//! - Table `wallets`: `wallet` / `{wallet_id}` holds the metadata; the owner
-//!   index `owner:{h(user_id)}` / `wallet` holds one row per user, so a user
-//!   has at most one wallet.
+//! - `wallets/{wallet_id}.json`: owner, address, label and status; created
+//!   once, then changed by compare-and-swap.
+//! - `wallets/{wallet_id}/keypair`: the Ed25519 keypair, create-only. Key
+//!   Vault has no Ed25519 keys, so the worker seals them itself.
+//! - `owners/{user_id}.json`: the user's current wallet. There's one per
+//!   user, which is what keeps a user to one wallet.
 //!
-//! Status changes are compare-and-swap writes, retried a few times on
-//! conflict. Plaintext `status` and `created_at` properties are copies for
-//! filtering; the worker only trusts the encrypted payload.
+//! Creating a wallet points the owner at it first, then stores the keypair,
+//! then the wallet document, so every step can be repeated.
 
-use std::time::Duration;
-
-use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
-use super::store::{
-    Container, Continuation, ETag, InsertOutcome, Page, Prop, PutOutcome, RkRange, StoreError,
-    Table,
-};
-use super::Storage;
+use super::{id, Change, Storage, StoreError};
+use crate::store::{Created, Replaced};
 
-const WALLET_PK: &str = "wallet";
-const OWNER_RK: &str = "wallet";
-const PAYLOAD_VERSION: u32 = 1;
-/// Compare-and-swap attempts (the first try and three retries) before a write
-/// gives up with a conflict.
-pub(crate) const CAS_ATTEMPTS: u32 = 4;
+/// An owner pointer naming a wallet still missing this long after it was
+/// set belongs to a create that died, and can be taken over.
+const ABANDONED_AFTER: chrono::Duration = chrono::Duration::minutes(10);
+/// Pointer compare-and-swap attempts before giving up.
+const POINTER_ATTEMPTS: u32 = 4;
 
 /// Wallet lifecycle status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,7 +45,7 @@ impl WalletStatus {
     }
 }
 
-/// Wallet metadata: the encrypted payload of a `wallet` row.
+/// The wallet document.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalletMetadata {
     pub wallet_id: String,
@@ -61,11 +53,8 @@ pub struct WalletMetadata {
     pub public_address: String,
     pub created_at: DateTime<Utc>,
     pub status: WalletStatus,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
-    /// Incremented on every update.
-    #[serde(default)]
-    pub version: u64,
 }
 
 /// API-facing wallet response (**never** contains private key material).
@@ -91,18 +80,40 @@ impl From<WalletMetadata> for WalletResponse {
     }
 }
 
-/// The payload of an index row: the wallet it points to.
+/// `owners/{user_id}.json`.
 #[derive(Serialize, Deserialize)]
-struct WalletPointer {
-    wallet_id: String,
+struct OwnerPointer {
+    /// `None` once the wallet is deleted.
+    wallet_id: Option<String>,
+    updated_at: DateTime<Utc>,
 }
 
 /// The outcome of [`Wallets::create`].
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum CreateOutcome {
-    Created,
-    /// The owner already has this (non-deleted) wallet.
+    Created(WalletMetadata),
+    /// The owner has this other wallet.
     OwnerHasWallet(String),
+}
+
+/// A new wallet's keypair: its 64 bytes and base58 address.
+pub struct NewKeypair {
+    pub bytes: Zeroizing<Vec<u8>>,
+    pub address: String,
+}
+
+fn wallet_path(wallet_id: &str) -> String {
+    format!("wallets/{wallet_id}.json")
+}
+
+fn keypair_path(wallet_id: &str) -> String {
+    format!("wallets/{wallet_id}/keypair")
+}
+
+fn owner_path(user_id: &str) -> Result<String, StoreError> {
+    id(user_id)
+        .map(|u| format!("owners/{u}.json"))
+        .ok_or_else(|| StoreError::Invalid("the user ID can't name an object".into()))
 }
 
 /// Wallet storage.
@@ -110,302 +121,217 @@ pub struct Wallets<'a> {
     s: &'a Storage,
 }
 
-fn keypair_path(wallet_id: &str) -> String {
-    format!("{wallet_id}/keypair.enc")
-}
-
-/// A short random pause before retrying a lost compare-and-swap.
-pub(crate) async fn cas_backoff(attempt: u32) {
-    use p256::elliptic_curve::rand_core::{OsRng, RngCore};
-    let millis = 20 * u64::from(attempt) + u64::from(OsRng.next_u32() % 50);
-    tokio::time::sleep(Duration::from_millis(millis)).await;
-}
-
 impl<'a> Wallets<'a> {
     pub(crate) fn new(s: &'a Storage) -> Self {
         Self { s }
     }
 
-    fn owner_pk(&self, user_id: &str) -> String {
-        format!("owner:{}", self.s.keys().index_hash(user_id))
-    }
-
-    fn wallet_row(&self, meta: &WalletMetadata) -> Result<super::store::Entity, StoreError> {
-        Ok(self
-            .s
-            .sealed_row(
-                Table::Wallets,
-                WALLET_PK,
-                &meta.wallet_id,
-                PAYLOAD_VERSION,
-                meta,
-            )?
-            .with("status", Prop::Str(meta.status.as_str().into()))
-            .with("created_at", Prop::Str(meta.created_at.to_rfc3339())))
-    }
-
-    /// Create a wallet: first claim the owner's index row (one wallet per
-    /// user), then store the keypair create-only, then the wallet row. An
-    /// index row left by an interrupted create, or pointing at a deleted
-    /// wallet, is taken over.
+    /// Create wallet `wallet_id` for `owner`: point the owner at it, store
+    /// `keypair` create-only (or reuse one stored by an earlier attempt,
+    /// whose address `address_of` reads), then create the wallet document.
     pub async fn create(
         &self,
-        meta: &WalletMetadata,
-        keypair: &[u8],
+        owner: &str,
+        wallet_id: &str,
+        label: Option<String>,
+        keypair: NewKeypair,
+        address_of: impl Fn(&[u8]) -> Option<String>,
     ) -> Result<CreateOutcome, StoreError> {
-        let owner_pk = self.owner_pk(&meta.owner_user_id);
-        let pointer = WalletPointer {
-            wallet_id: meta.wallet_id.clone(),
-        };
-        let owner_row = self.s.sealed_row(
-            Table::Wallets,
-            &owner_pk,
-            OWNER_RK,
-            PAYLOAD_VERSION,
-            &pointer,
-        )?;
-        let mut attempt = 0;
-        loop {
-            attempt += 1;
-            match self
-                .s
-                .index()
-                .insert(Table::Wallets, owner_row.clone())
-                .await?
-            {
-                InsertOutcome::Inserted(_) => break,
-                InsertOutcome::Conflict => {}
-            }
-            let Some((existing, etag)) = self
-                .s
-                .get_sealed::<WalletPointer>(Table::Wallets, &owner_pk, OWNER_RK, PAYLOAD_VERSION)
-                .await?
-            else {
-                continue; // deleted in between: try the insert again
-            };
-            if let Some(wallet) = self.get(&existing.wallet_id).await? {
-                if wallet.status != WalletStatus::Deleted {
-                    return Ok(CreateOutcome::OwnerHasWallet(existing.wallet_id));
-                }
-            }
-            match self
-                .s
-                .index()
-                .update_if_match(Table::Wallets, owner_row.clone(), &etag)
-                .await
-            {
-                Ok(_) => break,
-                Err(StoreError::PreconditionFailed | StoreError::NotFound)
-                    if attempt < CAS_ATTEMPTS =>
-                {
-                    cas_backoff(attempt).await
-                }
-                Err(e) => return Err(e),
-            }
+        if let Some(other) = self.point_owner_at(owner, wallet_id).await? {
+            return Ok(CreateOutcome::OwnerHasWallet(other));
         }
 
-        let path = keypair_path(&meta.wallet_id);
-        let sealed = self.s.keys().seal_blob(Container::Wallets, &path, keypair);
-        if self
-            .s
-            .objects()
-            .put_if_absent(Container::Wallets, &path, Bytes::from(sealed))
+        let state = self.s.state();
+        let address = match state
+            .create(&keypair_path(wallet_id), &keypair.bytes)
             .await?
-            == PutOutcome::AlreadyExists
         {
-            return Err(StoreError::Invalid(format!(
-                "wallet {} already has a keypair",
-                meta.wallet_id
-            )));
+            Created::New(_) => keypair.address,
+            Created::AlreadyExists => {
+                let stored = self.read_keypair(wallet_id).await?;
+                address_of(&stored).ok_or_else(|| {
+                    StoreError::Integrity(format!("wallet {wallet_id}'s keypair doesn't parse"))
+                })?
+            }
+        };
+
+        let wallet = WalletMetadata {
+            wallet_id: wallet_id.to_string(),
+            owner_user_id: owner.to_string(),
+            public_address: address,
+            created_at: Utc::now(),
+            status: WalletStatus::Active,
+            label,
+        };
+        match state.create_json(&wallet_path(wallet_id), &wallet).await? {
+            Created::New(_) => Ok(CreateOutcome::Created(wallet)),
+            Created::AlreadyExists => self
+                .get(wallet_id)
+                .await?
+                .map(CreateOutcome::Created)
+                .ok_or_else(|| StoreError::Invalid(format!("wallet {wallet_id} vanished"))),
         }
-        if self
-            .s
-            .index()
-            .insert(Table::Wallets, self.wallet_row(meta)?)
-            .await?
-            == InsertOutcome::Conflict
-        {
-            return Err(StoreError::Invalid(format!(
-                "wallet {} already exists",
-                meta.wallet_id
-            )));
-        }
-        Ok(CreateOutcome::Created)
     }
 
-    /// The wallet and its row's ETag.
-    async fn get_versioned(
+    /// Point `owner` at `wallet_id`, unless they have another wallet, which
+    /// is returned. A pointer to a deleted wallet, or to one still missing
+    /// after [`ABANDONED_AFTER`], is taken over.
+    async fn point_owner_at(
         &self,
+        owner: &str,
         wallet_id: &str,
-    ) -> Result<Option<(WalletMetadata, ETag)>, StoreError> {
-        self.s
-            .get_sealed(Table::Wallets, WALLET_PK, wallet_id, PAYLOAD_VERSION)
-            .await
+    ) -> Result<Option<String>, StoreError> {
+        let path = owner_path(owner)?;
+        let state = self.s.state();
+        let mine = OwnerPointer {
+            wallet_id: Some(wallet_id.to_string()),
+            updated_at: Utc::now(),
+        };
+        for _ in 0..POINTER_ATTEMPTS {
+            let Some((pointer, etag)) = state.get_json::<OwnerPointer>(&path).await? else {
+                match state.create_json(&path, &mine).await? {
+                    Created::New(_) => return Ok(None),
+                    Created::AlreadyExists => continue,
+                }
+            };
+            let replaceable = match &pointer.wallet_id {
+                None => true,
+                Some(current) if current == wallet_id => return Ok(None),
+                Some(current) => match self.get(current).await? {
+                    Some(wallet) => wallet.status == WalletStatus::Deleted,
+                    None => Utc::now() - pointer.updated_at > ABANDONED_AFTER,
+                },
+            };
+            if !replaceable {
+                return Ok(pointer.wallet_id);
+            }
+            if let Replaced::Done(_) = state.replace_json(&path, &mine, &etag).await? {
+                return Ok(None);
+            }
+        }
+        Err(StoreError::Contended)
     }
 
     pub async fn get(&self, wallet_id: &str) -> Result<Option<WalletMetadata>, StoreError> {
-        Ok(self.get_versioned(wallet_id).await?.map(|(meta, _)| meta))
+        let Some(wallet_id) = id(wallet_id) else {
+            return Ok(None);
+        };
+        Ok(self
+            .s
+            .state()
+            .get_json(&wallet_path(wallet_id))
+            .await?
+            .map(|(wallet, _)| wallet))
     }
 
-    /// The ID of the user's wallet, if they have one.
+    /// The wallet the user's owner pointer names, if any.
     pub async fn wallet_id_for_owner(&self, user_id: &str) -> Result<Option<String>, StoreError> {
         Ok(self
             .s
-            .get_sealed::<WalletPointer>(
-                Table::Wallets,
-                &self.owner_pk(user_id),
-                OWNER_RK,
-                PAYLOAD_VERSION,
-            )
+            .state()
+            .get_json::<OwnerPointer>(&owner_path(user_id)?)
             .await?
-            .map(|(pointer, _)| pointer.wallet_id))
+            .and_then(|(pointer, _)| pointer.wallet_id))
     }
 
-    /// Set the wallet's status by compare-and-swap. Returns the updated
-    /// wallet, or `None` if it doesn't exist. Already being in the target
-    /// status counts as success.
+    /// Set the wallet's status by compare-and-swap. Returns the wallet, or
+    /// `None` if it doesn't exist. Already being in `status` is success.
     pub async fn set_status(
         &self,
         wallet_id: &str,
         status: WalletStatus,
     ) -> Result<Option<WalletMetadata>, StoreError> {
-        let mut attempt = 0;
-        loop {
-            attempt += 1;
-            let Some((mut meta, etag)) = self.get_versioned(wallet_id).await? else {
-                return Ok(None);
-            };
-            if meta.status == status {
-                return Ok(Some(meta));
-            }
-            meta.status = status;
-            meta.version += 1;
-            match self
-                .s
-                .index()
-                .update_if_match(Table::Wallets, self.wallet_row(&meta)?, &etag)
-                .await
-            {
-                Ok(_) => return Ok(Some(meta)),
-                Err(StoreError::PreconditionFailed) if attempt < CAS_ATTEMPTS => {
-                    cas_backoff(attempt).await
+        let Some(wallet_id) = id(wallet_id) else {
+            return Ok(None);
+        };
+        self.s
+            .state()
+            .update_json::<WalletMetadata, StoreError>(&wallet_path(wallet_id), |w| {
+                if w.status == status {
+                    return Ok(Change::Unchanged);
                 }
-                Err(e) => return Err(e),
-            }
-        }
+                w.status = status;
+                Ok(Change::Changed)
+            })
+            .await
     }
 
-    /// Mark the wallet deleted, then drop its owner's index row so the owner
-    /// can create another. The keypair is kept.
+    /// Mark the wallet deleted, then clear its owner's pointer so they can
+    /// create another. The keypair is kept.
     pub async fn soft_delete(&self, wallet: &WalletMetadata) -> Result<(), StoreError> {
         self.set_status(&wallet.wallet_id, WalletStatus::Deleted)
             .await?;
-        let owner_pk = self.owner_pk(&wallet.owner_user_id);
-        if let Some((pointer, etag)) = self
-            .s
-            .get_sealed::<WalletPointer>(Table::Wallets, &owner_pk, OWNER_RK, PAYLOAD_VERSION)
-            .await?
-        {
-            if pointer.wallet_id == wallet.wallet_id {
-                match self
-                    .s
-                    .index()
-                    .delete_if_match(Table::Wallets, &owner_pk, OWNER_RK, &etag)
-                    .await
-                {
-                    // A concurrent create already took the row over.
-                    Ok(()) | Err(StoreError::PreconditionFailed | StoreError::NotFound) => {}
-                    Err(e) => return Err(e),
+        self.s
+            .state()
+            .update_json::<OwnerPointer, StoreError>(&owner_path(&wallet.owner_user_id)?, |p| {
+                if p.wallet_id.as_deref() != Some(&wallet.wallet_id) {
+                    return Ok(Change::Unchanged);
                 }
-            }
-        }
+                p.wallet_id = None;
+                p.updated_at = Utc::now();
+                Ok(Change::Changed)
+            })
+            .await?;
         Ok(())
     }
 
-    /// One page of all wallets, in wallet ID order.
-    pub async fn list(
-        &self,
-        limit: usize,
-        page: Option<Continuation>,
-    ) -> Result<Page<WalletMetadata>, StoreError> {
-        let rows = self
-            .s
-            .query_rows(Table::Wallets, WALLET_PK, RkRange::all(), limit, page)
-            .await?;
-        Ok(Page {
-            items: rows
-                .items
-                .iter()
-                .map(|e| self.s.open_row(Table::Wallets, PAYLOAD_VERSION, e))
-                .collect::<Result<_, _>>()?,
-            next: rows.next,
-        })
-    }
-
-    /// Every wallet.
+    /// Every wallet, in wallet ID order.
     pub async fn all(&self) -> Result<Vec<WalletMetadata>, StoreError> {
         self.s
-            .query_all(Table::Wallets, WALLET_PK, RkRange::all())
-            .await?
-            .iter()
-            .map(|e| self.s.open_row(Table::Wallets, PAYLOAD_VERSION, e))
-            .collect()
+            .state()
+            .list_json("wallets/", |p| p.ends_with(".json"))
+            .await
     }
 
     /// The wallet's 64-byte Ed25519 keypair. **Internal use only.**
     pub async fn read_keypair(&self, wallet_id: &str) -> Result<Zeroizing<Vec<u8>>, StoreError> {
-        let path = keypair_path(wallet_id);
-        let object = self
-            .s
-            .objects()
-            .get(Container::Wallets, &path)
-            .await?
-            .ok_or(StoreError::NotFound)?;
-        self.s
-            .keys()
-            .open_blob(Container::Wallets, &path, &object.body)
+        let path = keypair_path(
+            id(wallet_id).ok_or_else(|| StoreError::Invalid("invalid wallet ID".into()))?,
+        );
+        let doc =
+            self.s.state().read_immutable(&path).await?.ok_or_else(|| {
+                StoreError::Integrity(format!("wallet {wallet_id} has no keypair"))
+            })?;
+        Ok(Zeroizing::new(doc.plain.to_vec()))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::memory::MemoryStore;
-    use crate::storage::tests::memory_storage;
-    use crate::storage::StorageKeys;
-    use crate::tee::tests::fixed_key;
-    use std::sync::Arc;
+    use crate::storage::tests::{files_storage, two_workers};
 
-    fn wallet(id: &str, owner: &str) -> WalletMetadata {
-        WalletMetadata {
-            wallet_id: id.into(),
-            owner_user_id: owner.into(),
-            public_address: format!("addr-{id}"),
-            created_at: Utc::now(),
-            status: WalletStatus::Active,
-            label: None,
-            version: 0,
+    fn keypair(seed: u8) -> NewKeypair {
+        NewKeypair {
+            bytes: Zeroizing::new(vec![seed; 64]),
+            address: format!("addr-{seed}"),
         }
+    }
+
+    fn address_of(bytes: &[u8]) -> Option<String> {
+        Some(format!("addr-{}", bytes[0]))
+    }
+
+    async fn create(s: &Storage, owner: &str, wallet_id: &str, seed: u8) -> CreateOutcome {
+        s.wallets()
+            .create(owner, wallet_id, None, keypair(seed), address_of)
+            .await
+            .unwrap()
     }
 
     #[tokio::test]
     async fn one_wallet_per_user_until_it_is_deleted() {
-        let s = memory_storage();
-        let wallets = s.wallets();
-        let first = wallet("w1", "alice");
+        let s = files_storage();
+        let CreateOutcome::Created(first) = create(&s, "alice", "w1", 7).await else {
+            panic!("created");
+        };
+        assert_eq!(first.public_address, "addr-7");
+        assert!(matches!(
+            create(&s, "alice", "w2", 8).await,
+            CreateOutcome::OwnerHasWallet(w) if w == "w1"
+        ));
         assert_eq!(
-            wallets.create(&first, &[7; 64]).await.unwrap(),
-            CreateOutcome::Created
-        );
-        assert_eq!(
-            wallets
-                .create(&wallet("w2", "alice"), &[8; 64])
-                .await
-                .unwrap(),
-            CreateOutcome::OwnerHasWallet("w1".into())
-        );
-        assert_eq!(
-            wallets
+            s.wallets()
                 .wallet_id_for_owner("alice")
                 .await
                 .unwrap()
@@ -413,146 +339,108 @@ mod tests {
             Some("w1")
         );
         assert_eq!(
-            wallets.read_keypair("w1").await.unwrap().as_slice(),
+            s.wallets().read_keypair("w1").await.unwrap().as_slice(),
             &[7; 64]
         );
 
-        wallets.soft_delete(&first).await.unwrap();
-        assert_eq!(wallets.wallet_id_for_owner("alice").await.unwrap(), None);
+        s.wallets().soft_delete(&first).await.unwrap();
         assert_eq!(
-            wallets.get("w1").await.unwrap().unwrap().status,
-            WalletStatus::Deleted
+            s.wallets().wallet_id_for_owner("alice").await.unwrap(),
+            None
         );
-        assert_eq!(
-            wallets
-                .create(&wallet("w2", "alice"), &[8; 64])
-                .await
-                .unwrap(),
-            CreateOutcome::Created
-        );
-    }
-
-    #[tokio::test]
-    async fn an_index_row_left_by_an_interrupted_create_is_taken_over() {
-        let s = memory_storage();
-        let wallets = s.wallets();
-        // Only the owner index row of a create that died before the wallet row.
-        let pointer = WalletPointer {
-            wallet_id: "ghost".into(),
-        };
-        let row = s
-            .sealed_row(
-                Table::Wallets,
-                &wallets.owner_pk("bob"),
-                OWNER_RK,
-                PAYLOAD_VERSION,
-                &pointer,
-            )
-            .unwrap();
-        s.index().insert(Table::Wallets, row).await.unwrap();
-
-        assert_eq!(
-            wallets
-                .create(&wallet("w9", "bob"), &[1; 64])
-                .await
-                .unwrap(),
-            CreateOutcome::Created
-        );
-        assert_eq!(
-            wallets.wallet_id_for_owner("bob").await.unwrap().as_deref(),
-            Some("w9")
-        );
-    }
-
-    #[tokio::test]
-    async fn status_changes_are_compare_and_swap_and_idempotent() {
-        let s = memory_storage();
-        let wallets = s.wallets();
-        wallets
-            .create(&wallet("w1", "carol"), &[1; 64])
-            .await
-            .unwrap();
-        let suspended = wallets
-            .set_status("w1", WalletStatus::Suspended)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(suspended.version, 1);
-        let again = wallets
-            .set_status("w1", WalletStatus::Suspended)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(again.version, 1, "already in the target status: no write");
-        assert!(wallets
-            .set_status("nope", WalletStatus::Active)
-            .await
-            .unwrap()
-            .is_none());
-    }
-
-    #[tokio::test]
-    async fn storage_sees_no_owner_ids_and_tampered_rows_fail() {
-        let store = Arc::new(MemoryStore::new());
-        let s = Storage::new(
-            store.clone(),
-            store.clone(),
-            StorageKeys::derive(&fixed_key(1)),
-            "w".into(),
-        );
-        s.wallets()
-            .create(&wallet("w1", "user_2abcSECRET"), &[1; 64])
-            .await
-            .unwrap();
-        let owner_pk = s.wallets().owner_pk("user_2abcSECRET");
-        assert!(!owner_pk.contains("SECRET"));
-
-        // A storage admin flips the plaintext status: the payload still rules.
-        store.tamper_row(Table::Wallets, WALLET_PK, "w1", |props| {
-            props.insert("status".into(), Prop::Str("suspended".into()));
-        });
         assert_eq!(
             s.wallets().get("w1").await.unwrap().unwrap().status,
-            WalletStatus::Active
+            WalletStatus::Deleted
         );
-
-        // Moving the payload to another row fails the AAD.
-        let payload = s
-            .index()
-            .get(Table::Wallets, WALLET_PK, "w1")
-            .await
-            .unwrap()
-            .unwrap();
-        let mut moved = payload.clone();
-        moved.rk = "w2".into();
-        s.index().upsert(Table::Wallets, moved).await.unwrap();
         assert!(matches!(
-            s.wallets().get("w2").await,
-            Err(StoreError::Integrity(_))
+            create(&s, "alice", "w2", 8).await,
+            CreateOutcome::Created(_)
         ));
     }
 
     #[tokio::test]
-    async fn wallet_lists_page_with_cursors_across_workers() {
-        let (a, b) = crate::storage::tests::two_workers();
-        for i in 0..5 {
-            a.wallets()
-                .create(&wallet(&format!("w{i}"), &format!("user{i}")), &[1; 64])
-                .await
-                .unwrap();
+    async fn a_repeated_create_reuses_its_keypair_and_document() {
+        let (a, b, _files) = two_workers();
+        let CreateOutcome::Created(first) = create(&a, "bob", "w1", 1).await else {
+            panic!("created");
+        };
+        // A retry on another worker generates a new keypair but keeps the stored one.
+        let CreateOutcome::Created(again) = create(&b, "bob", "w1", 2).await else {
+            panic!("the same wallet");
+        };
+        assert_eq!(again.public_address, first.public_address);
+        assert_eq!(
+            b.wallets().read_keypair("w1").await.unwrap().as_slice(),
+            &[1; 64]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pointer_to_a_wallet_that_never_appeared_is_taken_over_later() {
+        let s = files_storage();
+        // Only the pointer of a create that died before its wallet document.
+        let stale = OwnerPointer {
+            wallet_id: Some("ghost".into()),
+            updated_at: Utc::now() - chrono::Duration::minutes(11),
+        };
+        s.state()
+            .create_json("owners/carol.json", &stale)
+            .await
+            .unwrap();
+        assert!(matches!(
+            create(&s, "carol", "w9", 9).await,
+            CreateOutcome::Created(_)
+        ));
+
+        // A fresh one is still in progress, so it isn't.
+        let fresh = OwnerPointer {
+            wallet_id: Some("pending".into()),
+            updated_at: Utc::now(),
+        };
+        s.state()
+            .create_json("owners/dave.json", &fresh)
+            .await
+            .unwrap();
+        assert!(matches!(
+            create(&s, "dave", "w10", 10).await,
+            CreateOutcome::OwnerHasWallet(w) if w == "pending"
+        ));
+    }
+
+    #[tokio::test]
+    async fn status_changes_are_compare_and_swap_and_idempotent() {
+        let s = files_storage();
+        create(&s, "erin", "w1", 1).await;
+        let suspended = s
+            .wallets()
+            .set_status("w1", WalletStatus::Suspended)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(suspended.status, WalletStatus::Suspended);
+        assert!(s
+            .wallets()
+            .set_status("nope", WalletStatus::Active)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(s.wallets().get("../x").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn wallet_lists_skip_keypairs() {
+        let (a, b, _files) = two_workers();
+        for (i, owner) in ["u1", "u2", "u3"].iter().enumerate() {
+            create(&a, owner, &format!("w{i}"), i as u8).await;
         }
-        let first = a.wallets().list(2, None).await.unwrap();
-        assert_eq!(first.items.len(), 2);
-        let cursor = a.sign_cursor("wallets", first.next.as_ref().unwrap());
-        let page = b.page_from("wallets", Some(&cursor)).unwrap();
-        let second = b.wallets().list(2, page).await.unwrap();
-        let ids: Vec<_> = first
-            .items
-            .iter()
-            .chain(&second.items)
-            .map(|w| w.wallet_id.as_str())
+        let ids: Vec<_> = b
+            .wallets()
+            .all()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|w| w.wallet_id)
             .collect();
-        assert_eq!(ids, ["w0", "w1", "w2", "w3"]);
-        assert_eq!(b.wallets().all().await.unwrap().len(), 5);
+        assert_eq!(ids, ["w0", "w1", "w2"]);
     }
 }

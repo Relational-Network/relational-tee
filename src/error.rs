@@ -176,15 +176,13 @@ impl From<serde_json::Error> for ApiError {
     }
 }
 
-impl From<crate::storage::StoreError> for ApiError {
-    fn from(e: crate::storage::StoreError) -> Self {
-        use crate::storage::StoreError;
+impl From<crate::store::StoreError> for ApiError {
+    fn from(e: crate::store::StoreError) -> Self {
+        use crate::store::StoreError;
         match e {
-            StoreError::NotFound => Self::not_found("not found"),
-            StoreError::PreconditionFailed => {
+            StoreError::Contended => {
                 Self::conflict("the resource changed while it was being updated; retry")
             }
-            StoreError::Conflict => Self::conflict("the resource already exists or can't change"),
             StoreError::Integrity(m) => {
                 tracing::error!(alert = "storage_integrity", error = %m, "Stored data failed an integrity check");
                 Self::internal("stored data failed an integrity check").with_code("integrity_error")

@@ -10,7 +10,7 @@ use std::env;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 
-use crate::storage::azure::{AzureConfig, CredentialConfig};
+use crate::store::azure::{AzureConfig, CredentialConfig};
 use crate::tee::skr::SkrConfig;
 
 // ============================================================================
@@ -88,18 +88,21 @@ const DEV_KEY_VAULT_URL: &str = "https://dev.vault.azure.net";
 /// Where durable state lives (`STORAGE_BACKEND`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StorageConfig {
-    /// `azure`: Azure Blob and Table storage (in dev builds, also `azurite`).
+    /// `azure`: Azure Blob Storage (in dev builds, also `azurite`).
     Azure(AzureConfig),
-    /// `memory`: in memory, lost when the worker stops. Dev builds only.
+    /// `files`: local files under `DATA_DIR`, one directory per container.
+    /// Dev builds only.
     #[cfg(feature = "dev")]
-    Memory,
+    Files { dir: PathBuf },
 }
 
-/// Azurite's default endpoints, for `STORAGE_BACKEND=azurite`.
+/// Azurite's default Blob endpoint, for `STORAGE_BACKEND=azurite`.
 #[cfg(feature = "dev")]
 pub const AZURITE_BLOB_URL: &str = "http://127.0.0.1:10000/devstoreaccount1";
+
+/// Where dev builds keep local files by default.
 #[cfg(feature = "dev")]
-pub const AZURITE_TABLE_URL: &str = "http://127.0.0.1:10002/devstoreaccount1";
+pub const DEFAULT_DATA_DIR: &str = "./data";
 
 /// Process configuration read once from the environment at startup.
 #[derive(Debug, Clone)]
@@ -161,35 +164,27 @@ impl ServerConfig {
     }
 }
 
-/// Read `STORAGE_BACKEND` and its settings: `STORAGE_BLOB_URL`,
-/// `STORAGE_TABLE_URL` and `MANAGED_IDENTITY_CLIENT_ID` for `azure`. Dev
-/// builds add `azurite` (Azurite's dev account, default endpoints on
-/// localhost) and `memory`, their default; release builds have only `azure`,
-/// and require HTTPS endpoints.
+/// Read `STORAGE_BACKEND` and its settings: `STORAGE_BLOB_URL` and
+/// `MANAGED_IDENTITY_CLIENT_ID` for `azure`. Dev builds add `azurite`
+/// (Azurite's dev account, its default endpoint on localhost) and `files`,
+/// their default, under `DATA_DIR`; release builds have only `azure`, and
+/// require an HTTPS endpoint.
 fn storage_from_lookup(lookup: &impl Fn(&str) -> Option<String>) -> Result<StorageConfig, String> {
     #[cfg(feature = "dev")]
-    let default = "memory";
+    let default = "files";
     #[cfg(not(feature = "dev"))]
     let default = "azure";
 
     match lookup("STORAGE_BACKEND").as_deref().unwrap_or(default) {
         "azure" => {
-            let url = |name: &str| {
-                lookup(name).ok_or_else(|| format!("{name} is required when STORAGE_BACKEND=azure"))
-            };
-            let (blob_url, table_url) = (url("STORAGE_BLOB_URL")?, url("STORAGE_TABLE_URL")?);
+            let blob_url = lookup("STORAGE_BLOB_URL")
+                .ok_or("STORAGE_BLOB_URL is required when STORAGE_BACKEND=azure")?;
             #[cfg(not(feature = "dev"))]
-            for (name, value) in [
-                ("STORAGE_BLOB_URL", &blob_url),
-                ("STORAGE_TABLE_URL", &table_url),
-            ] {
-                if !value.starts_with("https://") {
-                    return Err(format!("{name} must be an https:// URL"));
-                }
+            if !blob_url.starts_with("https://") {
+                return Err("STORAGE_BLOB_URL must be an https:// URL".into());
             }
             Ok(StorageConfig::Azure(AzureConfig {
                 blob_url,
-                table_url,
                 credential: CredentialConfig::ManagedIdentity {
                     client_id: lookup("MANAGED_IDENTITY_CLIENT_ID"),
                 },
@@ -198,17 +193,20 @@ fn storage_from_lookup(lookup: &impl Fn(&str) -> Option<String>) -> Result<Stora
         #[cfg(feature = "dev")]
         "azurite" => Ok(StorageConfig::Azure(AzureConfig {
             blob_url: lookup("STORAGE_BLOB_URL").unwrap_or_else(|| AZURITE_BLOB_URL.into()),
-            table_url: lookup("STORAGE_TABLE_URL").unwrap_or_else(|| AZURITE_TABLE_URL.into()),
             credential: CredentialConfig::AzuriteDevAccount,
         })),
         #[cfg(feature = "dev")]
-        "memory" => Ok(StorageConfig::Memory),
+        "files" => Ok(StorageConfig::Files {
+            dir: lookup("DATA_DIR")
+                .unwrap_or_else(|| DEFAULT_DATA_DIR.into())
+                .into(),
+        }),
         #[cfg(not(feature = "dev"))]
-        other @ ("azurite" | "memory") => Err(format!(
+        other @ ("azurite" | "files") => Err(format!(
             "STORAGE_BACKEND={other} isn't available: release builds contain only azure"
         )),
         other => Err(format!(
-            "STORAGE_BACKEND {other:?} is unknown: use azure, azurite or memory"
+            "STORAGE_BACKEND {other:?} is unknown: use azure, azurite or files"
         )),
     }
 }
@@ -355,14 +353,6 @@ pub const TX_CACHE_TTL_SECS: u64 = 30;
 pub const TX_DETAIL_CACHE_CAPACITY: usize = 1024;
 
 // ============================================================================
-// Storage
-// ============================================================================
-
-/// Committed datasets are immutable for this many days. Short and unlocked
-/// while the pilot holds synthetic data only.
-pub const DATASET_RETENTION_DAYS: i64 = 7;
-
-// ============================================================================
 // DRT Smart Contract
 // ============================================================================
 
@@ -459,12 +449,11 @@ mod tests {
     }
 
     /// Settings a release build requires.
-    const RELEASE_BASE: [(&str, &str); 5] = [
+    const RELEASE_BASE: [(&str, &str); 4] = [
         ("TLS_CERT_PATH", "c"),
         ("TLS_KEY_PATH", "k"),
         ("KEY_VAULT_URL", "kv.vault.azure.net"),
         ("STORAGE_BLOB_URL", "https://acct.blob.core.windows.net"),
-        ("STORAGE_TABLE_URL", "https://acct.table.core.windows.net"),
     ];
 
     /// `extra` followed by [`RELEASE_BASE`]; the first match wins, so `extra`
@@ -591,7 +580,7 @@ mod tests {
 
     #[cfg(feature = "dev")]
     #[test]
-    fn dev_build_defaults_to_local_dev_keys_and_memory_storage() {
+    fn dev_build_defaults_to_local_dev_keys_and_local_files() {
         let config = config_from(&[]).expect("dev defaults");
         assert_eq!(
             config.keys,
@@ -599,16 +588,28 @@ mod tests {
                 dir: PathBuf::from("dev/keys")
             }
         );
-        assert_eq!(config.storage, StorageConfig::Memory);
+        assert_eq!(
+            config.storage,
+            StorageConfig::Files {
+                dir: PathBuf::from("./data")
+            }
+        );
+        let elsewhere = config_from(&[("DATA_DIR", "/tmp/rt")]).unwrap();
+        assert_eq!(
+            elsewhere.storage,
+            StorageConfig::Files {
+                dir: PathBuf::from("/tmp/rt")
+            }
+        );
         let azurite = config_from(&[("STORAGE_BACKEND", "azurite")]).unwrap();
         assert_eq!(
             azurite.storage,
             StorageConfig::Azure(AzureConfig {
                 blob_url: AZURITE_BLOB_URL.into(),
-                table_url: AZURITE_TABLE_URL.into(),
                 credential: CredentialConfig::AzuriteDevAccount,
             })
         );
+        assert!(config_from(&[("STORAGE_BACKEND", "memory")]).is_err());
     }
 
     #[cfg(not(feature = "dev"))]
@@ -616,10 +617,10 @@ mod tests {
     fn release_build_rejects_dev_providers_and_plain_http_storage() {
         let err = complete(&[("KEY_PROVIDER", "local")]).expect_err("local isn't compiled in");
         assert!(err.contains("KEY_PROVIDER=local"), "{err}");
-        assert!(complete(&[("STORAGE_BACKEND", "memory")]).is_err());
+        assert!(complete(&[("STORAGE_BACKEND", "files")]).is_err());
         assert!(complete(&[("STORAGE_BACKEND", "azurite")]).is_err());
         assert!(complete(&[("STORAGE_BLOB_URL", "http://acct.blob.core.windows.net")]).is_err());
-        assert!(config_from(&base_without(&["STORAGE_TABLE_URL"])).is_err());
+        assert!(config_from(&base_without(&["STORAGE_BLOB_URL"])).is_err());
     }
 
     #[cfg(not(feature = "dev"))]

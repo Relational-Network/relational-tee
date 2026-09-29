@@ -2,13 +2,13 @@
 
 The worker behind IOB MicRes: an Axum server that runs Use Case 1 credential pools on Solana (create a Malta pool, upload its schema, initialise it, issue and revoke credentials, read the issuance log and audit trail) and custodial Solana wallets (create, balance, fee estimate, send, history, admin suspend and activate).
 
-> **Migration in progress.** This repo was imported from `relational-sdk`, a Gramine SGX enclave, and is being moved to Azure Confidential Containers (AMD SEV-SNP). Gramine, RA-TLS, the SGX build and the old SSH deployment are gone, and the server now builds and runs natively. Still to come: key release and attestation on Azure, Azure Blob and Table storage with encryption at rest, idempotent mutations, Entra ID sign-in, and in-app edge controls. Until then, parts of the server are interim, as described below.
+> **Migration in progress.** This repo was imported from `relational-sdk`, a Gramine SGX enclave, and is being moved to Azure Confidential Containers (AMD SEV-SNP). Gramine, RA-TLS, the SGX build and the old SSH deployment are gone, and the server now builds and runs natively. Still to come: key release and attestation on real Azure hardware, idempotent mutations, Entra ID sign-in, and in-app edge controls. Until then, parts of the server are interim, as described below.
 
 ## What works today, and what's interim
 
 - **Transport.** Dev builds serve plain HTTP on `127.0.0.1:8443`, or HTTPS with a local mkcert certificate. Release builds have no plain HTTP path: they read a PEM certificate and key from `TLS_CERT_PATH` and `TLS_KEY_PATH`, and refuse to start without them.
 - **Keys.** At startup the worker obtains four P-256 keys, `transport-key`, `storage-root`, `tls-key` and `commitment-key`, and keeps them in memory only. Release builds get them from Microsoft's SKR sidecar on localhost (`KEY_PROVIDER=skr`), which releases a key only to a confidential container group whose attested policy matches the key's release policy. Dev builds default to `KEY_PROVIDER=local`, which reads dev keys from `dev/keys/` (`just dev-keys` creates them); release builds don't contain that provider and refuse `KEY_PROVIDER=local`. Uploads are sealed to `transport-key`, which every worker shares.
-- **Storage.** All durable state lives in Azure Blob and Table storage, encrypted inside the worker with keys derived from `storage-root` (see [Storage](#storage)); workers keep nothing on local disk. Dev builds default to an in-memory store.
+- **Storage.** All durable state lives in Azure Blob Storage as documents sealed inside the worker with a key derived from `storage-root` (see [Storage](#storage)); workers keep nothing on local disk. Dev builds default to the same sealed objects in local files under `./data`.
 - **Auth.** Protected endpoints still validate ES256 tokens from the Attestation Verification Service (AVS). The AVS only issues tokens to an SGX enclave it has attested, so authenticated endpoints can't be exercised locally until Entra ID validation replaces it. Public endpoints (`/health*`, `/v1/attestation/public-key`, `/docs`) work.
 - **Solana.** The public devnet RPC by default. It is rate-limited and has no SLA, and the server warns about it at startup.
 
@@ -28,9 +28,9 @@ just            # list the recipes
 | `just dev-keys` | Create any missing dev keys in `dev/keys/`: one private JWK per key, and the dev MAA signing key; existing keys are kept |
 | `just skr` | Run the fake SKR sidecar on `127.0.0.1:9000`; start the worker with `KEY_PROVIDER=skr` to use it |
 | `just cert` | Create a locally trusted mkcert certificate in `dev/certs/`; `just dev` then serves HTTPS |
-| `just test` | Run the tests with cargo-nextest, in the release and dev configurations; storage tests use the in-memory backend |
-| `just azurite` | Start Azurite, the Azure Storage emulator, in Docker (Blob on `127.0.0.1:10000`, Table on `:10002`, data in memory); `just azurite-stop` stops it |
-| `just test-azurite` | Run the storage conformance tests against Azurite, starting it first if needed |
+| `just test` | Run the tests with cargo-nextest, in the release and dev configurations; storage tests use local files in temporary directories |
+| `just azurite` | Start Azurite's Blob service, the Azure Storage emulator, in Docker on `127.0.0.1:10000`, data in memory; `just azurite-stop` stops it |
+| `just test-azurite` | Run the store conformance tests against Azurite, starting it first if needed |
 | `just check` | Run every gate: rustfmt, clippy (`-D warnings`, with and without all features), the tests, the banned-crate check and `cargo audit` |
 | `just spa` | Run the dashboard dev server from `../iob-pilot` (override with `IOB_PILOT_DIR`), using the host's Node and pnpm |
 | `just image` | Build the canonical x86_64-linux image with Nix and load it into Docker as `relational-tee:latest` |
@@ -54,8 +54,8 @@ Not there yet: a fault-injection suite for the idempotency work, and a debug-mod
 
 ### Running it locally
 
-- **Fastest:** `just dev` uses dev keys (`KEY_PROVIDER=local`) and in-memory storage, and needs nothing else running.
-- **Production code paths:** `just skr` and `just azurite` in other terminals, then `KEY_PROVIDER=skr STORAGE_BACKEND=azurite just dev`. The worker then releases keys and attests through the SKR client, and stores everything in Azurite through the Azure client.
+- **Fastest:** `just dev` uses dev keys (`KEY_PROVIDER=local`) and sealed local files under `./data` (`STORAGE_BACKEND=files`), which survive restarts, and needs nothing else running.
+- **Production code paths:** `just skr` and `just azurite` in other terminals, then `KEY_PROVIDER=skr STORAGE_BACKEND=azurite just dev`. The worker then releases keys and attests through the SKR client, and stores everything in Azurite through the Azure client, signing with Azurite's well-known Shared Key.
 - **Several workers:** `just image-dev` once, then `just stack-up` ([`compose.yaml`](compose.yaml)). Three workers share Azurite and one fake SKR sidecar behind HAProxy on `127.0.0.1:8443`, which round-robins at layer 4 and probes `/health/ready` like the Azure load balancer. The fake sidecar's `/certs` is on `127.0.0.1:9000`.
 
 Authenticated endpoints still need AVS-issued tokens, which the local stack can't mint, so locally they answer 401 until Entra ID sign-in lands.
@@ -73,8 +73,9 @@ Authenticated endpoints still need AVS-issued tokens, which the local stack can'
 | `MAA_ENDPOINT` | `sharedweu.weu.attest.azure.net` | same | Attestation authority the sidecar uses |
 | `KEY_VAULT_URL` | a placeholder | required | Key Vault the sidecar releases keys from |
 | `KEY_NAMES` | `transport-key,storage-root,tls-key,commitment-key` | same | Key Vault names of the four keys, in that order |
-| `STORAGE_BACKEND` | `memory` | `azure` (the only one) | `azure`, `azurite` (Azurite's dev account) or `memory` (lost on exit) |
-| `STORAGE_BLOB_URL`, `STORAGE_TABLE_URL` | Azurite's, for `azurite` | required, `https://` | Blob and Table endpoints |
+| `STORAGE_BACKEND` | `files` | `azure` (the only one) | `azure`, `azurite` (Azurite's dev account) or `files` (local files) |
+| `STORAGE_BLOB_URL` | Azurite's, for `azurite` | required, `https://` | Blob endpoint |
+| `DATA_DIR` | `./data` | n/a | Where `files` keeps its containers |
 | `MANAGED_IDENTITY_CLIENT_ID` | unset | the worker identity | Which managed identity to request storage tokens for |
 | `SOLANA_RPC_URL` | `https://api.devnet.solana.com` | same | Solana RPC endpoint |
 | `SOLANA_NETWORK` | `devnet` | same | `devnet` or `mainnet`, for explorer links |
@@ -85,18 +86,16 @@ Dev builds are the ones with the `dev` Cargo feature (`just dev`, or `cargo run 
 
 ## Storage
 
-The worker reaches Azure Storage over its own hyper and rustls client, with Entra tokens from the managed identity endpoint (the account has shared keys disabled). It encrypts everything before it leaves the process, so storage sees only ciphertext and hashed identifiers:
+Everything durable is an object in one store with four operations: get (conditional on a cached ETag), create-only put, compare-and-swap put, and list. There's no delete or append. `AzureBlob` implements it with three Blob REST calls over the worker's own hyper and rustls client, authenticated with Entra tokens from the managed identity endpoint (the account has shared keys disabled); `LocalFiles` implements it on local files for development and tests. One conformance suite runs against both.
 
-- **Keys.** HKDF-SHA256 over `storage-root`'s private scalar, salt `relational-tee/storage-root`, with a versioned label per purpose: `blob-kek-v1`, `table-payload-v1`, `index-hmac-v1`, `audit-hmac-v1`, `log-enc-v1` and `cursor-hmac-v1`.
-- **Blobs** get a fresh AES-256-GCM data key each, wrapped (RFC 3394) under the blob key. The additional authenticated data binds each object to its container and path.
-- **Table rows** carry their fields in one encrypted `payload` property, bound to the table and the row's keys. Plaintext properties are copies of filter fields; the worker trusts only the payload. User IDs appear in keys only as `h(x)`, an HMAC under the index key.
-- **Pools** are rows changed only by ETag compare-and-swap, so no worker needs a lock. Their totals are computed from committed records and revocations, and cached per worker until the pool's newest record changes.
-- **Datasets** are staged (a record row claims the ID, then the create-only blob is written), then committed in one atomic batch, and made immutable for 7 days. The dataset's data key lives only in its record row, so deleting it there erases the blob. If an append-DRT burn never reaches the chain, the staged dataset is removed; if it was sent but not confirmed, the record stays staged for reconciliation.
-- **Revocations** are appended to an encrypted, HMAC-tagged log (the authoritative record), then indexed per pool.
+- **Sealing.** Every object in the `state` container is sealed inside the worker: `"RTS1"` ‖ a random 96-bit nonce ‖ AES-256-GCM ciphertext, under `storage-key-v1`, with associated data binding the container and path, so a moved or copied object fails to open. `storage-key-v1` and `index-hmac-v1` are HKDF-SHA256 over `storage-root`'s private scalar, salt `relational-tee/storage-root`. `index-hmac-v1` names identity objects, so Entra object IDs and emails never appear in object names.
+- **Layout.** `pools/{pda}.json` is one document per pool: its metadata, schema, who created it with the creation signature, the initial upload, the issuance log with each burn's signature, and the revocations. That document is the pool's audit trail, and its totals are computed from it. Each uploaded CSV is `pools/{pda}/datasets/{upload_id}`, create-only. `wallets/{id}.json` and `wallets/{id}/keypair` hold a wallet, and `owners/{user_id}.json` points each user at their one wallet. `identities/…` map Entra identities to internal user IDs. `canary/{worker_id}` is the readiness canary.
+- **Writes.** Every write is create-only or a compare-and-swap, so no worker needs a lock. A lost compare-and-swap retries three times with jitter, then the request fails with `409 conflict`.
+- **The cache.** Each worker keeps decrypted objects in a bounded LRU with their ETags. A read sends the cached ETag and costs no body or decryption when nothing changed; a list returns every ETag, so only changed objects are fetched. Keypairs are never revalidated, and datasets aren't cached.
 - **Wallet history** isn't stored: it's read from Solana on demand (`getSignaturesForAddress`, then `getTransaction`), with SOL amounts from balance changes and SPL amounts from token-balance changes. Its cursor is the last signature of the previous page. Each worker caches pages for 30 seconds and parsed transactions by signature.
-- **Pagination** uses signed cursors: pass a response's `next_cursor` back as `cursor`, with the same filters. Any worker accepts any worker's cursor. Lists no longer take `offset` or return totals.
+- **Pagination.** Lists are filtered, sorted and paged in memory. A cursor is the key of the previous page's last item, so any worker continues it; one that names no item returns `400 invalid_cursor`. Lists don't take `offset` or return totals.
 
-Tables and containers are created at startup if they're missing. `STORAGE_BACKEND=azurite` uses Azurite's well-known dev account key (dev builds only); `memory` keeps everything in the process. Azurite doesn't implement immutability policies (it answers 501), so dataset commits there log a warning.
+The worker creates the `state`, `tls` and `reference-values` containers at startup if they're missing. `STORAGE_BACKEND=azurite` signs with Azurite's well-known dev account key (dev builds only).
 
 ## Build and release
 
@@ -113,16 +112,16 @@ CI (`.github/workflows/ci.yml`) runs `just check` in the dev shell, `nix flake c
 
 - **Request IDs.** Every response carries `X-Request-Id`: the client's value if it's a valid UUID, otherwise a new one. The same ID is on the request's log lines and on its audit event.
 - **Audit events.** Every mutation, failed mutation and admin read logs exactly one event with target `audit` when it completes, for operators to query in Azure Monitor. An event carries only `event` (for example `credential_issued`), `outcome` (`success` or `failure`), `code` on failure, `request_id`, `user_id`, and where relevant `pool`, `record_id`, `wallet_id`, `rows` and `signature`; never CSV content, emails, free-text reasons, keys or client IP addresses. The output leaves the TEE through the host, so these events are diagnostics: the pool's own records and the chain are the audit trail users rely on.
-- **Errors.** Every error, including unknown routes and malformed bodies, has one body shape: `{ "error": "<message>", "code": "<snake_case code>", "request_id": "<id>" }`. Clients branch on `code`; `error` is for people. Codes by status: `bad_request`, `unauthorized`, `forbidden`, `not_found`, `method_not_allowed`, `request_timeout`, `conflict`, `payload_too_large`, `unsupported_media_type`, `unprocessable_entity`, `rate_limited`, `internal_error`, `service_unavailable`. More specific codes: `invalid_cursor` and `validation_failed` (400), `wallet_exists` and `initialization_in_progress` (409), `integrity_error` (500), `storage_unavailable`, `rpc_unavailable` and `attestation_unavailable` (503).
+- **Errors.** Every error, including unknown routes and malformed bodies, has one body shape: `{ "error": "<message>", "code": "<snake_case code>", "request_id": "<id>" }`. Clients branch on `code`; `error` is for people. Codes by status: `bad_request`, `unauthorized`, `forbidden`, `not_found`, `method_not_allowed`, `request_timeout`, `conflict`, `payload_too_large`, `unsupported_media_type`, `unprocessable_entity`, `rate_limited`, `internal_error`, `service_unavailable`. More specific codes: `invalid_cursor` and `validation_failed` (400), `wallet_exists` (409), `integrity_error` (500), `storage_unavailable`, `rpc_unavailable` and `attestation_unavailable` (503). A lost compare-and-swap, or an initialisation another upload beat, is a plain `conflict` (409).
 - **Pagination.** Lists take `cursor` and `limit` and return `next_cursor` when there's another page (see [Storage](#storage)).
 
 ## Endpoints
 
-- **Health:** `GET /health/live` answers 200 while the process runs. `GET /health/ready` answers 200 only when the worker holds its four keys, has a valid certificate (or serves plain HTTP in a dev build), its storage canary (a read and a conditional write of `leases/canary/{worker_id}`, every 20 seconds) succeeded within 60 seconds, and it isn't draining. It reads cached state only and never depends on Solana RPC. `GET /health` returns details for operators: keys held, certificate expiry, canary age, key cache age, Solana RPC status (checked every 30 seconds), version and host data. On SIGTERM the worker fails readiness at once, keeps serving for 10 seconds so the load balancer notices, then stops accepting connections and gives in-flight requests up to 40 seconds; Ctrl-C skips the 10 seconds, and a second Ctrl-C exits at once.
+- **Health:** `GET /health/live` answers 200 while the process runs. `GET /health/ready` answers 200 only when the worker holds its four keys, has a valid certificate (or serves plain HTTP in a dev build), its storage canary (a read and a conditional write of the sealed `state/canary/{worker_id}`, every 20 seconds) succeeded within 60 seconds, and it isn't draining. It reads cached state only and never depends on Solana RPC. `GET /health` returns details for operators: keys held, certificate expiry, canary age, key cache age, Solana RPC status (checked every 30 seconds), version and host data. On SIGTERM the worker fails readiness at once, keeps serving for 10 seconds so the load balancer notices, then stops accepting connections and gives in-flight requests up to 40 seconds; Ctrl-C skips the 10 seconds, and a second Ctrl-C exits at once.
 - **Attestation:** `GET /v1/attestation` returns `{ maa_token, transport_jwk, kid }`: an MAA token whose `x-ms-runtime.keys[0]` is the transport public key, and the key's RFC 7638 thumbprint. The worker requests the token at startup, refreshes it at 80% of its lifetime and serves it from memory; it answers 503 until the first token arrives. `GET /v1/attestation/public-key` still returns the bare transport public key, which the dashboard seals uploads to.
 - **Users:** `GET /v1/users/me`.
 - **Wallets:** `GET` and `POST /v1/wallets`; `GET` and `DELETE /v1/wallets/{id}`; `GET …/balance`; `POST …/estimate` and `…/send`; `GET …/transactions` and `…/transactions/{signature}`.
-- **Pools:** `POST /v1/drt/pools/malta`; `GET /v1/drt/pools/list`, `/v1/drt/pools/{pda}`, `…/drt/{name}` and `/v1/drt/pools/by-wallet/{wallet_id}`; `POST` and `GET …/schema`; `POST …/initialize`, `…/issue` and `…/revoke`; `GET …/revocations`, `…/summary` and `…/issuance-log`.
+- **Pools:** `POST /v1/drt/pools/malta`; `GET /v1/drt/pools/list`, `/v1/drt/pools/{pda}`, `…/drt/{name}` and `/v1/drt/pools/by-wallet/{wallet_id}`; `POST` and `GET …/schema`; `POST …/initialize`, `…/issue` and `…/revoke`; `GET …/revocations`, `…/summary` and `…/issuance-log`. The summary, issuance log and revocations together are the pool's audit trail: who created it and when, with the creation signature; the initial upload; each issuance with its burn signature; and each revocation with who, when and why.
 - **Admin:** `GET /v1/admin/status`, `/v1/admin/wallet-stats` and `/v1/admin/wallets`; `POST /v1/admin/wallets/{id}/suspend` and `…/activate`.
 - **Docs:** `GET /api-doc/openapi.json`; Swagger UI at `/docs` in builds with the `swagger-ui` feature.
 

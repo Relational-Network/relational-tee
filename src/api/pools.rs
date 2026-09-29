@@ -32,8 +32,9 @@ use crate::blockchain::signing::keypair_from_bytes_verified;
 use crate::data_validation::FieldSchema;
 use crate::error::ApiError;
 use crate::state::AppState;
-use crate::storage::pools::{DrtMetadata, PoolKind, PoolMetadata, PoolState};
+use crate::storage::pools::{DrtMetadata, PoolDoc, PoolKind};
 use crate::storage::wallets::WalletMetadata;
+use crate::store::Created;
 
 // ============================================================================
 // Shared helpers (also used by api/credentials.rs and api/admin.rs)
@@ -52,19 +53,6 @@ pub(crate) async fn load_wallet_keypair(
     Ok((wallet, keypair))
 }
 
-/// A transaction that failed.
-pub(crate) struct SendFailure {
-    pub error: ApiError,
-    /// The signed transaction reached the RPC node, so it may still land.
-    pub sent: Option<String>,
-}
-
-impl From<SendFailure> for ApiError {
-    fn from(failure: SendFailure) -> Self {
-        failure.error
-    }
-}
-
 /// Sign, send and confirm a transaction; `commitment` is `"confirmed"` or
 /// `"finalized"`. Returns its signature.
 pub(crate) async fn sign_and_send(
@@ -72,33 +60,23 @@ pub(crate) async fn sign_and_send(
     keypair: &Keypair,
     instructions: Vec<solana_instruction::Instruction>,
     commitment: &str,
-) -> Result<String, SendFailure> {
-    let not_sent = |error| SendFailure { error, sent: None };
+) -> Result<String, ApiError> {
     let rpc = state.solana_client.rpc();
-    let recent_blockhash = rpc.get_latest_blockhash().await.map_err(|e| {
-        not_sent(ApiError::rpc_unavailable(format!(
-            "blockhash fetch failed: {e}"
-        )))
-    })?;
+    let recent_blockhash = rpc
+        .get_latest_blockhash()
+        .await
+        .map_err(|e| ApiError::rpc_unavailable(format!("blockhash fetch failed: {e}")))?;
     let message = solana_message::Message::new(&instructions, Some(&keypair.pubkey()));
     let tx = solana_transaction::Transaction::new(&[keypair], message, recent_blockhash);
-    let signature = rpc.send_transaction(&tx).await.map_err(|e| {
-        not_sent(ApiError::rpc_unavailable(format!(
-            "transaction send failed: {e}"
-        )))
-    })?;
-    let sig_str = signature.to_string();
-    if let Err(error) = state
+    let signature = rpc
+        .send_transaction(&tx)
+        .await
+        .map_err(|e| ApiError::rpc_unavailable(format!("transaction send failed: {e}")))?;
+    state
         .solana_client
         .await_confirmation(&signature, commitment)
-        .await
-    {
-        return Err(SendFailure {
-            error,
-            sent: Some(sig_str),
-        });
-    }
-    Ok(sig_str)
+        .await?;
+    Ok(signature.to_string())
 }
 
 /// Compare a wallet's Solana public address against `pool.owner`.
@@ -111,11 +89,8 @@ pub(crate) fn verify_pool_ownership(pool: &Pool, wallet: &WalletMetadata) -> Res
     Ok(())
 }
 
-/// Load a pool's metadata, or 404.
-pub(crate) async fn load_pool_meta(
-    state: &AppState,
-    pool_pda: &str,
-) -> Result<PoolMetadata, ApiError> {
+/// Load a pool's document, or 404.
+pub(crate) async fn load_pool(state: &AppState, pool_pda: &str) -> Result<PoolDoc, ApiError> {
     state.storage.pools().get(pool_pda).await?.ok_or_else(|| {
         ApiError::not_found(format!(
             "pool metadata not found for {pool_pda} — pool may need creation"
@@ -246,7 +221,7 @@ async fn create_pool_atomic(
     })
 }
 
-/// What a new pool row records beyond its on-chain state.
+/// What a new pool's document records beyond its on-chain state.
 struct NewPool<'a> {
     pool_pda: &'a str,
     pool_name: &'a str,
@@ -255,31 +230,37 @@ struct NewPool<'a> {
     owner: &'a WalletMetadata,
     schema_id: String,
     schema: Vec<FieldSchema>,
+    created_by: &'a str,
+    creation_signature: String,
 }
 
-/// Store a newly created pool.
-async fn persist_pool_metadata(
-    state: &AppState,
-    new: NewPool<'_>,
-) -> Result<PoolMetadata, ApiError> {
-    let meta = PoolMetadata {
+/// Store a newly created pool's document.
+async fn persist_pool(state: &AppState, new: NewPool<'_>) -> Result<PoolDoc, ApiError> {
+    let doc = PoolDoc {
         pool_pda: new.pool_pda.to_string(),
         pool_name: new.pool_name.to_string(),
         kind: PoolKind::Malta,
         pool_uuid_hex: new.pool_uuid_hex.to_string(),
         drts: new.drts,
         owner_wallet_id: new.owner.wallet_id.clone(),
-        owner_pubkey: Some(new.owner.public_address.clone()),
+        owner_pubkey: new.owner.public_address.clone(),
         schema_id: new.schema_id,
         schema: new.schema,
         validation_mode: crate::data_validation::ValidationMode::HeadersOnly,
-        state: PoolState::NeedsInit,
-        created_onchain_at: chrono::Utc::now(),
-        initialized_at: None,
-        version: 0,
+        created_by: new.created_by.to_string(),
+        created_at: chrono::Utc::now(),
+        creation_signature: new.creation_signature,
+        initial: None,
+        issuances: Vec::new(),
+        revocations: Vec::new(),
     };
-    state.storage.pools().create(&meta).await?;
-    Ok(meta)
+    match state.storage.pools().create(&doc).await? {
+        Created::New(_) => Ok(doc),
+        Created::AlreadyExists => Err(ApiError::conflict(format!(
+            "pool {} already has a document",
+            doc.pool_pda
+        ))),
+    }
 }
 
 // ============================================================================
@@ -325,7 +306,7 @@ pub async fn create_malta_pool(
     let pool_uuid_hex = hex::encode(created.pool_uuid);
     let final_sig = created.signatures.last().cloned().unwrap_or_default();
 
-    let meta = persist_pool_metadata(
+    let meta = persist_pool(
         &state,
         NewPool {
             pool_pda: &pool_pda_str,
@@ -335,6 +316,8 @@ pub async fn create_malta_pool(
             owner: &wallet,
             schema_id: schema_id.clone(),
             schema: fields,
+            created_by: &token.sub,
+            creation_signature: final_sig.clone(),
         },
     )
     .await?;
@@ -419,14 +402,7 @@ pub async fn get_pool(
                     code_hash: d.code_hash_hex.clone(),
                 })
                 .collect();
-            (
-                m.pool_name.clone(),
-                match m.kind {
-                    PoolKind::Malta => "malta",
-                }
-                .to_string(),
-                drts,
-            )
+            (m.pool_name.clone(), m.kind.as_str().to_string(), drts)
         }
         None => (String::new(), "unknown".to_string(), Vec::new()),
     };
@@ -475,7 +451,7 @@ pub async fn get_drt(
 ) -> Result<Json<DrtConfigResponse>, ApiError> {
     let pool_pda = Pubkey::from_str(&pool_pda_str)
         .map_err(|_| ApiError::bad_request("invalid pool PDA address"))?;
-    let meta = load_pool_meta(&state, &pool_pda_str).await?;
+    let meta = load_pool(&state, &pool_pda_str).await?;
     let drt_meta = meta
         .drts
         .get(&drt_name)

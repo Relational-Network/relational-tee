@@ -31,6 +31,7 @@ mod http_client;
 mod request_id;
 mod state;
 mod storage;
+mod store;
 mod tee;
 mod tls;
 
@@ -313,29 +314,33 @@ fn providers(config: &KeyProviderConfig) -> (Arc<dyn KeyProvider>, Arc<dyn Attes
     }
 }
 
-/// Open the configured stores. Azure storage gets any missing container or
-/// table created.
+/// Open the sealed `state` container. On Azure, any missing container is
+/// created first.
 async fn open_storage(
     config: &StorageConfig,
     keys: storage::StorageKeys,
     worker_id: String,
 ) -> Result<storage::Storage, String> {
-    match config {
+    let state: Arc<dyn store::ObjectStore> = match config {
         StorageConfig::Azure(azure) => {
-            let store = Arc::new(storage::azure::AzureStore::new(azure)?);
-            store
-                .ensure_layout()
-                .await
-                .map_err(|e| format!("preparing storage at {}: {e}", azure.blob_url))?;
-            info!(blob = %azure.blob_url, table = %azure.table_url, "Storage ready");
-            Ok(storage::Storage::new(store.clone(), store, keys, worker_id))
+            let state = store::azure::AzureBlob::new(azure, store::STATE)?;
+            for name in store::CONTAINERS {
+                state
+                    .container(name)
+                    .ensure_container()
+                    .await
+                    .map_err(|e| format!("preparing storage at {}: {e}", azure.blob_url))?;
+            }
+            info!(blob = %azure.blob_url, "Storage ready");
+            Arc::new(state)
         }
         #[cfg(feature = "dev")]
-        StorageConfig::Memory => {
-            warn!("STORAGE_BACKEND=memory: state is lost when the worker stops (dev builds only)");
-            Ok(storage::Storage::in_memory(keys, worker_id))
+        StorageConfig::Files { dir } => {
+            warn!(dir = %dir.display(), "STORAGE_BACKEND=files: sealed objects in local files (dev builds only)");
+            Arc::new(store::files::LocalFiles::new(dir.join(store::STATE)))
         }
-    }
+    };
+    Ok(storage::Storage::new(state, keys, worker_id))
 }
 
 /// Service entrypoint: read configuration, build the router, and serve.
@@ -382,7 +387,7 @@ async fn main() {
     ));
     attestation.spawn_refresher(attestation_provider);
 
-    // Encrypted Blob and Table storage, with keys derived from storage-root.
+    // Sealed Blob storage, with keys derived from storage-root.
     let worker_id = uuid::Uuid::new_v4().to_string();
     info!(worker_id = %worker_id, "Worker identity for this process");
     let storage = open_storage(

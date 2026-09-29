@@ -18,10 +18,10 @@ use utoipa::ToSchema;
 
 use crate::audit;
 use crate::auth::UserToken;
-use crate::blockchain::signing::generate_solana_keypair;
+use crate::blockchain::signing::{generate_solana_keypair, keypair_from_bytes};
 use crate::error::ApiError;
 use crate::state::AppState;
-use crate::storage::wallets::{CreateOutcome, WalletMetadata, WalletResponse, WalletStatus};
+use crate::storage::wallets::{CreateOutcome, NewKeypair, WalletResponse, WalletStatus};
 
 use super::{enforce_owner, load_wallet};
 
@@ -100,37 +100,36 @@ pub async fn create_wallet(
 
     // Generate Ed25519 keypair.
     let (keypair_bytes, public_address) = generate_solana_keypair()?;
-    let keypair_bytes = zeroize::Zeroizing::new(keypair_bytes);
+    let keypair = NewKeypair {
+        bytes: zeroize::Zeroizing::new(keypair_bytes),
+        address: public_address,
+    };
     let wallet_id = uuid::Uuid::new_v4().to_string();
 
-    let metadata = WalletMetadata {
-        wallet_id: wallet_id.clone(),
-        owner_user_id: token.sub.clone(),
-        public_address: public_address.clone(),
-        created_at: chrono::Utc::now(),
-        status: WalletStatus::Active,
-        label: payload.label,
-        version: 0,
+    let address_of = |bytes: &[u8]| {
+        use solana_signer::Signer;
+        keypair_from_bytes(bytes)
+            .ok()
+            .map(|k| k.pubkey().to_string())
     };
-
-    match state
+    let wallet = match state
         .storage
         .wallets()
-        .create(&metadata, &keypair_bytes)
+        .create(&token.sub, &wallet_id, payload.label, keypair, address_of)
         .await?
     {
-        CreateOutcome::Created => {}
+        CreateOutcome::Created(wallet) => wallet,
         CreateOutcome::OwnerHasWallet(existing) => {
             return Err(
                 ApiError::conflict(format!("user already has a wallet: {existing}"))
                     .with_code("wallet_exists"),
             );
         }
-    }
+    };
 
     info!(
         wallet_id = %wallet_id,
-        address = %public_address,
+        address = %wallet.public_address,
         owner = %token.sub,
         "Wallet created"
     );
@@ -139,10 +138,10 @@ pub async fn create_wallet(
     let explorer_url = state
         .solana_client
         .network()
-        .explorer_address_url(&public_address);
+        .explorer_address_url(&wallet.public_address);
 
     let response = CreateWalletResponse {
-        wallet: WalletResponse::from(metadata),
+        wallet: WalletResponse::from(wallet),
         explorer_url,
     };
 
