@@ -43,13 +43,14 @@
         pkgs: targets:
         (pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml).override { inherit targets; };
 
-      # Commit time of the flake source, for reproducible timestamps.
+      # Commit time of the flake source, for reproducible timestamps. Only the
+      # final package gets it: in the shared arguments it would change the
+      # dependency and check derivations on every commit and defeat their cache.
       sourceDateEpoch = toString (self.lastModified or 1);
 
       commonArgs = craneLib: pkgs: {
         src = craneLib.cleanCargoSource ./.;
         strictDeps = true;
-        SOURCE_DATE_EPOCH = sourceDateEpoch;
         buildInputs = lib.optionals pkgs.stdenv.hostPlatform.isDarwin [ pkgs.libiconv ];
       };
 
@@ -104,7 +105,13 @@
             '';
           };
         in
-        craneLib.buildPackage (args // { cargoArtifacts = craneLib.buildDepsOnly args; });
+        craneLib.buildPackage (
+          args
+          // {
+            cargoArtifacts = craneLib.buildDepsOnly args;
+            SOURCE_DATE_EPOCH = sourceDateEpoch;
+          }
+        );
 
       # /etc/passwd and /etc/group for the non-root user; the image has no shell.
       etcFor =
