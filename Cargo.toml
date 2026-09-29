@@ -85,6 +85,11 @@ hex = { version = "0.4", default-features = false, features = ["alloc"] }
 # ── Embedded database ─────────────────────────────────────────────
 redb = { version = "3.1", default-features = false }
 
+# ── Allocator ─────────────────────────────────────────────────────
+# musl's allocator is slow under multithreaded load; the release binary is
+# statically linked against musl, so every build uses mimalloc instead.
+mimalloc = { version = "0.1.52", default-features = false }
+
 # ── In-process cache ──────────────────────────────────────────────
 lru = { version = "0.18", default-features = false }
 dashmap = { version = "6", default-features = false }

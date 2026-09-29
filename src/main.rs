@@ -52,6 +52,9 @@ use handlers::{admin_status, get_public_key, AdminStatusResponse};
 use health::{health, liveness, readiness, HealthChecks, HealthResponse, ReadyResponse};
 use state::AppState;
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 /// Start time captured once for uptime reporting.
 static STARTED_AT: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 
