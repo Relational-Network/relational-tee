@@ -8,3 +8,6 @@ drt-examples/mean/target
 /data/
 
 SPRINT*
+
+# Local mkcert certificates (just cert)
+/dev/certs/
