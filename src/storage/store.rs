@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
 
 pub use crate::tee::BoxFuture;
 
@@ -193,6 +194,14 @@ impl RkRange {
         Self::default()
     }
 
+    /// Row keys that start with `prefix`.
+    pub fn prefix(prefix: &str) -> Self {
+        Self {
+            start: Some(prefix.to_string()),
+            end: prefix_end(prefix),
+        }
+    }
+
     pub fn between(start: Option<String>, end: Option<String>) -> Self {
         Self { start, end }
     }
@@ -201,6 +210,25 @@ impl RkRange {
     pub fn contains(&self, rk: &str) -> bool {
         self.start.as_deref().is_none_or(|s| rk >= s) && self.end.as_deref().is_none_or(|e| rk < e)
     }
+}
+
+/// The smallest string greater than every string starting with `prefix`.
+fn prefix_end(prefix: &str) -> Option<String> {
+    let mut chars: Vec<char> = prefix.chars().collect();
+    while let Some(last) = chars.pop() {
+        if let Some(next) = char::from_u32(last as u32 + 1) {
+            chars.push(next);
+            return Some(chars.into_iter().collect());
+        }
+    }
+    None
+}
+
+/// One operation of an atomic batch within a single partition.
+#[derive(Clone, Debug)]
+pub enum BatchOp {
+    Insert(Entity),
+    UpdateIfMatch(Entity, ETag),
 }
 
 /// A filter on plaintext properties.
@@ -244,6 +272,9 @@ pub enum StoreError {
     NotFound,
     /// A compare-and-swap write lost: the ETag is stale.
     PreconditionFailed,
+    /// The write conflicts with what's stored: a row that already exists,
+    /// or an object under an immutability policy.
+    Conflict,
     /// Stored data failed authentication: tampered, moved or corrupted.
     Integrity(String),
     /// The store couldn't be reached or answered with a server error.
@@ -257,6 +288,7 @@ impl fmt::Display for StoreError {
         match self {
             StoreError::NotFound => f.write_str("not found"),
             StoreError::PreconditionFailed => f.write_str("precondition failed (stale ETag)"),
+            StoreError::Conflict => f.write_str("conflicts with the stored state"),
             StoreError::Integrity(m) => write!(f, "integrity check failed: {m}"),
             StoreError::Unavailable(m) => write!(f, "storage unavailable: {m}"),
             StoreError::Invalid(m) => write!(f, "storage request failed: {m}"),
@@ -289,6 +321,18 @@ pub trait ObjectStore: Send + Sync {
         c: Container,
         path: &'a str,
         block: Bytes,
+    ) -> BoxFuture<'a, Result<(), StoreError>>;
+
+    /// Delete the object. A missing object counts as deleted; one under an
+    /// immutability policy fails with [`StoreError::Conflict`].
+    fn delete<'a>(&'a self, c: Container, path: &'a str) -> BoxFuture<'a, Result<(), StoreError>>;
+
+    /// Forbid overwriting or deleting the object until `until`.
+    fn set_immutability<'a>(
+        &'a self,
+        c: Container,
+        path: &'a str,
+        until: DateTime<Utc>,
     ) -> BoxFuture<'a, Result<(), StoreError>>;
 }
 
@@ -335,11 +379,30 @@ pub trait IndexStore: Send + Sync {
         top: usize,
         page: Option<Continuation>,
     ) -> BoxFuture<'a, Result<Page<Entity>, StoreError>>;
+
+    /// Apply up to 100 operations on rows of partition `pk` atomically: all
+    /// of them, or none.
+    fn batch<'a>(
+        &'a self,
+        t: Table,
+        pk: &'a str,
+        ops: Vec<BatchOp>,
+    ) -> BoxFuture<'a, Result<(), StoreError>>;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prefix_ranges_cover_exactly_the_prefix() {
+        let range = RkRange::prefix("log:");
+        assert!(range.contains("log:"));
+        assert!(range.contains("log:ffff:abc"));
+        assert!(!range.contains("log;"));
+        assert!(!range.contains("lo"));
+        assert!(!range.contains("rec:1"));
+    }
 
     #[test]
     fn ranges_include_the_start_and_exclude_the_end() {

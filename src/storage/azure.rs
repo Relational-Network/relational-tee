@@ -24,9 +24,11 @@ use tokio::sync::Mutex;
 use tracing::{debug, info};
 use zeroize::Zeroizing;
 
+use chrono::{DateTime, Utc};
+
 use super::store::{
-    BoxFuture, Container, Continuation, ETag, Entity, Filter, IndexStore, InsertOutcome, Object,
-    ObjectStore, Page, Prop, PutOutcome, RkRange, StoreError, Table,
+    BatchOp, BoxFuture, Container, Continuation, ETag, Entity, Filter, IndexStore, InsertOutcome,
+    Object, ObjectStore, Page, Prop, PutOutcome, RkRange, StoreError, Table,
 };
 use crate::http_client::{HttpClient, Response};
 
@@ -577,6 +579,57 @@ impl ObjectStore for AzureStore {
             }
         })
     }
+
+    fn delete<'a>(&'a self, c: Container, path: &'a str) -> BoxFuture<'a, Result<(), StoreError>> {
+        Box::pin(async move {
+            let response = self
+                .send(Req {
+                    service: Service::Blob,
+                    method: Method::DELETE,
+                    path: self.blob_path(c, path),
+                    query: vec![],
+                    headers: vec![],
+                    body: Bytes::new(),
+                })
+                .await?;
+            match response.status() {
+                StatusCode::ACCEPTED | StatusCode::NOT_FOUND => Ok(()),
+                StatusCode::CONFLICT => Err(StoreError::Conflict),
+                _ => Err(unexpected("delete blob", &response)),
+            }
+        })
+    }
+
+    fn set_immutability<'a>(
+        &'a self,
+        c: Container,
+        path: &'a str,
+        until: DateTime<Utc>,
+    ) -> BoxFuture<'a, Result<(), StoreError>> {
+        Box::pin(async move {
+            let response = self
+                .send(Req {
+                    service: Service::Blob,
+                    method: Method::PUT,
+                    path: self.blob_path(c, path),
+                    query: vec![("comp", "immutabilityPolicies".into())],
+                    headers: vec![
+                        (
+                            "x-ms-immutability-policy-until-date",
+                            until.format("%a, %d %b %Y %H:%M:%S GMT").to_string(),
+                        ),
+                        ("x-ms-immutability-policy-mode", "Unlocked".into()),
+                    ],
+                    body: Bytes::new(),
+                })
+                .await?;
+            match response.status() {
+                StatusCode::OK => Ok(()),
+                StatusCode::NOT_FOUND => Err(StoreError::NotFound),
+                _ => Err(unexpected("set immutability policy", &response)),
+            }
+        })
+    }
 }
 
 /// Render an entity as Table JSON.
@@ -859,6 +912,96 @@ impl IndexStore for AzureStore {
                 .map(|v| entity_from_json(v, None))
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(Page { items, next })
+        })
+    }
+
+    fn batch<'a>(
+        &'a self,
+        t: Table,
+        pk: &'a str,
+        ops: Vec<BatchOp>,
+    ) -> BoxFuture<'a, Result<(), StoreError>> {
+        Box::pin(async move {
+            if ops.is_empty() {
+                return Ok(());
+            }
+            if ops.len() > 100 {
+                return Err(StoreError::Invalid(
+                    "a batch holds at most 100 operations".into(),
+                ));
+            }
+            let id = uuid::Uuid::new_v4().simple().to_string();
+            let batch = format!("batch_{id}");
+            let changeset = format!("changeset_{id}");
+            let mut body =
+                format!("--{batch}\r\nContent-Type: multipart/mixed; boundary={changeset}\r\n\r\n");
+            for op in &ops {
+                let (method, entity, if_match) = match op {
+                    BatchOp::Insert(e) => ("POST", e, None),
+                    BatchOp::UpdateIfMatch(e, etag) => ("PUT", e, Some(etag)),
+                };
+                if entity.pk != pk {
+                    return Err(StoreError::Invalid(
+                        "batch rows must share a partition".into(),
+                    ));
+                }
+                let url = match op {
+                    BatchOp::Insert(_) => {
+                        format!("{}{}/{}", self.table.origin, self.table.prefix, t.name())
+                    }
+                    BatchOp::UpdateIfMatch(..) => format!(
+                        "{}{}",
+                        self.table.origin,
+                        self.entity_path(t, &entity.pk, &entity.rk)
+                    ),
+                };
+                body.push_str(&format!(
+                    "--{changeset}\r\nContent-Type: application/http\r\nContent-Transfer-Encoding: binary\r\n\r\n\
+                     {method} {url} HTTP/1.1\r\nContent-Type: application/json\r\nAccept: {TABLE_ACCEPT}\r\n\
+                     DataServiceVersion: 3.0;\r\nPrefer: return-no-content\r\n"
+                ));
+                if let Some(etag) = if_match {
+                    body.push_str(&format!("If-Match: {}\r\n", etag.0));
+                }
+                body.push_str(&format!("\r\n{}\r\n", entity_json(entity)));
+            }
+            body.push_str(&format!("--{changeset}--\r\n--{batch}--\r\n"));
+
+            let response = self
+                .send(Req {
+                    service: Service::Table,
+                    method: Method::POST,
+                    path: format!("{}/$batch", self.table.prefix),
+                    query: vec![],
+                    headers: vec![
+                        ("accept", TABLE_ACCEPT.to_string()),
+                        ("content-type", format!("multipart/mixed; boundary={batch}")),
+                        ("dataserviceversion", ODATA_VERSION.to_string()),
+                        ("maxdataserviceversion", ODATA_VERSION.to_string()),
+                    ],
+                    body: Bytes::from(body),
+                })
+                .await?;
+            if response.status() != StatusCode::ACCEPTED {
+                return Err(unexpected("table batch", &response));
+            }
+            // The changeset either succeeds as a whole or reports the one
+            // operation that failed.
+            let text = String::from_utf8_lossy(response.body()).into_owned();
+            let failed = text
+                .lines()
+                .filter_map(|line| line.strip_prefix("HTTP/1.1 "))
+                .filter_map(|rest| rest.get(..3)?.parse::<u16>().ok())
+                .find(|status| !(200..300).contains(status));
+            match failed {
+                None => Ok(()),
+                Some(409) => Err(StoreError::Conflict),
+                Some(412) => Err(StoreError::PreconditionFailed),
+                Some(404) => Err(StoreError::NotFound),
+                Some(status) => Err(StoreError::Invalid(format!(
+                    "table batch operation failed with HTTP {status}"
+                ))),
+            }
         })
     }
 }

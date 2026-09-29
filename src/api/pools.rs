@@ -15,7 +15,7 @@ use solana_pubkey::Pubkey;
 use solana_signer::Signer;
 use std::collections::BTreeMap;
 use std::str::FromStr;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::auth::AdminToken;
 use crate::blockchain::drt::{
@@ -33,7 +33,7 @@ use crate::data_validation::FieldSchema;
 use crate::error::ApiError;
 use crate::state::AppState;
 use crate::storage::audit::AuditEventType;
-use crate::storage::pool_metadata::{DrtMetadata, PoolKind, PoolMetadata, PoolState};
+use crate::storage::pools::{DrtMetadata, PoolKind, PoolMetadata, PoolState};
 use crate::storage::wallets::WalletMetadata;
 
 // ============================================================================
@@ -53,29 +53,51 @@ pub(crate) async fn load_wallet_keypair(
     Ok((wallet, keypair))
 }
 
+/// A transaction that failed.
+pub(crate) struct SendFailure {
+    pub error: ApiError,
+    /// The signed transaction reached the RPC node, so it may still land.
+    pub sent: Option<String>,
+}
+
+impl From<SendFailure> for ApiError {
+    fn from(failure: SendFailure) -> Self {
+        failure.error
+    }
+}
+
 /// Sign + send + parse events. `commitment` is `"confirmed"` or `"finalized"`.
 pub(crate) async fn sign_send_and_parse(
     state: &AppState,
     keypair: &Keypair,
     instructions: Vec<solana_instruction::Instruction>,
     commitment: &str,
-) -> Result<(String, Vec<DrtEvent>), ApiError> {
+) -> Result<(String, Vec<DrtEvent>), SendFailure> {
+    let not_sent = |error| SendFailure { error, sent: None };
     let rpc = state.solana_client.rpc();
-    let recent_blockhash = rpc
-        .get_latest_blockhash()
-        .await
-        .map_err(|e| ApiError::service_unavailable(format!("blockhash fetch failed: {e}")))?;
+    let recent_blockhash = rpc.get_latest_blockhash().await.map_err(|e| {
+        not_sent(ApiError::service_unavailable(format!(
+            "blockhash fetch failed: {e}"
+        )))
+    })?;
     let message = solana_message::Message::new(&instructions, Some(&keypair.pubkey()));
     let tx = solana_transaction::Transaction::new(&[keypair], message, recent_blockhash);
-    let signature = rpc
-        .send_transaction(&tx)
-        .await
-        .map_err(|e| ApiError::service_unavailable(format!("transaction send failed: {e}")))?;
-    state
+    let signature = rpc.send_transaction(&tx).await.map_err(|e| {
+        not_sent(ApiError::service_unavailable(format!(
+            "transaction send failed: {e}"
+        )))
+    })?;
+    let sig_str = signature.to_string();
+    if let Err(error) = state
         .solana_client
         .await_confirmation(&signature, commitment)
-        .await?;
-    let sig_str = signature.to_string();
+        .await
+    {
+        return Err(SendFailure {
+            error,
+            sent: Some(sig_str),
+        });
+    }
     let events = parse_events_from_signature_with_commitment(rpc, &sig_str, commitment)
         .await
         .unwrap_or_default();
@@ -92,10 +114,12 @@ pub(crate) fn verify_pool_ownership(pool: &Pool, wallet: &WalletMetadata) -> Res
     Ok(())
 }
 
-/// Load pool metadata from enclave storage.
-pub(crate) fn load_pool_meta(state: &AppState, pool_pda: &str) -> Result<PoolMetadata, ApiError> {
-    let path = state.files.paths().pool_meta(pool_pda);
-    state.files.read_json::<PoolMetadata>(&path).map_err(|_| {
+/// Load a pool's metadata, or 404.
+pub(crate) async fn load_pool_meta(
+    state: &AppState,
+    pool_pda: &str,
+) -> Result<PoolMetadata, ApiError> {
+    state.storage.pools().get(pool_pda).await?.ok_or_else(|| {
         ApiError::not_found(format!(
             "pool metadata not found for {pool_pda} — pool may need creation"
         ))
@@ -134,7 +158,7 @@ pub(crate) fn chain_section(
 /// `extra` lets callers inject additional id→label pairs (e.g. commitment hash
 /// → record_id for credential issuance / revocation events) before merging.
 pub(crate) fn pool_labels(
-    meta: &crate::storage::pool_metadata::PoolMetadata,
+    meta: &PoolMetadata,
     extra: Option<serde_json::Map<String, serde_json::Value>>,
 ) -> serde_json::Value {
     let mut id_to_name: serde_json::Map<String, serde_json::Value> = extra.unwrap_or_default();
@@ -286,50 +310,39 @@ async fn create_pool_atomic(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-fn persist_pool_metadata(
-    state: &AppState,
-    pool_pda: &str,
-    pool_name: &str,
-    kind: PoolKind,
-    pool_uuid_hex: &str,
+/// What a new pool row records beyond its on-chain state.
+struct NewPool<'a> {
+    pool_pda: &'a str,
+    pool_name: &'a str,
+    pool_uuid_hex: &'a str,
     drts: BTreeMap<String, DrtMetadata>,
-    owner_wallet_id: &str,
-    owner_pubkey: &str,
-    schema_id: &str,
-    validation_mode: crate::data_validation::ValidationMode,
-) -> Result<PoolMetadata, ApiError> {
-    let paths = state.files.paths();
-    let dataset_dir = paths.pool_dataset_dir(pool_pda);
-    state
-        .files
-        .create_dir(&dataset_dir)
-        .map_err(|e| ApiError::internal(format!("failed to create pool directory: {e}")))?;
+    owner: &'a WalletMetadata,
+    schema_id: String,
+    schema: Vec<FieldSchema>,
+}
 
+/// Store a newly created pool.
+async fn persist_pool_metadata(
+    state: &AppState,
+    new: NewPool<'_>,
+) -> Result<PoolMetadata, ApiError> {
     let meta = PoolMetadata {
-        pool_pda: pool_pda.to_string(),
-        pool_name: pool_name.to_string(),
-        kind,
-        pool_uuid_hex: pool_uuid_hex.to_string(),
-        drts,
-        owner_wallet_id: owner_wallet_id.to_string(),
-        owner_pubkey: Some(owner_pubkey.to_string()),
-        schema_id: schema_id.to_string(),
-        validation_mode,
+        pool_pda: new.pool_pda.to_string(),
+        pool_name: new.pool_name.to_string(),
+        kind: PoolKind::Malta,
+        pool_uuid_hex: new.pool_uuid_hex.to_string(),
+        drts: new.drts,
+        owner_wallet_id: new.owner.wallet_id.clone(),
+        owner_pubkey: Some(new.owner.public_address.clone()),
+        schema_id: new.schema_id,
+        schema: new.schema,
+        validation_mode: crate::data_validation::ValidationMode::HeadersOnly,
         state: PoolState::NeedsInit,
         created_onchain_at: chrono::Utc::now(),
         initialized_at: None,
-        last_issue_at: None,
-        total_credentials: 0,
-        revoked_count: 0,
+        version: 0,
     };
-    state
-        .files
-        .write_json(paths.pool_meta(pool_pda), &meta)
-        .map_err(|e| ApiError::internal(format!("failed to write pool metadata: {e}")))?;
-    if let Err(e) = state.tx_db.upsert_pool_meta(&meta) {
-        warn!(pool = %pool_pda, error = %e, "Failed to write pool meta to redb");
-    }
+    state.storage.pools().create(&meta).await?;
     Ok(meta)
 }
 
@@ -378,19 +391,17 @@ pub async fn create_malta_pool(
 
     let meta = persist_pool_metadata(
         &state,
-        &pool_pda_str,
-        &payload.pool_name,
-        PoolKind::Malta,
-        &pool_uuid_hex,
-        created.drts.clone(),
-        &wallet.wallet_id,
-        &wallet.public_address,
-        &schema_id,
-        crate::data_validation::ValidationMode::HeadersOnly,
-    )?;
-
-    crate::data_validation::save_pool_schema(state.files.paths(), &pool_pda_str, &fields)
-        .map_err(ApiError::internal)?;
+        NewPool {
+            pool_pda: &pool_pda_str,
+            pool_name: &payload.pool_name,
+            pool_uuid_hex: &pool_uuid_hex,
+            drts: created.drts.clone(),
+            owner: &wallet,
+            schema_id: schema_id.clone(),
+            schema: fields,
+        },
+    )
+    .await?;
 
     info!(
         signature = %final_sig,
@@ -469,7 +480,7 @@ pub async fn get_pool(
         .map_err(|_| ApiError::bad_request("invalid pool PDA address"))?;
 
     let pool = fetch_pool(state.solana_client.rpc(), &pool_pda).await?;
-    let meta = load_pool_meta(&state, &pool_pda_str).ok();
+    let meta = state.storage.pools().get(&pool_pda_str).await?;
 
     let (name, kind, drts) = match &meta {
         Some(m) => {
@@ -541,7 +552,7 @@ pub async fn get_drt(
 ) -> Result<Json<DrtConfigResponse>, ApiError> {
     let pool_pda = Pubkey::from_str(&pool_pda_str)
         .map_err(|_| ApiError::bad_request("invalid pool PDA address"))?;
-    let meta = load_pool_meta(&state, &pool_pda_str)?;
+    let meta = load_pool_meta(&state, &pool_pda_str).await?;
     let drt_meta = meta
         .drts
         .get(&drt_name)

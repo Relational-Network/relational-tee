@@ -49,12 +49,6 @@ pub const DEFAULT_BIND_ADDR: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 #[cfg(not(feature = "dev"))]
 pub const DEFAULT_BIND_ADDR: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
 
-/// Default storage directory.
-#[cfg(feature = "dev")]
-pub const DEFAULT_DATA_DIR: &str = "data";
-#[cfg(not(feature = "dev"))]
-pub const DEFAULT_DATA_DIR: &str = "/data";
-
 /// Maximum request body size (50 MiB).
 pub const MAX_BODY_SIZE: usize = 50 * 1024 * 1024;
 
@@ -111,14 +105,13 @@ pub const AZURITE_TABLE_URL: &str = "http://127.0.0.1:10002/devstoreaccount1";
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     pub addr: SocketAddr,
-    pub data_dir: PathBuf,
     pub transport: Transport,
     pub keys: KeyProviderConfig,
     pub storage: StorageConfig,
 }
 
 impl ServerConfig {
-    /// Read `BIND_ADDR`, `PORT`, `DATA_DIR`, `TLS_CERT_PATH`, `TLS_KEY_PATH`,
+    /// Read `BIND_ADDR`, `PORT`, `TLS_CERT_PATH`, `TLS_KEY_PATH`,
     /// and the key provider and storage settings (see
     /// [`key_provider_from_lookup`] and [`storage_from_lookup`]).
     pub fn from_env() -> Result<Self, String> {
@@ -138,7 +131,6 @@ impl ServerConfig {
                 .map_err(|e| format!("PORT {v:?} is not a port number: {e}"))?,
             None => DEFAULT_PORT,
         };
-        let data_dir = PathBuf::from(lookup("DATA_DIR").unwrap_or_else(|| DEFAULT_DATA_DIR.into()));
 
         let transport = match (lookup("TLS_CERT_PATH"), lookup("TLS_KEY_PATH")) {
             (Some(cert), Some(key)) => Transport::Tls {
@@ -162,7 +154,6 @@ impl ServerConfig {
 
         Ok(Self {
             addr: SocketAddr::new(ip, port),
-            data_dir,
             transport,
             keys: key_provider_from_lookup(&lookup)?,
             storage: storage_from_lookup(&lookup)?,
@@ -367,7 +358,7 @@ pub const INDEXER_POLL_INTERVAL_SECS: u64 = 60;
 ///
 /// Prevents expensive repeated RPC calls on rapid page loads.
 /// After syncing an address, subsequent requests within this window
-/// skip the RPC call and return cached data from redb.
+/// skip the RPC call and return the stored history.
 pub const SYNC_COOLDOWN_SECS: u64 = 10;
 
 /// LRU cache capacity (number of wallet first-pages cached).
@@ -377,14 +368,12 @@ pub const TX_CACHE_CAPACITY: usize = 128;
 pub const TX_CACHE_TTL_SECS: u64 = 30;
 
 // ============================================================================
-// Nonce Replay Protection
+// Storage
 // ============================================================================
 
-/// Maximum age of a nonce entry in seconds before it is purged (24 hours).
-pub const NONCE_MAX_AGE_SECS: i64 = 86_400;
-
-/// How often the background nonce purge task runs (in seconds, every 15 min).
-pub const NONCE_PURGE_INTERVAL_SECS: u64 = 900;
+/// Committed datasets are immutable for this many days. Short and unlocked
+/// while the pilot holds synthetic data only.
+pub const DATASET_RETENTION_DAYS: i64 = 7;
 
 // ============================================================================
 // DRT Smart Contract
@@ -513,13 +502,11 @@ mod tests {
         let config = complete(&[
             ("BIND_ADDR", "::1"),
             ("PORT", "9443"),
-            ("DATA_DIR", "/var/lib/rt"),
             ("TLS_CERT_PATH", "cert.pem"),
             ("TLS_KEY_PATH", "key.pem"),
         ])
         .expect("valid config");
         assert_eq!(config.addr, "[::1]:9443".parse().unwrap());
-        assert_eq!(config.data_dir, PathBuf::from("/var/lib/rt"));
         assert_eq!(
             config.transport,
             Transport::Tls {
@@ -542,7 +529,6 @@ mod tests {
     fn dev_build_defaults_to_plain_http_on_loopback() {
         let config = config_from(&[]).expect("dev defaults");
         assert_eq!(config.addr, "127.0.0.1:8443".parse().unwrap());
-        assert_eq!(config.data_dir, PathBuf::from("data"));
         assert_eq!(config.transport, Transport::PlainHttp);
     }
 
@@ -552,7 +538,6 @@ mod tests {
         assert!(config_from(&base_without(&["TLS_CERT_PATH", "TLS_KEY_PATH"])).is_err());
         let config = complete(&[]).expect("release config with TLS");
         assert_eq!(config.addr, "0.0.0.0:8443".parse().unwrap());
-        assert_eq!(config.data_dir, PathBuf::from("/data"));
     }
 
     #[test]

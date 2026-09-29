@@ -395,20 +395,6 @@ async fn main() {
         std::process::exit(1);
     });
 
-    // Initialize local storage for pool files.
-    let data_dir = server_config.data_dir.as_path();
-    let mut encrypted_storage = storage::EncryptedStorage::new(data_dir);
-    match encrypted_storage.initialize() {
-        Ok(()) => warn!(
-            data_dir = %data_dir.display(),
-            "Pool files are plaintext on disk: synthetic data only"
-        ),
-        Err(e) => {
-            tracing::warn!(error = %e, data_dir = %data_dir.display(),
-                "Failed to initialize local storage — pool endpoints will be unavailable");
-        }
-    }
-
     info!(jwks_url = %avs_jwks_url(), "JWT validation enabled");
 
     // Log DRT program ID at startup.
@@ -463,13 +449,6 @@ async fn main() {
     let solana_client =
         blockchain::SolanaClient::new(&network_config.rpc_url.clone(), network_config);
 
-    // Initialize transaction database (redb). Required — fail fast if it cannot open.
-    let tx_db = Arc::new(
-        storage::tx_database::TxDatabase::open(&storage::StoragePaths::new(data_dir).tx_db_path())
-            .expect("Failed to open transaction database — cannot start without DB"),
-    );
-    info!("Transaction database opened");
-
     // Initialize transaction cache.
     let tx_cache = Arc::new(storage::tx_cache::TxCache::new(
         config::TX_CACHE_CAPACITY,
@@ -483,11 +462,8 @@ async fn main() {
         audience: AVS_AUDIENCE.to_string(),
         jwks_cache: Arc::new(tokio::sync::RwLock::new(None)),
         storage: Arc::new(storage),
-        files: Arc::new(encrypted_storage),
-        tx_db,
         solana_client: Arc::new(solana_client),
         tx_cache,
-        pool_locks: Arc::new(dashmap::DashMap::new()),
     };
 
     // Spawn background transaction indexer only when explicitly enabled.
@@ -502,31 +478,6 @@ async fn main() {
         );
     } else {
         info!("Transaction indexer disabled; using on-demand API sync");
-    }
-
-    // Spawn background nonce purge task to prevent unbounded growth of the
-    // replay-protection table.  Runs every NONCE_PURGE_INTERVAL_SECS.
-    {
-        let tx_db = state.tx_db.clone();
-        let interval = std::time::Duration::from_secs(config::NONCE_PURGE_INTERVAL_SECS);
-        let max_age = config::NONCE_MAX_AGE_SECS;
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(interval);
-            ticker.tick().await; // first tick is immediate — skip it
-            loop {
-                ticker.tick().await;
-                match tx_db.purge_expired_nonces(max_age) {
-                    Ok(n) if n > 0 => info!(removed = n, "Purged expired nonces"),
-                    Ok(_) => {}
-                    Err(e) => warn!(error = %e, "Nonce purge failed"),
-                }
-            }
-        });
-        info!(
-            interval_secs = config::NONCE_PURGE_INTERVAL_SECS,
-            max_age_secs = config::NONCE_MAX_AGE_SECS,
-            "Nonce purge background task started"
-        );
     }
 
     // Build the router with all endpoints.

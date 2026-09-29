@@ -3,12 +3,10 @@
 
 //! Background transaction indexer.
 //!
-//! Periodically polls Solana for new signatures on watched addresses and
-//! stores them in the [`TxDatabase`]. Each wallet address registered via
-//! [`TxDatabase::register_address`] is monitored.
-//!
-//! The indexer runs on a Tokio interval timer and stores the last-seen
-//! signature per address in redb's `INDEXER_STATE` table so it only
-//! fetches truly new transactions on each poll.
+//! Polls Solana for new signatures on our wallets' addresses and stores the
+//! transactions in each wallet's history. It keeps the last signature seen
+//! per address in the shared sync rows, so it only fetches new transactions.
+//! The continuous loop is off (`INDEXER_ENABLED`); list requests sync on
+//! demand.
 
 pub mod poller;

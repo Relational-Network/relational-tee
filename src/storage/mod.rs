@@ -3,12 +3,10 @@
 
 //! Durable state: envelope-encrypted objects in Blob storage and rows in
 //! Table storage, behind the [`store::ObjectStore`] and [`store::IndexStore`]
-//! traits. The repositories ([`wallets`], [`transactions`], [`audit`]) seal
-//! everything before it reaches a store, so a storage administrator sees
-//! only ciphertext and hashed identifiers.
-//!
-//! Pools, records and revocations still live in the local layer below
-//! (`DATA_DIR` and redb).
+//! traits. The repositories ([`pools`], [`records`], [`revocations`],
+//! [`wallets`], [`transactions`], [`audit`]) seal everything before it
+//! reaches a store, so a storage administrator sees only ciphertext and
+//! hashed identifiers. Workers keep no durable local state.
 
 use std::sync::Arc;
 
@@ -25,22 +23,19 @@ pub mod audit;
 pub mod azure;
 #[cfg(test)]
 mod conformance;
-pub mod encrypted_fs;
 pub mod envelope;
 #[cfg(any(test, feature = "dev"))]
 pub mod memory;
-pub mod paths;
-pub mod pool_metadata;
+pub mod pools;
+pub mod records;
+pub mod revocations;
 pub mod store;
 pub mod transactions;
 pub mod tx_cache;
-pub mod tx_database;
 pub mod wallets;
 
 // Re-exports for convenience.
-pub use encrypted_fs::EncryptedStorage;
 pub use envelope::StorageKeys;
-pub use paths::StoragePaths;
 pub use store::StoreError;
 
 /// The name of the encrypted row property.
@@ -76,6 +71,7 @@ pub struct Storage {
     index: Arc<dyn IndexStore>,
     keys: StorageKeys,
     worker_id: String,
+    totals: records::TotalsCache,
 }
 
 impl Storage {
@@ -90,6 +86,7 @@ impl Storage {
             index,
             keys,
             worker_id,
+            totals: records::TotalsCache::default(),
         }
     }
 
@@ -98,6 +95,18 @@ impl Storage {
     pub fn in_memory(keys: StorageKeys, worker_id: String) -> Self {
         let store = Arc::new(memory::MemoryStore::new());
         Self::new(store.clone(), store, keys, worker_id)
+    }
+
+    pub fn pools(&self) -> pools::Pools<'_> {
+        pools::Pools::new(self)
+    }
+
+    pub fn records(&self) -> records::Records<'_> {
+        records::Records::new(self)
+    }
+
+    pub fn revocations(&self) -> revocations::Revocations<'_> {
+        revocations::Revocations::new(self)
     }
 
     pub fn wallets(&self) -> wallets::Wallets<'_> {
@@ -126,6 +135,10 @@ impl Storage {
 
     pub(crate) fn keys(&self) -> &StorageKeys {
         &self.keys
+    }
+
+    pub(crate) fn totals_cache(&self) -> &records::TotalsCache {
+        &self.totals
     }
 
     /// A row whose `payload` is `value`, sealed for this table and these keys.

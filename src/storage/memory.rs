@@ -10,18 +10,24 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
 
 use super::store::{
-    BoxFuture, Container, Continuation, ETag, Entity, Filter, IndexStore, InsertOutcome, Object,
-    ObjectStore, Page, Prop, PutOutcome, RkRange, StoreError, Table,
+    BatchOp, BoxFuture, Container, Continuation, ETag, Entity, Filter, IndexStore, InsertOutcome,
+    Object, ObjectStore, Page, Prop, PutOutcome, RkRange, StoreError, Table,
 };
 
 /// A row's properties and ETag, keyed by partition and row key.
 type Rows = BTreeMap<(String, String), (BTreeMap<String, Prop>, ETag)>;
 
+struct Blob {
+    body: Vec<u8>,
+    immutable_until: Option<DateTime<Utc>>,
+}
+
 #[derive(Default)]
 struct Inner {
-    blobs: HashMap<(Container, String), (Vec<u8>, ETag)>,
+    blobs: HashMap<(Container, String), Blob>,
     rows: HashMap<Table, Rows>,
     next_etag: u64,
 }
@@ -77,7 +83,7 @@ impl MemoryStore {
             .blobs
             .get_mut(&(c, path.to_string()))
             .expect("blob exists");
-        f(&mut blob.0);
+        f(&mut blob.body);
     }
 }
 
@@ -91,8 +97,8 @@ impl ObjectStore for MemoryStore {
             .lock()
             .blobs
             .get(&(c, path.to_string()))
-            .map(|(body, _)| Object {
-                body: Bytes::copy_from_slice(body),
+            .map(|blob| Object {
+                body: Bytes::copy_from_slice(&blob.body),
             });
         Box::pin(async move { Ok(found) })
     }
@@ -109,7 +115,13 @@ impl ObjectStore for MemoryStore {
             PutOutcome::AlreadyExists
         } else {
             let etag = inner.etag();
-            inner.blobs.insert(key, (body.to_vec(), etag.clone()));
+            inner.blobs.insert(
+                key,
+                Blob {
+                    body: body.to_vec(),
+                    immutable_until: None,
+                },
+            );
             PutOutcome::Created(etag)
         };
         Box::pin(async move { Ok(outcome) })
@@ -121,15 +133,48 @@ impl ObjectStore for MemoryStore {
         path: &'a str,
         block: Bytes,
     ) -> BoxFuture<'a, Result<(), StoreError>> {
-        let mut inner = self.lock();
-        let etag = inner.etag();
-        let entry = inner
+        self.lock()
             .blobs
             .entry((c, path.to_string()))
-            .or_insert_with(|| (Vec::new(), etag.clone()));
-        entry.0.extend_from_slice(&block);
-        entry.1 = etag;
+            .or_insert_with(|| Blob {
+                body: Vec::new(),
+                immutable_until: None,
+            })
+            .body
+            .extend_from_slice(&block);
         Box::pin(async move { Ok(()) })
+    }
+
+    fn delete<'a>(&'a self, c: Container, path: &'a str) -> BoxFuture<'a, Result<(), StoreError>> {
+        let mut inner = self.lock();
+        let key = (c, path.to_string());
+        let result = match inner.blobs.get(&key) {
+            Some(Blob {
+                immutable_until: Some(until),
+                ..
+            }) if *until > Utc::now() => Err(StoreError::Conflict),
+            _ => {
+                inner.blobs.remove(&key);
+                Ok(())
+            }
+        };
+        Box::pin(async move { result })
+    }
+
+    fn set_immutability<'a>(
+        &'a self,
+        c: Container,
+        path: &'a str,
+        until: DateTime<Utc>,
+    ) -> BoxFuture<'a, Result<(), StoreError>> {
+        let result = match self.lock().blobs.get_mut(&(c, path.to_string())) {
+            Some(blob) => {
+                blob.immutable_until = Some(until);
+                Ok(())
+            }
+            None => Err(StoreError::NotFound),
+        };
+        Box::pin(async move { result })
     }
 }
 
@@ -253,5 +298,51 @@ impl IndexStore for MemoryStore {
             }
         }
         Box::pin(async move { Ok(Page { items, next }) })
+    }
+
+    fn batch<'a>(
+        &'a self,
+        t: Table,
+        pk: &'a str,
+        ops: Vec<BatchOp>,
+    ) -> BoxFuture<'a, Result<(), StoreError>> {
+        let mut inner = self.lock();
+        let mut etags = Vec::with_capacity(ops.len());
+        for _ in &ops {
+            etags.push(inner.etag());
+        }
+        let rows = inner.rows.entry(t).or_default();
+        // Apply to a copy, and keep it only if every operation succeeds.
+        let mut next = rows.clone();
+        let mut result = Ok(());
+        for (op, etag) in ops.into_iter().zip(etags) {
+            let (entity, expected) = match op {
+                BatchOp::Insert(e) => (e, None),
+                BatchOp::UpdateIfMatch(e, etag) => (e, Some(etag)),
+            };
+            if entity.pk != pk {
+                result = Err(StoreError::Invalid(
+                    "batch rows must share a partition".into(),
+                ));
+                break;
+            }
+            let key = (entity.pk, entity.rk);
+            match (next.get(&key), expected) {
+                (Some(_), None) => result = Err(StoreError::Conflict),
+                (None, Some(_)) => result = Err(StoreError::NotFound),
+                (Some((_, current)), Some(expected)) if *current != expected => {
+                    result = Err(StoreError::PreconditionFailed)
+                }
+                _ => {
+                    next.insert(key, (entity.props, etag));
+                    continue;
+                }
+            }
+            break;
+        }
+        if result.is_ok() {
+            *rows = next;
+        }
+        Box::pin(async move { result })
     }
 }

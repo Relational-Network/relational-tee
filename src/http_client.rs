@@ -214,6 +214,10 @@ impl Response {
         self.headers.get(name).and_then(|v| v.to_str().ok())
     }
 
+    pub fn body(&self) -> &Bytes {
+        &self.body
+    }
+
     /// Consume the response, returning the raw body.
     pub fn into_body(self) -> Bytes {
         self.body

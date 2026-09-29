@@ -8,7 +8,7 @@ The worker behind IOB MicRes: an Axum server that runs Use Case 1 credential poo
 
 - **Transport.** Dev builds serve plain HTTP on `127.0.0.1:8443`, or HTTPS with a local mkcert certificate. Release builds have no plain HTTP path: they read a PEM certificate and key from `TLS_CERT_PATH` and `TLS_KEY_PATH`, and refuse to start without them.
 - **Keys.** At startup the worker obtains four P-256 keys, `transport-key`, `storage-root`, `tls-key` and `commitment-key`, and keeps them in memory only. Release builds get them from Microsoft's SKR sidecar on localhost (`KEY_PROVIDER=skr`), which releases a key only to a confidential container group whose attested policy matches the key's release policy. Dev builds default to `KEY_PROVIDER=local`, which reads dev keys from `dev/keys/` (`just dev-keys` creates them); release builds don't contain that provider and refuse `KEY_PROVIDER=local`. Uploads are sealed to `transport-key`, which every worker shares.
-- **Storage.** Wallets, transaction history and the audit log live in Azure Blob and Table storage, encrypted inside the worker with keys derived from `storage-root` (see [Storage](#storage)). Pools, their datasets, issuance records and revocations still live under `DATA_DIR` as JSON files plus a redb database, **unencrypted on disk**: use synthetic data only.
+- **Storage.** All durable state lives in Azure Blob and Table storage, encrypted inside the worker with keys derived from `storage-root` (see [Storage](#storage)); workers keep nothing on local disk. Dev builds default to an in-memory store.
 - **Auth.** Protected endpoints still validate ES256 tokens from the Attestation Verification Service (AVS). The AVS only issues tokens to an SGX enclave it has attested, so authenticated endpoints can't be exercised locally until Entra ID validation replaces it. Public endpoints (`/health*`, `/v1/attestation/public-key`, `/docs`) work.
 - **Solana.** The public devnet RPC by default. It is rate-limited and has no SLA, and the server warns about it at startup.
 
@@ -57,7 +57,6 @@ Not there yet: a container stack with several replicas and local fakes for stora
 |---|---|---|---|
 | `BIND_ADDR` | `127.0.0.1` | `0.0.0.0` | Listening IP address |
 | `PORT` | `8443` | `8443` | Listening port |
-| `DATA_DIR` | `data` | `/data` | Local storage directory |
 | `TLS_CERT_PATH`, `TLS_KEY_PATH` | unset: plain HTTP | required | PEM certificate chain and private key |
 | `KEY_PROVIDER` | `local` | `skr` (the only one) | Where keys come from: the SKR sidecar, or dev key files |
 | `DEV_KEYS_DIR` | `dev/keys` | n/a | Dev key files for `KEY_PROVIDER=local` |
@@ -83,9 +82,12 @@ The worker reaches Azure Storage over its own hyper and rustls client, with Entr
 - **Blobs** get a fresh AES-256-GCM data key each, wrapped (RFC 3394) under the blob key. The additional authenticated data binds each object to its container and path.
 - **Table rows** carry their fields in one encrypted `payload` property, bound to the table and the row's keys. Plaintext properties are copies of filter fields; the worker trusts only the payload. User IDs appear in keys only as `h(x)`, an HMAC under the index key.
 - **Audit events** carry an HMAC tag under `audit-hmac-v1`, so every worker can verify every event. Each is appended encrypted to the worker's hourly append blob, then indexed by pool and by day. Reads verify each event and return failures with `hmac_valid: false` instead of dropping them.
-- **Pagination** uses signed cursors: pass a response's `next_cursor` back as `cursor`. Any worker accepts any worker's cursor.
+- **Pools** are rows changed only by ETag compare-and-swap, so no worker needs a lock. Their totals are computed from committed records and revocations, and cached per worker until the pool's newest record changes.
+- **Datasets** are staged (a record row claims the ID, then the create-only blob is written), then committed in one atomic batch, and made immutable for 7 days. The dataset's data key lives only in its record row, so deleting it there erases the blob. If an append-DRT burn never reaches the chain, the staged dataset is removed; if it was sent but not confirmed, the record stays staged for reconciliation.
+- **Revocations** are appended to an encrypted, HMAC-tagged log (the authoritative record), then indexed per pool.
+- **Pagination** uses signed cursors: pass a response's `next_cursor` back as `cursor`, with the same filters. Any worker accepts any worker's cursor. Lists no longer take `offset` or return totals.
 
-Tables and containers are created at startup if they're missing. `STORAGE_BACKEND=azurite` uses Azurite's well-known dev account key (dev builds only); `memory` keeps everything in the process.
+Tables and containers are created at startup if they're missing. `STORAGE_BACKEND=azurite` uses Azurite's well-known dev account key (dev builds only); `memory` keeps everything in the process. Azurite doesn't implement immutability policies (it answers 501), so dataset commits there log a warning.
 
 ## Build and release
 

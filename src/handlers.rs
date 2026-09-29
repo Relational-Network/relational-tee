@@ -20,12 +20,9 @@ use utoipa::ToSchema;
 use crate::auth::AdminToken;
 use crate::config::MAX_BODY_SIZE;
 use crate::crypto::{jwk_for_public_key, Jwk};
-use crate::data_validation::{
-    load_pool_schema, validate_csv_bytes, ValidationMode, ValidationSummary,
-};
+use crate::data_validation::{validate_csv_bytes, FieldSchema, ValidationMode, ValidationSummary};
 use crate::error::ApiError;
 use crate::state::AppState;
-use crate::storage::paths::StoragePaths;
 use crate::tee::{KeyName, ReleasedKey};
 
 // ============================================================================
@@ -108,12 +105,11 @@ pub(crate) struct ParsedCsvPayload {
     pub csv_bytes: Vec<u8>,
 }
 
-/// Validate a CSV payload against the pool's stored schema.
+/// Validate a CSV payload against the pool's schema.
 ///
-/// `mode == None` skips the schema lookup entirely. Other modes require the
-/// schema to have been uploaded via `POST /v1/drt/pools/{pda}/schema`.
+/// `mode == None` skips the schema entirely. Other modes need one.
 pub(crate) fn validate_payload(
-    paths: &StoragePaths,
+    schema: &[FieldSchema],
     pool_pda: &str,
     csv_bytes: &[u8],
     mode: ValidationMode,
@@ -121,14 +117,12 @@ pub(crate) fn validate_payload(
     if matches!(mode, ValidationMode::None) {
         return Ok(validate_csv_bytes(csv_bytes, &[], mode));
     }
-
-    let schema = load_pool_schema(paths, pool_pda).ok_or_else(|| {
-        ApiError::bad_request(format!(
-            "schema for pool {pool_pda} not found — upload one to the enclave first",
-        ))
-    })?;
-
-    Ok(validate_csv_bytes(csv_bytes, &schema, mode))
+    if schema.is_empty() {
+        return Err(ApiError::bad_request(format!(
+            "pool {pool_pda} has no schema — upload one first",
+        )));
+    }
+    Ok(validate_csv_bytes(csv_bytes, schema, mode))
 }
 
 pub(crate) async fn parse_csv_payload(

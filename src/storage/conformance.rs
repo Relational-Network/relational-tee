@@ -7,18 +7,25 @@
 use bytes::Bytes;
 
 use super::store::{
-    Container, Entity, Filter, IndexStore, InsertOutcome, ObjectStore, Prop, PutOutcome, RkRange,
-    StoreError, Table,
+    BatchOp, Container, Entity, Filter, IndexStore, InsertOutcome, ObjectStore, Prop, PutOutcome,
+    RkRange, StoreError, Table,
 };
 
 /// Run every check. `run` keeps keys unique, so reruns against a shared
-/// store don't collide.
-pub(crate) async fn check_all(objects: &dyn ObjectStore, index: &dyn IndexStore) {
+/// store don't collide. Azurite has no immutability policies, so that check
+/// is optional.
+pub(crate) async fn check_all(
+    objects: &dyn ObjectStore,
+    index: &dyn IndexStore,
+    immutability: bool,
+) {
     let run = uuid::Uuid::new_v4().simple().to_string();
     create_only_writes(objects, &run).await;
     append_blobs(objects, &run).await;
+    deletes(objects, &run, immutability).await;
     conditional_row_writes(index, &run).await;
     queries_and_pages(index, &run).await;
+    atomic_batches(index, &run).await;
 }
 
 async fn create_only_writes(objects: &dyn ObjectStore, run: &str) {
@@ -60,6 +67,43 @@ async fn append_blobs(objects: &dyn ObjectStore, run: &str) {
     }
     let got = objects.get(Container::Audit, &path).await.unwrap().unwrap();
     assert_eq!(got.body.as_ref(), b"one\ntwo\n");
+}
+
+async fn deletes(objects: &dyn ObjectStore, run: &str, immutability: bool) {
+    let path = format!("conformance/{run}/staged.bin");
+    objects
+        .put_if_absent(Container::Datasets, &path, Bytes::from_static(b"x"))
+        .await
+        .unwrap();
+    objects.delete(Container::Datasets, &path).await.unwrap();
+    assert!(objects
+        .get(Container::Datasets, &path)
+        .await
+        .unwrap()
+        .is_none());
+    objects.delete(Container::Datasets, &path).await.unwrap();
+
+    if immutability {
+        let path = format!("conformance/{run}/committed.bin");
+        objects
+            .put_if_absent(Container::Datasets, &path, Bytes::from_static(b"y"))
+            .await
+            .unwrap();
+        let until = chrono::Utc::now() + chrono::Duration::days(1);
+        objects
+            .set_immutability(Container::Datasets, &path, until)
+            .await
+            .unwrap();
+        assert!(matches!(
+            objects.delete(Container::Datasets, &path).await,
+            Err(StoreError::Conflict)
+        ));
+        assert!(objects
+            .get(Container::Datasets, &path)
+            .await
+            .unwrap()
+            .is_some());
+    }
 }
 
 fn row(pk: &str, rk: &str, state: &str) -> Entity {
@@ -200,10 +244,97 @@ async fn queries_and_pages(index: &dyn IndexStore, run: &str) {
     );
 }
 
+async fn atomic_batches(index: &dyn IndexStore, run: &str) {
+    let pk = format!("batch-{run}");
+    let InsertOutcome::Inserted(etag) = index
+        .insert(Table::Records, row(&pk, "rec:1", "staged"))
+        .await
+        .unwrap()
+    else {
+        panic!("first insert succeeds");
+    };
+    index
+        .insert(Table::Records, row(&pk, "log:taken", "committed"))
+        .await
+        .unwrap();
+
+    // One conflicting operation, and nothing is applied.
+    let conflicting = index
+        .batch(
+            Table::Records,
+            &pk,
+            vec![
+                BatchOp::UpdateIfMatch(row(&pk, "rec:1", "committed"), etag.clone()),
+                BatchOp::Insert(row(&pk, "log:taken", "committed")),
+            ],
+        )
+        .await;
+    assert!(
+        matches!(conflicting, Err(StoreError::Conflict)),
+        "{conflicting:?}"
+    );
+    let rec = index
+        .get(Table::Records, &pk, "rec:1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        rec.str("state"),
+        Some("staged"),
+        "a failed batch changes nothing"
+    );
+
+    let stale = index
+        .batch(
+            Table::Records,
+            &pk,
+            vec![
+                BatchOp::Insert(row(&pk, "log:2", "committed")),
+                BatchOp::UpdateIfMatch(
+                    row(&pk, "rec:1", "committed"),
+                    super::store::ETag("W/\"datetime'2000-01-01T00%3A00%3A00Z'\"".into()),
+                ),
+            ],
+        )
+        .await;
+    assert!(
+        matches!(stale, Err(StoreError::PreconditionFailed)),
+        "{stale:?}"
+    );
+    assert!(index
+        .get(Table::Records, &pk, "log:2")
+        .await
+        .unwrap()
+        .is_none());
+
+    index
+        .batch(
+            Table::Records,
+            &pk,
+            vec![
+                BatchOp::UpdateIfMatch(row(&pk, "rec:1", "committed"), etag),
+                BatchOp::Insert(row(&pk, "log:2", "committed")),
+            ],
+        )
+        .await
+        .unwrap();
+    let rec = index
+        .get(Table::Records, &pk, "rec:1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(rec.str("state"), Some("committed"));
+    assert!(index
+        .get(Table::Records, &pk, "log:2")
+        .await
+        .unwrap()
+        .is_some());
+}
+
 #[tokio::test]
 async fn memory_store_meets_the_contract() {
     let store = super::memory::MemoryStore::new();
-    check_all(&store, &store).await;
+    check_all(&store, &store, true).await;
 }
 
 /// Against Azurite on its default ports: `just test-azurite` starts it and
@@ -220,5 +351,5 @@ async fn azurite_meets_the_contract() {
     })
     .expect("Azurite config");
     store.ensure_layout().await.expect("Azurite reachable");
-    check_all(&store, &store).await;
+    check_all(&store, &store, false).await;
 }

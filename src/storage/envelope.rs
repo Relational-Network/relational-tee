@@ -9,9 +9,11 @@
 //!
 //! - **Blobs:** a random 256-bit data key (DEK) and 96-bit nonce per object,
 //!   AES-256-GCM. Stored as `"RSB1"` ‖ header length (u32, big-endian) ‖
-//!   header (JSON) ‖ ciphertext and tag. The header names the DEK wrapped
-//!   with AES-256 key wrap (RFC 3394) under the blob KEK. The AAD binds the
-//!   container, path and header, so objects can't be moved or re-headed.
+//!   header (JSON) ‖ ciphertext and tag. The header carries the DEK wrapped
+//!   with AES-256 key wrap (RFC 3394) under the blob KEK, or, for datasets,
+//!   a `dek_ref` naming the row that holds it, so deleting that row erases an
+//!   immutable blob. The AAD binds the container, path and header, so
+//!   objects can't be moved or re-headed.
 //! - **Table rows:** sensitive fields go in one binary `payload` property:
 //!   nonce ‖ AES-256-GCM ciphertext and tag, with an AAD binding the table,
 //!   partition key, row key and payload schema version.
@@ -102,6 +104,8 @@ struct BlobHeader {
     nonce: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     wrapped_dek: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dek_ref: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -171,22 +175,51 @@ impl StorageKeys {
         Ok(out)
     }
 
-    /// Encrypt an object stored at `container/path` under a fresh DEK.
+    /// Encrypt an object stored at `container/path` under a fresh DEK,
+    /// wrapped in its own header.
     pub fn seal_blob(&self, container: Container, path: &str, plaintext: &[u8]) -> Vec<u8> {
         let dek = Zeroizing::new(random::<32>());
+        let wrapped = Some(URL_SAFE_NO_PAD.encode(self.wrap(&dek)));
+        self.seal_with(container, path, plaintext, &dek, wrapped, None)
+    }
+
+    /// Encrypt an object under a fresh DEK kept outside it: the header names
+    /// `dek_ref`, and the caller stores the returned wrapped DEK there.
+    pub fn seal_detached(
+        &self,
+        container: Container,
+        path: &str,
+        dek_ref: &str,
+        plaintext: &[u8],
+    ) -> (Vec<u8>, Vec<u8>) {
+        let dek = Zeroizing::new(random::<32>());
+        let sealed = self.seal_with(container, path, plaintext, &dek, None, Some(dek_ref.into()));
+        (sealed, self.wrap(&dek))
+    }
+
+    fn seal_with(
+        &self,
+        container: Container,
+        path: &str,
+        plaintext: &[u8],
+        dek: &[u8; 32],
+        wrapped_dek: Option<String>,
+        dek_ref: Option<String>,
+    ) -> Vec<u8> {
         let nonce = random::<12>();
         let header = BlobHeader {
             alg: "A256GCM".into(),
             kek: BLOB_KEK_LABEL.into(),
             nonce: URL_SAFE_NO_PAD.encode(nonce),
-            wrapped_dek: Some(URL_SAFE_NO_PAD.encode(self.wrap(&dek))),
+            wrapped_dek,
+            dek_ref,
         };
         let header = serde_json::to_vec(&header).expect("header serializes");
         let aad = aad(
             BLOB_AAD,
             &[container.name().as_bytes(), path.as_bytes(), &header],
         );
-        let ciphertext = Aes256Gcm::new_from_slice(dek.as_ref())
+        let ciphertext = Aes256Gcm::new_from_slice(dek)
             .expect("32-byte key")
             .encrypt(
                 Nonce::from_slice(&nonce),
@@ -213,6 +246,30 @@ impl StorageKeys {
         path: &str,
         sealed: &[u8],
     ) -> Result<Zeroizing<Vec<u8>>, StoreError> {
+        self.open_with(container, path, sealed, None)
+    }
+
+    /// Decrypt an object sealed by [`seal_detached`](Self::seal_detached),
+    /// given the wrapped DEK stored at its `dek_ref`. The worker never reads
+    /// datasets back yet.
+    #[cfg(test)]
+    pub fn open_detached(
+        &self,
+        container: Container,
+        path: &str,
+        sealed: &[u8],
+        wrapped_dek: &[u8],
+    ) -> Result<Zeroizing<Vec<u8>>, StoreError> {
+        self.open_with(container, path, sealed, Some(wrapped_dek))
+    }
+
+    fn open_with(
+        &self,
+        container: Container,
+        path: &str,
+        sealed: &[u8],
+        detached_dek: Option<&[u8]>,
+    ) -> Result<Zeroizing<Vec<u8>>, StoreError> {
         if sealed.len() < 8 || &sealed[..4] != BLOB_MAGIC {
             return Err(integrity("not a sealed object"));
         }
@@ -232,11 +289,17 @@ impl StorageKeys {
             .ok()
             .filter(|n| n.len() == 12)
             .ok_or_else(|| integrity("bad object nonce"))?;
-        let wrapped = header
-            .wrapped_dek
-            .as_deref()
-            .and_then(|w| URL_SAFE_NO_PAD.decode(w).ok())
-            .ok_or_else(|| integrity("object has no wrapped data key"))?;
+        let wrapped = match (detached_dek, &header.wrapped_dek, &header.dek_ref) {
+            (None, Some(w), None) => URL_SAFE_NO_PAD
+                .decode(w)
+                .map_err(|_| integrity("bad wrapped data key"))?,
+            (Some(w), None, Some(_)) => w.to_vec(),
+            _ => {
+                return Err(integrity(
+                    "object's data key isn't where the reader expects it",
+                ))
+            }
+        };
         let dek = self.unwrap(&wrapped)?;
         let aad = aad(
             BLOB_AAD,
@@ -461,6 +524,31 @@ mod tests {
         let other_env = StorageKeys::derive(&fixed_key(2));
         assert!(other_env
             .open_blob(Container::Datasets, "pool/a.csv.enc", &sealed)
+            .is_err());
+    }
+
+    #[test]
+    fn detached_keys_open_only_with_their_own_wrapped_dek() {
+        let k = keys();
+        let path = "Pool1/r1.csv.enc";
+        let (sealed, wrapped) =
+            k.seal_detached(Container::Datasets, path, "records/Pool1/rec:r1", b"csv");
+        assert_eq!(
+            k.open_detached(Container::Datasets, path, &sealed, &wrapped)
+                .unwrap()
+                .as_slice(),
+            b"csv"
+        );
+        // Without its key the object can't be opened at all.
+        assert!(k.open_blob(Container::Datasets, path, &sealed).is_err());
+        let (_, other) = k.seal_detached(Container::Datasets, path, "records/Pool1/rec:r2", b"x");
+        assert!(k
+            .open_detached(Container::Datasets, path, &sealed, &other)
+            .is_err());
+        // A self-contained object doesn't take an outside key either.
+        let inline = k.seal_blob(Container::Datasets, path, b"csv");
+        assert!(k
+            .open_detached(Container::Datasets, path, &inline, &wrapped)
             .is_err());
     }
 

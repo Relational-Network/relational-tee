@@ -8,8 +8,6 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::storage::paths::StoragePaths;
-
 /// Maximum number of validation errors returned per request.
 pub const MAX_VALIDATION_ERRORS: usize = 100;
 
@@ -69,33 +67,6 @@ pub struct ValidationSummary {
     pub valid: bool,
     pub errors: Vec<ValidationError>,
     pub rows_validated: usize,
-}
-
-/// Load a pool's schema from `data/pools/{pda}/schema.json`.
-///
-/// Returns `None` if the file does not exist or cannot be parsed.
-pub fn load_pool_schema(paths: &StoragePaths, pool_pda: &str) -> Option<Vec<FieldSchema>> {
-    let schema_path = paths.pool_schema(pool_pda);
-    let content = std::fs::read_to_string(&schema_path).ok()?;
-    serde_json::from_str(&content).ok()
-}
-
-/// Persist a pool's schema to `data/pools/{pda}/schema.json`.
-///
-/// Creates the pool directory if it does not exist.
-pub fn save_pool_schema(
-    paths: &StoragePaths,
-    pool_pda: &str,
-    schema: &[FieldSchema],
-) -> Result<(), String> {
-    let pool_dir = paths.pool_dir(pool_pda);
-    std::fs::create_dir_all(&pool_dir)
-        .map_err(|e| format!("failed to create pool directory: {e}"))?;
-    let schema_path = paths.pool_schema(pool_pda);
-    let json = serde_json::to_string_pretty(schema)
-        .map_err(|e| format!("failed to serialize schema: {e}"))?;
-    std::fs::write(&schema_path, json).map_err(|e| format!("failed to write schema file: {e}"))?;
-    Ok(())
 }
 
 /// Validate CSV bytes against a given schema under the chosen mode.
@@ -591,28 +562,5 @@ mod tests {
         let loaded: Vec<FieldSchema> = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(loaded.len(), schema.len());
         assert_eq!(loaded[0].name, "description");
-    }
-
-    #[test]
-    fn save_and_load_pool_schema_isolated_per_pda() {
-        let dir = std::env::temp_dir().join(format!("schema_test_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        let paths = StoragePaths::new(&dir);
-
-        let schema_a = test_pilot_schema();
-        let mut schema_b = test_pilot_schema();
-        // Distinguish B's schema so we can prove A is untouched.
-        schema_b.pop();
-
-        save_pool_schema(&paths, "PDA_A", &schema_a).expect("save A");
-        save_pool_schema(&paths, "PDA_B", &schema_b).expect("save B");
-
-        let loaded_a = load_pool_schema(&paths, "PDA_A").expect("load A");
-        let loaded_b = load_pool_schema(&paths, "PDA_B").expect("load B");
-        assert_eq!(loaded_a.len(), schema_a.len());
-        assert_eq!(loaded_b.len(), schema_b.len());
-        assert_ne!(loaded_a.len(), loaded_b.len(), "pools must be isolated");
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

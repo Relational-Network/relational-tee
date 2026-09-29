@@ -29,33 +29,18 @@ pub struct ReadyResponse {
 pub struct HealthChecks {
     /// Whether the service process is running.
     pub service: String,
-    /// Data directory availability (if configured).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub data_dir: Option<String>,
     /// Solana RPC reachability (readiness only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub solana_rpc: Option<String>,
     /// AVS JWKS cache status (readiness only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub jwks: Option<String>,
-    /// Transaction database (redb) status (readiness only).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tx_db: Option<String>,
 }
 
 /// Simple health check response for liveness probes.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct HealthResponse {
     pub status: String,
-}
-
-/// Check if the data directory exists and is accessible.
-/// Uses async I/O to avoid blocking the Tokio runtime.
-async fn check_data_dir(state: &AppState) -> Option<String> {
-    match tokio::fs::metadata(state.files.paths().root()).await {
-        Ok(_) => Some("ok".to_string()),
-        Err(_) => Some("missing".to_string()),
-    }
 }
 
 /// Health check endpoint handler.
@@ -72,28 +57,16 @@ async fn check_data_dir(state: &AppState) -> Option<String> {
         (status = 503, description = "Service is unhealthy", body = ReadyResponse)
     )
 )]
-pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<ReadyResponse>) {
-    let data_dir = check_data_dir(&state).await;
-    let all_ok = data_dir.as_ref().map(|s| s == "ok").unwrap_or(true);
-
+pub async fn health() -> (StatusCode, Json<ReadyResponse>) {
     let response = ReadyResponse {
-        status: if all_ok { "ok" } else { "degraded" }.to_string(),
+        status: "ok".to_string(),
         checks: HealthChecks {
             service: "ok".to_string(),
-            data_dir,
             solana_rpc: None,
             jwks: None,
-            tx_db: None,
         },
     };
-
-    let status = if all_ok {
-        StatusCode::OK
-    } else {
-        StatusCode::SERVICE_UNAVAILABLE
-    };
-
-    (status, Json(response))
+    (StatusCode::OK, Json(response))
 }
 
 /// Liveness probe handler.
@@ -132,8 +105,6 @@ pub async fn liveness() -> Json<HealthResponse> {
     )
 )]
 pub async fn readiness(State(state): State<AppState>) -> (StatusCode, Json<ReadyResponse>) {
-    let data_dir = check_data_dir(&state).await;
-
     // Check Solana RPC by calling a lightweight getHealth.
     let solana_rpc = match state.solana_client.rpc().get_health().await {
         Ok(()) => "ok".to_string(),
@@ -150,25 +121,14 @@ pub async fn readiness(State(state): State<AppState>) -> (StatusCode, Json<Ready
         }
     };
 
-    // Check redb by opening a read transaction.
-    let tx_db = match state.tx_db.begin_read_txn() {
-        Ok(_) => "ok".to_string(),
-        Err(e) => format!("error: {e}"),
-    };
-
-    let all_ok = data_dir.as_ref().map(|s| s == "ok").unwrap_or(true)
-        && solana_rpc == "ok"
-        && jwks == "ok"
-        && tx_db == "ok";
+    let all_ok = solana_rpc == "ok" && jwks == "ok";
 
     let response = ReadyResponse {
         status: if all_ok { "ok" } else { "degraded" }.to_string(),
         checks: HealthChecks {
             service: "ok".to_string(),
-            data_dir,
             solana_rpc: Some(solana_rpc),
             jwks: Some(jwks),
-            tx_db: Some(tx_db),
         },
     };
 

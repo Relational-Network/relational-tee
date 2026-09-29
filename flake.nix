@@ -132,10 +132,6 @@
             pkgs.cacert
             (etcFor pkgs)
           ];
-          fakeRootCommands = ''
-            mkdir -p data
-            chown 65532:65532 data
-          '';
           config = {
             Entrypoint = [ "/bin/relational-tee" ];
             User = "65532:65532";

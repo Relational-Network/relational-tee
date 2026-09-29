@@ -9,8 +9,7 @@ use crate::attestation::Attestation;
 use crate::auth::JwksCache;
 use crate::blockchain::SolanaClient;
 use crate::storage::tx_cache::TxCache;
-use crate::storage::tx_database::TxDatabase;
-use crate::storage::{EncryptedStorage, Storage};
+use crate::storage::Storage;
 use crate::tee::WorkerKeys;
 
 /// Shared application state passed to every handler via Axum's `State` extractor.
@@ -28,20 +27,12 @@ pub struct AppState {
     pub jwks_cache: Arc<tokio::sync::RwLock<Option<JwksCache>>>,
 
     // ── Storage ─────────────────────────────────────────────────
-    /// Encrypted Blob and Table storage: wallets, transactions, audit.
+    /// Encrypted Blob and Table storage.
     pub storage: Arc<Storage>,
-    /// Local files for pool metadata and datasets.
-    pub files: Arc<EncryptedStorage>,
-    /// Embedded database (redb) for pool indexes.
-    pub tx_db: Arc<TxDatabase>,
 
     // ── Chain ───────────────────────────────────────────────────
     /// Solana RPC client.
     pub solana_client: Arc<SolanaClient>,
     /// LRU cache for first-page tx queries.
     pub tx_cache: Arc<TxCache>,
-
-    // ── Pool concurrency ────────────────────────────────────────
-    /// Per-pool mutexes to serialize issuance operations on `pool.meta.json`.
-    pub pool_locks: Arc<dashmap::DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }

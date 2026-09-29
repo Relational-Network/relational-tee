@@ -27,29 +27,11 @@ use crate::state::AppState;
 use crate::storage::wallets::{WalletMetadata, WalletStatus};
 
 // ============================================================================
-// Shared pagination queries
+// Shared pagination query
 // ============================================================================
-
-/// Reusable pagination query parameters (limit + offset).
-#[derive(Debug, Deserialize, IntoParams)]
-pub struct PaginationQuery {
-    /// Maximum number of items to return (default 50, max 200).
-    #[serde(default = "default_page_limit")]
-    pub limit: usize,
-    /// Offset for pagination (default 0).
-    #[serde(default)]
-    pub offset: usize,
-}
 
 fn default_page_limit() -> usize {
     50
-}
-
-impl PaginationQuery {
-    /// Clamp limit to `[1, 200]`.
-    pub fn clamped_limit(&self) -> usize {
-        self.limit.clamp(1, 200)
-    }
 }
 
 /// Cursor pagination: pass the previous response's `next_cursor` as
