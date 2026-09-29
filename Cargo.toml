@@ -29,7 +29,7 @@ serde_json = { version = "1.0.149", default-features = false }
 
 # ── OpenAPI / Swagger ──────────────────────────────────────────────
 utoipa = { version = "5.4.0", default-features = false, features = ["chrono", "macros"]}
-utoipa-swagger-ui = { version = "9.0.2", default-features = false, features = ["axum"], optional = true }
+utoipa-swagger-ui = { version = "9.0.2", default-features = false, features = ["axum", "vendored"], optional = true }
 
 # ── TLS & Crypto ───────────────────────────────────────────────────
 rustls = { version = "0.23.36", default-features = false, features = ["aws-lc-rs"] }
