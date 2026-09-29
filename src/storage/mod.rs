@@ -53,7 +53,7 @@ pub struct InvalidCursor;
 
 impl From<InvalidCursor> for crate::error::ApiError {
     fn from(_: InvalidCursor) -> Self {
-        Self::bad_request("invalid pagination cursor")
+        Self::bad_request("invalid pagination cursor").with_code("invalid_cursor")
     }
 }
 

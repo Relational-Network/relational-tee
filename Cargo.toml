@@ -100,3 +100,4 @@ lru = { version = "0.18", default-features = false }
 
 [dev-dependencies]
 tokio = { version = "1.49.0", default-features = false, features = ["test-util"] }
+tower = { version = "0.5", default-features = false, features = ["util"] }

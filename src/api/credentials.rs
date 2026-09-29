@@ -391,6 +391,12 @@ fn kind_str(kind: PoolKind) -> &'static str {
 
 fn validation_failed(errors: usize) -> ApiError {
     ApiError::bad_request(format!("CSV validation failed: {errors} error(s)"))
+        .with_code("validation_failed")
+}
+
+fn initialization_in_progress() -> ApiError {
+    ApiError::conflict("pool initialization is already in progress — retry shortly")
+        .with_code("initialization_in_progress")
 }
 
 // ============================================================================
@@ -619,9 +625,7 @@ pub async fn initialize_pool(
     if let StageOutcome::Exists(existing) = &outcome {
         if existing.status == RecordStatus::Staged {
             if Utc::now() - existing.uploaded_at < STAGED_INIT_TIMEOUT {
-                return Err(ApiError::conflict(
-                    "pool initialization is already in progress — retry shortly",
-                ));
+                return Err(initialization_in_progress());
             }
             warn!(pool = %pool_pda_str, "Discarding an abandoned initialization");
             records.discard_abandoned(&pool_pda_str, "initial").await?;
@@ -637,11 +641,7 @@ pub async fn initialize_pool(
                 .await?
         }
         StageOutcome::Exists(existing) if existing.status == RecordStatus::Committed => existing,
-        StageOutcome::Exists(_) => {
-            return Err(ApiError::conflict(
-                "pool initialization is already in progress — retry shortly",
-            ))
-        }
+        StageOutcome::Exists(_) => return Err(initialization_in_progress()),
     };
 
     // Move the pool to ready.

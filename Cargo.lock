@@ -1607,6 +1607,7 @@ dependencies = [
  "solana-system-interface",
  "solana-transaction",
  "tokio",
+ "tower",
  "tower-http",
  "tracing",
  "tracing-subscriber",

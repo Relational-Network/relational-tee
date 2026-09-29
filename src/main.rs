@@ -27,6 +27,7 @@ mod handlers;
 mod health;
 mod http_client;
 mod indexer;
+mod request_id;
 mod state;
 mod storage;
 mod tee;
@@ -40,7 +41,7 @@ use axum::{
 use std::sync::Arc;
 use std::time::Instant;
 use tower_http::set_header::SetResponseHeaderLayer;
-use tower_http::trace::{DefaultMakeSpan, DefaultOnRequest, DefaultOnResponse, TraceLayer};
+use tower_http::trace::{DefaultOnRequest, DefaultOnResponse, TraceLayer};
 use tracing::{info, warn, Level};
 use tracing_subscriber::EnvFilter;
 use utoipa::{openapi::security::SecurityScheme, Modify, OpenApi};
@@ -137,6 +138,7 @@ Protected endpoints require a JWT issued by the Attestation Verification Service
         ReadyResponse,
         HealthChecks,
         AdminStatusResponse,
+        error::ErrorBody,
         attestation::AttestationResponse,
         data_validation::ValidationError,
         data_validation::ValidationMode,
@@ -480,47 +482,7 @@ async fn main() {
         info!("Transaction indexer disabled; using on-demand API sync");
     }
 
-    // Build the router with all endpoints.
-    // Body limit: 50MB max for upload endpoints, prevents unbounded memory usage.
-    let app = Router::new()
-        // Health endpoints (unversioned for k8s probes).
-        .route("/health", get(health))
-        .route("/health/live", get(liveness))
-        .route("/health/ready", get(readiness))
-        // v1 API endpoints.
-        .route("/v1/attestation", get(attestation::get_attestation))
-        .route("/v1/attestation/public-key", get(get_public_key))
-        .route("/v1/admin/status", get(admin_status))
-        // Wallet service routes.
-        .merge(api::wallet_router())
-        // DRT pool routes.
-        .merge(api::drt_router())
-        .layer(DefaultBodyLimit::max(MAX_BODY_SIZE))
-        .layer(
-            TraceLayer::new_for_http()
-                .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
-                .on_request(DefaultOnRequest::new().level(Level::INFO))
-                .on_response(DefaultOnResponse::new().level(Level::INFO)),
-        )
-        .layer(SetResponseHeaderLayer::if_not_present(
-            header::HeaderName::from_static("x-content-type-options"),
-            HeaderValue::from_static("nosniff"),
-        ))
-        .layer(SetResponseHeaderLayer::if_not_present(
-            header::HeaderName::from_static("x-frame-options"),
-            HeaderValue::from_static("DENY"),
-        ))
-        .layer(SetResponseHeaderLayer::if_not_present(
-            header::CACHE_CONTROL,
-            HeaderValue::from_static("no-store"),
-        ))
-        .with_state(state);
-
-    // SwaggerUi serves the OpenAPI document itself.
-    #[cfg(feature = "swagger-ui")]
-    let app = app.merge(SwaggerUi::new("/docs").url("/api-doc/openapi.json", ApiDoc::openapi()));
-    #[cfg(not(feature = "swagger-ui"))]
-    let app = app.route("/api-doc/openapi.json", get(openapi_json));
+    let app = router(state);
 
     let addr = server_config.addr;
 
@@ -569,6 +531,63 @@ async fn main() {
                 .expect("server error");
         }
     }
+}
+
+/// Every route, with the middleware every response passes through. The
+/// request context is outermost, so every response, the fallback's
+/// included, carries `X-Request-Id` and the error body.
+fn router(state: AppState) -> Router {
+    let app = Router::new()
+        // Health endpoints (unversioned for k8s probes).
+        .route("/health", get(health))
+        .route("/health/live", get(liveness))
+        .route("/health/ready", get(readiness))
+        // v1 API endpoints.
+        .route("/v1/attestation", get(attestation::get_attestation))
+        .route("/v1/attestation/public-key", get(get_public_key))
+        .route("/v1/admin/status", get(admin_status))
+        // Wallet service routes.
+        .merge(api::wallet_router())
+        // DRT pool routes.
+        .merge(api::drt_router())
+        .fallback(request_id::not_found)
+        .with_state(state);
+
+    // SwaggerUi serves the OpenAPI document itself.
+    #[cfg(feature = "swagger-ui")]
+    let app = app.merge(SwaggerUi::new("/docs").url("/api-doc/openapi.json", ApiDoc::openapi()));
+    #[cfg(not(feature = "swagger-ui"))]
+    let app = app.route("/api-doc/openapi.json", get(openapi_json));
+
+    // Body limit: 50MB max for upload endpoints, prevents unbounded memory usage.
+    app.layer(DefaultBodyLimit::max(MAX_BODY_SIZE))
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(|request: &axum::http::Request<axum::body::Body>| {
+                    let id = request
+                        .extensions()
+                        .get::<request_id::RequestId>()
+                        .map(|id| id.0.as_str())
+                        .unwrap_or("-");
+                    tracing::info_span!("request", method = %request.method(),
+                        path = %request.uri().path(), request_id = %id)
+                })
+                .on_request(DefaultOnRequest::new().level(Level::INFO))
+                .on_response(DefaultOnResponse::new().level(Level::INFO)),
+        )
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::HeaderName::from_static("x-content-type-options"),
+            HeaderValue::from_static("nosniff"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::HeaderName::from_static("x-frame-options"),
+            HeaderValue::from_static("DENY"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-store"),
+        ))
+        .layer(axum::middleware::from_fn(request_id::request_context))
 }
 
 /// Wait for SIGINT (Ctrl-C) or SIGTERM for clean shutdown.

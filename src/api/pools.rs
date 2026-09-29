@@ -76,14 +76,14 @@ pub(crate) async fn sign_send_and_parse(
     let not_sent = |error| SendFailure { error, sent: None };
     let rpc = state.solana_client.rpc();
     let recent_blockhash = rpc.get_latest_blockhash().await.map_err(|e| {
-        not_sent(ApiError::service_unavailable(format!(
+        not_sent(ApiError::rpc_unavailable(format!(
             "blockhash fetch failed: {e}"
         )))
     })?;
     let message = solana_message::Message::new(&instructions, Some(&keypair.pubkey()));
     let tx = solana_transaction::Transaction::new(&[keypair], message, recent_blockhash);
     let signature = rpc.send_transaction(&tx).await.map_err(|e| {
-        not_sent(ApiError::service_unavailable(format!(
+        not_sent(ApiError::rpc_unavailable(format!(
             "transaction send failed: {e}"
         )))
     })?;

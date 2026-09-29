@@ -37,8 +37,7 @@
 
 use axum::{
     extract::FromRequestParts,
-    http::{header, request::Parts, StatusCode},
-    Json,
+    http::{header, request::Parts},
 };
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use serde::Deserialize;
@@ -47,6 +46,7 @@ use tracing::{debug, warn};
 
 use crate::config::{avs_jwks_url, is_loopback_http_url, AVS_ISSUER, JWKS_CACHE_TTL_SECS};
 use crate::crypto::{jwk_for_public_key, Jwk, JwksResponse};
+use crate::error::ApiError;
 use crate::http_client::HttpClient;
 use crate::state::AppState;
 use crate::tee::KeyName;
@@ -321,7 +321,7 @@ pub async fn validate_token(state: &AppState, token: &str) -> Result<TokenData, 
 /// Extracts and validates a Bearer token, returning the decoded `TokenData`.
 /// Returns 401 Unauthorized if the token is missing or invalid.
 impl FromRequestParts<AppState> for TokenData {
-    type Rejection = (StatusCode, Json<serde_json::Value>);
+    type Rejection = ApiError;
 
     async fn from_request_parts(
         parts: &mut Parts,
@@ -331,27 +331,16 @@ impl FromRequestParts<AppState> for TokenData {
             .headers
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| {
-                (
-                    StatusCode::UNAUTHORIZED,
-                    Json(serde_json::json!({"error": "missing authorization header"})),
-                )
-            })?;
+            .ok_or_else(|| ApiError::unauthorized("missing authorization header"))?;
 
-        let token = auth_header.strip_prefix("Bearer ").ok_or_else(|| {
-            (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({"error": "invalid authorization header format"})),
-            )
-        })?;
+        let token = auth_header
+            .strip_prefix("Bearer ")
+            .ok_or_else(|| ApiError::unauthorized("invalid authorization header format"))?;
 
         validate_token(state, token).await.map_err(|_| {
             // Detailed errors already logged inside validate_token.
             // Return generic message to prevent information leakage.
-            (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({"error": "invalid or expired token"})),
-            )
+            ApiError::unauthorized("invalid or expired token")
         })
     }
 }
@@ -367,7 +356,7 @@ impl FromRequestParts<AppState> for TokenData {
 pub struct AdminToken(pub TokenData);
 
 impl FromRequestParts<AppState> for AdminToken {
-    type Rejection = (StatusCode, Json<serde_json::Value>);
+    type Rejection = ApiError;
 
     async fn from_request_parts(
         parts: &mut Parts,
@@ -375,10 +364,7 @@ impl FromRequestParts<AppState> for AdminToken {
     ) -> Result<Self, Self::Rejection> {
         let token = TokenData::from_request_parts(parts, state).await?;
         if !token.has_role("admin") {
-            return Err((
-                StatusCode::FORBIDDEN,
-                Json(serde_json::json!({"error": "admin role required"})),
-            ));
+            return Err(ApiError::forbidden("admin role required"));
         }
         Ok(AdminToken(token))
     }
@@ -391,7 +377,7 @@ impl FromRequestParts<AppState> for AdminToken {
 pub struct UserToken(pub TokenData);
 
 impl FromRequestParts<AppState> for UserToken {
-    type Rejection = (StatusCode, Json<serde_json::Value>);
+    type Rejection = ApiError;
 
     async fn from_request_parts(
         parts: &mut Parts,
@@ -399,10 +385,7 @@ impl FromRequestParts<AppState> for UserToken {
     ) -> Result<Self, Self::Rejection> {
         let token = TokenData::from_request_parts(parts, state).await?;
         if !token.has_role("user") {
-            return Err((
-                StatusCode::FORBIDDEN,
-                Json(serde_json::json!({"error": "user role required"})),
-            ));
+            return Err(ApiError::forbidden("user role required"));
         }
         Ok(UserToken(token))
     }
@@ -417,7 +400,7 @@ impl FromRequestParts<AppState> for UserToken {
 pub struct AnalystToken(pub TokenData);
 
 impl FromRequestParts<AppState> for AnalystToken {
-    type Rejection = (StatusCode, Json<serde_json::Value>);
+    type Rejection = ApiError;
 
     async fn from_request_parts(
         parts: &mut Parts,
@@ -425,10 +408,7 @@ impl FromRequestParts<AppState> for AnalystToken {
     ) -> Result<Self, Self::Rejection> {
         let token = TokenData::from_request_parts(parts, state).await?;
         if !token.has_role("analyst") {
-            return Err((
-                StatusCode::FORBIDDEN,
-                Json(serde_json::json!({"error": "analyst role required"})),
-            ));
+            return Err(ApiError::forbidden("analyst role required"));
         }
         Ok(AnalystToken(token))
     }
@@ -441,7 +421,7 @@ impl FromRequestParts<AppState> for AnalystToken {
 pub struct ReadOnlyToken(pub TokenData);
 
 impl FromRequestParts<AppState> for ReadOnlyToken {
-    type Rejection = (StatusCode, Json<serde_json::Value>);
+    type Rejection = ApiError;
 
     async fn from_request_parts(
         parts: &mut Parts,
@@ -449,10 +429,7 @@ impl FromRequestParts<AppState> for ReadOnlyToken {
     ) -> Result<Self, Self::Rejection> {
         let token = TokenData::from_request_parts(parts, state).await?;
         if !token.has_role("read_only") {
-            return Err((
-                StatusCode::FORBIDDEN,
-                Json(serde_json::json!({"error": "read_only role required"})),
-            ));
+            return Err(ApiError::forbidden("read_only role required"));
         }
         Ok(ReadOnlyToken(token))
     }

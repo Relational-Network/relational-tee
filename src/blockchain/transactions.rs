@@ -43,7 +43,7 @@ impl SolanaClient {
         let start = std::time::Instant::now();
         loop {
             if start.elapsed() > timeout {
-                return Err(ApiError::service_unavailable(format!(
+                return Err(ApiError::rpc_unavailable(format!(
                     "transaction confirmation timed out ({timeout:?}) at {commitment}"
                 )));
             }
@@ -51,9 +51,7 @@ impl SolanaClient {
                 Ok(statuses) => {
                     if let Some(Some(status)) = statuses.first() {
                         if status.err.is_some() {
-                            return Err(ApiError::service_unavailable(
-                                "transaction failed on-chain",
-                            ));
+                            return Err(ApiError::rpc_unavailable("transaction failed on-chain"));
                         }
                         let confirmed = match status.confirmation_status.as_deref() {
                             Some("finalized") => true,
@@ -82,18 +80,20 @@ impl SolanaClient {
             .map_err(|_| ApiError::unprocessable(format!("invalid recipient: {recipient}")))?;
 
         let instruction = system_instruction::transfer(&keypair.pubkey(), &to, lamports);
-        let recent_blockhash =
-            self.rpc.get_latest_blockhash().await.map_err(|e| {
-                ApiError::service_unavailable(format!("blockhash fetch failed: {e}"))
-            })?;
+        let recent_blockhash = self
+            .rpc
+            .get_latest_blockhash()
+            .await
+            .map_err(|e| ApiError::rpc_unavailable(format!("blockhash fetch failed: {e}")))?;
 
         let message = Message::new(&[instruction], Some(&keypair.pubkey()));
         let tx = Transaction::new(&[keypair], message, recent_blockhash);
 
-        let signature: Signature =
-            self.rpc.send_transaction(&tx).await.map_err(|e| {
-                ApiError::service_unavailable(format!("transaction send failed: {e}"))
-            })?;
+        let signature: Signature = self
+            .rpc
+            .send_transaction(&tx)
+            .await
+            .map_err(|e| ApiError::rpc_unavailable(format!("transaction send failed: {e}")))?;
 
         self.await_confirmation(&signature, "confirmed").await?;
 
@@ -114,15 +114,16 @@ impl SolanaClient {
         lamports: u64,
     ) -> Result<u64, ApiError> {
         let instruction = system_instruction::transfer(from, to, lamports);
-        let recent_blockhash =
-            self.rpc.get_latest_blockhash().await.map_err(|e| {
-                ApiError::service_unavailable(format!("blockhash fetch failed: {e}"))
-            })?;
+        let recent_blockhash = self
+            .rpc
+            .get_latest_blockhash()
+            .await
+            .map_err(|e| ApiError::rpc_unavailable(format!("blockhash fetch failed: {e}")))?;
 
         let message = Message::new_with_blockhash(&[instruction], Some(from), &recent_blockhash);
         self.rpc
             .get_fee_for_message(&message)
             .await
-            .map_err(|e| ApiError::service_unavailable(format!("fee estimation failed: {e}")))
+            .map_err(|e| ApiError::rpc_unavailable(format!("fee estimation failed: {e}")))
     }
 }

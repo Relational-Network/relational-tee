@@ -177,7 +177,7 @@ pub async fn parse_events_from_signature_with_commitment(
         .get_transaction(signature_str, commitment)
         .await
         .map_err(|e| {
-            crate::error::ApiError::service_unavailable(format!("failed to fetch transaction: {e}"))
+            crate::error::ApiError::rpc_unavailable(format!("failed to fetch transaction: {e}"))
         })?;
 
     let logs = tx.meta.map(|m| m.log_messages).unwrap_or_default();

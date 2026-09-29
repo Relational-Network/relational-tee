@@ -50,7 +50,7 @@ impl SolanaClient {
             .rpc
             .get_balance(&pubkey)
             .await
-            .map_err(|e| ApiError::service_unavailable(format!("Solana RPC error: {e}")))?;
+            .map_err(|e| ApiError::rpc_unavailable(format!("Solana RPC error: {e}")))?;
         debug!(address, lamports, "Fetched SOL balance");
 
         let sol = lamports as f64 / 1_000_000_000.0;

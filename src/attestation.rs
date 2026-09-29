@@ -182,10 +182,10 @@ pub struct AttestationResponse {
 pub async fn get_attestation(
     State(state): State<AppState>,
 ) -> Result<Json<AttestationResponse>, ApiError> {
-    let token = state
-        .attestation
-        .token()
-        .ok_or_else(|| ApiError::service_unavailable("no attestation token yet; retry shortly"))?;
+    let token = state.attestation.token().ok_or_else(|| {
+        ApiError::service_unavailable("no attestation token yet; retry shortly")
+            .with_code("attestation_unavailable")
+    })?;
     Ok(Json(AttestationResponse {
         maa_token: token.token,
         transport_jwk: state.attestation.transport_jwk.clone(),

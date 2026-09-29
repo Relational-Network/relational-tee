@@ -86,7 +86,7 @@ pub struct AuditEvent {
     /// the tag is attached during write.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hmac: Option<String>,
-    /// Correlation ID linking related operations (e.g. redeem + issue).
+    /// The `X-Request-Id` of the request that caused the event.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub correlation_id: Option<String>,
     /// Pool PDA for pool-scoped events (previously buried in `details` JSON).
@@ -203,6 +203,9 @@ impl<'a> AuditLog<'a> {
     }
 
     async fn try_log(&self, mut event: AuditEvent) -> Result<(), StoreError> {
+        if event.correlation_id.is_none() {
+            event.correlation_id = crate::request_id::current();
+        }
         event.hmac = Some(self.s.keys().audit_tag(&event.canonical()));
         let signed = zeroize::Zeroizing::new(
             serde_json::to_vec(&event).map_err(|e| StoreError::Invalid(e.to_string()))?,

@@ -122,9 +122,10 @@ pub async fn create_wallet(
     {
         CreateOutcome::Created => {}
         CreateOutcome::OwnerHasWallet(existing) => {
-            return Err(ApiError::conflict(format!(
-                "user already has a wallet: {existing}"
-            )));
+            return Err(
+                ApiError::conflict(format!("user already has a wallet: {existing}"))
+                    .with_code("wallet_exists"),
+            );
         }
     }
 

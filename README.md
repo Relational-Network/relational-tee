@@ -100,6 +100,12 @@ Tables and containers are created at startup if they're missing. `STORAGE_BACKEN
 
 CI (`.github/workflows/ci.yml`) runs `just check` in the dev shell, `nix flake check`, and the x86_64 image build on every pull request and push to `main`. It fails if the `rsa` crate (RUSTSEC-2023-0071) or OpenSSL enters the dependency graph. Nothing is pushed or deployed yet.
 
+## API conventions
+
+- **Request IDs.** Every response carries `X-Request-Id`: the client's value if it's a valid UUID, otherwise a new one. The same ID is on the request's log lines and is the `correlation_id` of every audit event the request causes.
+- **Errors.** Every error, including unknown routes and malformed bodies, has one body shape: `{ "error": "<message>", "code": "<snake_case code>", "request_id": "<id>" }`. Clients branch on `code`; `error` is for people. Codes by status: `bad_request`, `unauthorized`, `forbidden`, `not_found`, `method_not_allowed`, `request_timeout`, `conflict`, `payload_too_large`, `unsupported_media_type`, `unprocessable_entity`, `rate_limited`, `internal_error`, `service_unavailable`. More specific codes: `invalid_cursor` and `validation_failed` (400), `wallet_exists` and `initialization_in_progress` (409), `integrity_error` (500), `storage_unavailable`, `rpc_unavailable` and `attestation_unavailable` (503).
+- **Pagination.** Lists take `cursor` and `limit` and return `next_cursor` when there's another page (see [Storage](#storage)).
+
 ## Endpoints
 
 - **Health:** `GET /health`, `/health/live`, `/health/ready`.
