@@ -36,6 +36,10 @@ dev *args: dev-keys
 dev-keys:
     cargo run --quiet --features dev -- dev-keys dev/keys
 
+# Run the fake SKR sidecar on 127.0.0.1:9000 (use KEY_PROVIDER=skr in the worker).
+skr: dev-keys
+    cargo run --features dev -- fake-skr
+
 # Create a locally trusted certificate for localhost with mkcert.
 cert:
     mkdir -p dev/certs

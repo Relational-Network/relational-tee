@@ -27,6 +27,10 @@ use zeroize::Zeroizing;
 #[cfg(feature = "dev")]
 pub mod dev_keys;
 #[cfg(feature = "dev")]
+pub mod dev_maa;
+#[cfg(feature = "dev")]
+pub mod fake_skr;
+#[cfg(feature = "dev")]
 pub mod local;
 pub mod skr;
 

@@ -240,11 +240,25 @@ async fn openapi_json() -> axum::Json<utoipa::openapi::OpenApi> {
 // ============================================================================
 
 /// Dev-only commands: `relational-tee dev-keys [DIR]` creates any missing dev
-/// key files. Returns the exit code when the arguments name a command.
+/// key files, and `relational-tee fake-skr` runs the fake SKR sidecar.
+/// Returns the exit code when the arguments name a command.
 #[cfg(feature = "dev")]
-fn run_dev_command(args: &[String]) -> Option<i32> {
+async fn run_dev_command(args: &[String]) -> Option<i32> {
     let command = args.get(1)?;
     match command.as_str() {
+        "fake-skr" => {
+            let result = match tee::fake_skr::FakeSkrConfig::from_env() {
+                Ok(config) => tee::fake_skr::serve(config).await,
+                Err(e) => Err(e),
+            };
+            Some(match result {
+                Ok(()) => 0,
+                Err(e) => {
+                    tracing::error!("{e}");
+                    1
+                }
+            })
+        }
         "dev-keys" => {
             let dir = std::path::PathBuf::from(
                 args.get(2)
@@ -268,7 +282,7 @@ fn run_dev_command(args: &[String]) -> Option<i32> {
             }
         }
         other => {
-            eprintln!("error: unknown command {other:?} (dev commands: dev-keys)");
+            eprintln!("error: unknown command {other:?} (dev commands: dev-keys, fake-skr)");
             Some(2)
         }
     }
@@ -293,11 +307,6 @@ fn key_provider(config: &KeyProviderConfig) -> Box<dyn KeyProvider> {
 /// Service entrypoint: read configuration, build the router, and serve.
 #[tokio::main]
 async fn main() {
-    #[cfg(feature = "dev")]
-    if let Some(code) = run_dev_command(&std::env::args().collect::<Vec<_>>()) {
-        std::process::exit(code);
-    }
-
     // Initialize tracing with environment filter (RUST_LOG).
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -305,6 +314,11 @@ async fn main() {
         )
         .with_target(true)
         .init();
+
+    #[cfg(feature = "dev")]
+    if let Some(code) = run_dev_command(&std::env::args().collect::<Vec<_>>()).await {
+        std::process::exit(code);
+    }
 
     // Capture process start for uptime reporting.
     let _ = STARTED_AT.set(Instant::now());

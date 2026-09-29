@@ -13,7 +13,8 @@ resolver = "3"
 
 [features]
 default = []
-dev = []
+# Dev builds: plain HTTP, dev keys, and the fake SKR sidecar and MAA signer.
+dev = ["dep:aws-lc-rs"]
 swagger-ui = ["dep:utoipa-swagger-ui"]
 
 [dependencies]
@@ -44,6 +45,9 @@ base64 = { version = "0.22.1", default-features = false }
 hkdf = { version = "0.12.4", default-features = false }
 aes-gcm = { version = "0.10.3", default-features = false, features = ["aes", "alloc"] }
 zeroize = { version = "1.8", default-features = false, features = ["alloc"] }
+# Dev builds only: the fake MAA signs RS256 tokens with aws-lc-rs, which rustls
+# and jsonwebtoken already use; the rsa crate stays banned.
+aws-lc-rs = { version = "1.18", default-features = false, features = ["aws-lc-sys", "ring-io"], optional = true }
 
 # ── HTTP client (hyper-direct, no reqwest) ────────────────────────
 # Hand-rolled minimal client in src/http_client.rs avoids the entire

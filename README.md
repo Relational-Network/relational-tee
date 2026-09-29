@@ -25,7 +25,8 @@ just            # list the recipes
 | Recipe | What it does |
 |---|---|
 | `just dev` | Run the dev build natively on `127.0.0.1:8443`, with Swagger UI at `/docs` (creates missing dev keys first) |
-| `just dev-keys` | Create any missing dev keys in `dev/keys/`, one private JWK per key; existing keys are kept |
+| `just dev-keys` | Create any missing dev keys in `dev/keys/`: one private JWK per key, and the dev MAA signing key; existing keys are kept |
+| `just skr` | Run the fake SKR sidecar on `127.0.0.1:9000`; start the worker with `KEY_PROVIDER=skr` to use it |
 | `just cert` | Create a locally trusted mkcert certificate in `dev/certs/`; `just dev` then serves HTTPS |
 | `just test` | Run the tests with cargo-nextest, in the release and dev configurations |
 | `just check` | Run every gate: rustfmt, clippy (`-D warnings`, with and without all features), the tests, the banned-crate check and `cargo audit` |
@@ -34,6 +35,17 @@ just            # list the recipes
 | `just image-dev` | Build the aarch64-linux dev image and load it into Docker |
 
 `just image` and `just image-dev` run Nix in a `nixos/nix` container with a cached `/nix` volume, so a Mac needs no separate Linux builder. On Apple Silicon the x86_64 image runs under emulation.
+
+### The fake SKR sidecar
+
+Dev builds include `relational-tee fake-skr`, a stand-in for Microsoft's SKR sidecar. It serves `POST /key/release` and `POST /attest/maa` with the sidecar's request and response shapes, answering from the dev keys, so the production client code path runs unchanged. It signs attestation tokens RS256 with the dev MAA key, with MAA's claim names and a fixed dev host data value, and serves that key's public half at `GET /certs` (with `Access-Control-Allow-Origin: *`), as MAA does: a dashboard can use `http://localhost:9000` as its attestation authority. A key without a dev key file gets 403, like a release policy mismatch.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `FAKE_SKR_ADDR` | `127.0.0.1:9000` | Listening address |
+| `FAKE_MAA_ISSUER` | `http://localhost:{port}` | The tokens' `iss`, and where `/certs` is served |
+| `FAKE_MAA_TOKEN_SECS` | `28800` (8 hours) | Token lifetime |
+| `DEV_KEYS_DIR` | `dev/keys` | Dev keys to release and sign with |
 
 Not there yet: a container stack with several replicas and local fakes for storage and key release, a fault-injection suite for the idempotency work, and a debug-mode sandbox on Azure.
 
