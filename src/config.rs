@@ -71,9 +71,20 @@ pub const DATA_DIR: &str = "/data";
 // Solana
 // ============================================================================
 
+// TODO: Solana's public devnet RPC is rate-limited and has no SLA. Switch to a
+// paid provider before production, keeping its API key out of the CCE policy,
+// which is public.
 /// Solana RPC endpoint. Hardcoded to devnet.
 /// To switch to mainnet, change this constant and rebuild.
 pub const SOLANA_RPC_URL: &str = "https://api.devnet.solana.com";
+
+/// Solana's public RPC endpoints. They are rate-limited and have no SLA, so the
+/// server warns at startup when `SOLANA_RPC_URL` is one of them.
+pub const PUBLIC_SOLANA_RPC_URLS: &[&str] = &[
+    "https://api.devnet.solana.com",
+    "https://api.testnet.solana.com",
+    "https://api.mainnet-beta.solana.com",
+];
 
 /// Solana network name. Hardcoded to devnet.
 pub const SOLANA_NETWORK: &str = "devnet";

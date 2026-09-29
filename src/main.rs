@@ -374,6 +374,12 @@ async fn main() {
     // Initialize Solana client.
     let network_config = blockchain::types::network_config_from_env();
     info!(network = %network_config.name, rpc = %network_config.rpc_url, "Solana client initialized");
+    if config::PUBLIC_SOLANA_RPC_URLS.contains(&network_config.rpc_url.as_str()) {
+        warn!(
+            rpc = %network_config.rpc_url,
+            "Using a public Solana RPC endpoint: rate-limited with no SLA; switch to a paid provider before production"
+        );
+    }
     let solana_client =
         blockchain::SolanaClient::new(&network_config.rpc_url.clone(), network_config);
 
