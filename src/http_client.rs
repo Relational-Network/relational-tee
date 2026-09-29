@@ -201,11 +201,6 @@ impl Response {
             .map_err(|e| HttpError::new(format!("response not valid UTF-8: {e}")))
     }
 
-    /// Consume the response, returning the body as raw bytes.
-    pub fn into_bytes(self) -> Vec<u8> {
-        self.body.to_vec()
-    }
-
     /// Consume the response, parsing the body as JSON.
     pub fn into_json<T: DeserializeOwned>(self) -> Result<T, HttpError> {
         serde_json::from_slice(&self.body)

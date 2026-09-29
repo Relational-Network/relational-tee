@@ -6,7 +6,6 @@
 //! - `POST /v1/drt/pools/malta`        — atomic create (CSV-driven pool + schema)
 //! - `POST /v1/drt/pools/iob-erp`      — atomic create (ERP pool, no schema)
 //! - `GET  /v1/drt/pools/{pool_pda}`   — pool info (chain + enclave metadata)
-//! - `GET  /v1/drt/events/{signature}` — parsed tx events
 
 use axum::{
     extract::{Path, State},
@@ -22,7 +21,7 @@ use tracing::{info, warn};
 use crate::auth::AdminToken;
 use crate::blockchain::drt::{
     accounts::{fetch_drt_config, fetch_pool},
-    events::{parse_events_from_signature, parse_events_from_signature_with_commitment, DrtEvent},
+    events::{parse_events_from_signature_with_commitment, DrtEvent},
     instructions::{
         build_compute_budget_ix, build_create_pool, build_register_drt, build_seal_pool,
     },
@@ -672,39 +671,5 @@ pub async fn get_drt(
         supply: cfg.supply,
         code_repo_url: cfg.code_repo_url,
         code_hash: hex::encode(cfg.code_hash),
-    }))
-}
-
-// ============================================================================
-// GET /v1/drt/events/{signature}
-// ============================================================================
-
-/// Parse DRT events from a transaction signature.
-#[utoipa::path(
-    get,
-    path = "/v1/drt/events/{signature}",
-    tag = "DRT Pools",
-    summary = "Get DRT events from transaction",
-    description = "Fetch a confirmed transaction and parse any DRT contract events from its logs.",
-    security(("bearer_auth" = [])),
-    params(
-        ("signature" = String, Path, description = "Transaction signature (base58)"),
-    ),
-    responses(
-        (status = 200, description = "Parsed events", body = TxEventsResponse),
-        (status = 401, description = "Unauthorized"),
-        (status = 404, description = "Transaction not found"),
-        (status = 503, description = "RPC unavailable"),
-    )
-)]
-pub async fn get_tx_events(
-    crate::auth::AnalystToken(_token): crate::auth::AnalystToken,
-    State(state): State<AppState>,
-    Path(signature): Path<String>,
-) -> Result<Json<TxEventsResponse>, ApiError> {
-    let events = parse_events_from_signature(state.solana_client.rpc(), &signature).await?;
-    Ok(Json(TxEventsResponse {
-        signature,
-        events: events.iter().map(|e| e.to_response()).collect(),
     }))
 }

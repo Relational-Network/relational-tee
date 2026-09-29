@@ -36,9 +36,9 @@ pub const APPEND_DRT_NAME: &str = "append";
 // ── Discriminators re-exported from idl_generated ───────────────
 
 pub use super::idl_generated::{
-    DISC_CREATE_POOL, DISC_DRT_CONFIG_ACCOUNT, DISC_DRT_REGISTERED, DISC_GRANT_ACCOUNT,
-    DISC_GRANT_RIGHT, DISC_POOL_ACCOUNT, DISC_POOL_CREATED, DISC_POOL_SEALED, DISC_REGISTER_DRT,
-    DISC_REVOKE_GRANT, DISC_RIGHT_GRANTED, DISC_RIGHT_REVOKED, DISC_SEAL_POOL,
+    DISC_CREATE_POOL, DISC_DRT_CONFIG_ACCOUNT, DISC_DRT_REGISTERED, DISC_GRANT_RIGHT,
+    DISC_POOL_ACCOUNT, DISC_POOL_CREATED, DISC_POOL_SEALED, DISC_REGISTER_DRT, DISC_RIGHT_GRANTED,
+    DISC_RIGHT_REVOKED, DISC_SEAL_POOL,
 };
 
 // ── Limits ──────────────────────────────────────────────────────
@@ -73,14 +73,6 @@ pub struct DrtConfig {
     pub code_hash: [u8; 32],
     pub code_repo_url: String,
     pub created_at: i64,
-    pub bump: u8,
-}
-
-/// On-chain `Grant` account.
-#[derive(Debug, Clone, BorshDeserialize, BorshSerialize)]
-pub struct Grant {
-    pub drt_config: Pubkey,
-    pub granted_at: i64,
     pub bump: u8,
 }
 
@@ -168,36 +160,6 @@ pub struct CreatePoolResponse {
     pub explorer_url: String,
 }
 
-/// Admin grant-right request — burns 1 admin-held DRT and writes a Grant PDA
-/// keyed by `sha256(analyst_id ‖ pool_uuid ‖ right_id)`.
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct GrantRightRequest {
-    pub wallet_id: String,
-    /// DRT name to grant (must exist in the pool).
-    pub drt_name: String,
-    /// Analyst identifier (e.g. Clerk `sub`). Never persisted on-chain.
-    pub analyst_id: String,
-}
-
-/// Admin revoke-grant request — closes the Grant PDA matching the commitment.
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct RevokeGrantRequest {
-    pub wallet_id: String,
-    pub drt_name: String,
-    pub analyst_id: String,
-}
-
-/// Single-signature grant/revoke response.
-#[derive(Debug, Serialize, ToSchema)]
-pub struct GrantResponse {
-    pub signature: String,
-    pub explorer_url: String,
-    /// The commitment hash recorded on-chain (hex).
-    pub commitment_hex: String,
-    /// The Grant PDA address (base58).
-    pub grant_pda: String,
-}
-
 /// API view of a DrtConfig.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct DrtConfigResponse {
@@ -222,15 +184,8 @@ pub struct PoolInfoResponse {
 }
 
 // ============================================================================
-// Event API response types
+// Event response types (embedded in audit details)
 // ============================================================================
-
-/// Wrapper for event list from a transaction.
-#[derive(Debug, Serialize, ToSchema)]
-pub struct TxEventsResponse {
-    pub signature: String,
-    pub events: Vec<DrtEventResponse>,
-}
 
 /// Single event in API format.
 #[derive(Debug, Serialize, ToSchema)]

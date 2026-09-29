@@ -30,7 +30,6 @@
 
 pub mod audit;
 pub mod encrypted_fs;
-pub mod grants;
 pub mod ownership;
 pub mod paths;
 pub mod pool_metadata;

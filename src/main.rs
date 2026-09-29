@@ -21,7 +21,6 @@ mod blockchain;
 mod config;
 mod crypto;
 mod data_validation;
-mod drt;
 mod error;
 mod handlers;
 mod health;
@@ -33,7 +32,7 @@ mod storage;
 use axum::{
     extract::DefaultBodyLimit,
     http::{header, HeaderValue},
-    routing::{get, post},
+    routing::get,
     Json, Router,
 };
 use std::sync::Arc;
@@ -49,10 +48,7 @@ use utoipa_swagger_ui::SwaggerUi;
 use config::{avs_jwks_url, ServerConfig, Transport, AVS_AUDIENCE, MAX_BODY_SIZE};
 
 use crypto::enclave_key;
-use handlers::{
-    admin_status, data_query, get_public_key, AdminStatusResponse, DataQueryRequest,
-    DataQueryResponse,
-};
+use handlers::{admin_status, get_public_key, AdminStatusResponse};
 use health::{health, liveness, readiness, HealthChecks, HealthResponse, ReadyResponse};
 use state::AppState;
 
@@ -94,7 +90,6 @@ Protected endpoints require a JWT issued by the Attestation Verification Service
         health::readiness,
         handlers::get_public_key,
         handlers::admin_status,
-        handlers::data_query,
         // Wallet API
         api::users::get_me,
         api::wallets::create_wallet,
@@ -115,13 +110,7 @@ Protected endpoints require a JWT issued by the Attestation Verification Service
         api::pools::create_malta_pool,
         api::pools::create_iob_erp_pool,
         api::pools::get_pool,
-        api::pools::get_tx_events,
         api::pools::get_drt,
-        api::admin::grant_right,
-        api::admin::revoke_grant,
-        api::admin::get_grant_status,
-        api::admin::list_pool_grants,
-        api::admin::list_my_grants,
         // Credential / Pool discovery API
         api::credentials::upload_schema,
         api::credentials::get_schema,
@@ -140,8 +129,6 @@ Protected endpoints require a JWT issued by the Attestation Verification Service
         ReadyResponse,
         HealthChecks,
         AdminStatusResponse,
-        DataQueryRequest,
-        DataQueryResponse,
         data_validation::ValidationError,
         data_validation::ValidationMode,
         crypto::Jwk,
@@ -181,18 +168,6 @@ Protected endpoints require a JWT issued by the Attestation Verification Service
         blockchain::drt::types::CreatePoolResponse,
         blockchain::drt::types::DrtConfigResponse,
         blockchain::drt::types::PoolInfoResponse,
-        blockchain::drt::types::GrantRightRequest,
-        blockchain::drt::types::RevokeGrantRequest,
-        blockchain::drt::types::GrantResponse,
-        api::admin::GrantStatusResponse,
-        api::admin::PoolGrantsResponse,
-        api::admin::MyGrantEntry,
-        api::admin::MyGrantsPool,
-        api::admin::MyGrantsResponse,
-        storage::grants::GrantRecord,
-        storage::grants::GrantStatus,
-        blockchain::drt::types::TxEventsResponse,
-        blockchain::drt::types::DrtEventResponse,
         // Credential schemas
         api::credentials::UploadSchemaRequest,
         api::credentials::UploadSchemaResponse,
@@ -225,7 +200,6 @@ Protected endpoints require a JWT issued by the Attestation Verification Service
         (name = "Attestation", description = "Enclave attestation and public key"),
         (name = "Protected", description = "JWT-protected endpoints"),
         (name = "Admin", description = "Admin-only endpoints"),
-        (name = "Data", description = "Data upload and query endpoints"),
         (name = "Users", description = "User identity endpoints"),
         (name = "Wallets", description = "Wallet CRUD endpoints"),
         (name = "Balance", description = "Balance query endpoints"),
@@ -427,7 +401,6 @@ async fn main() {
         // v1 API endpoints.
         .route("/v1/attestation/public-key", get(get_public_key))
         .route("/v1/admin/status", get(admin_status))
-        .route("/v1/data/query", post(data_query))
         .route("/api-doc/openapi.json", get(openapi_json))
         // Wallet service routes.
         .merge(api::wallet_router())

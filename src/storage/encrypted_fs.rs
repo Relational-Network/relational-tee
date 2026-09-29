@@ -135,18 +135,6 @@ impl EncryptedStorage {
 
     // ── Raw I/O ───────────────────────────────────────────────────
 
-    /// Read raw bytes from a file.
-    pub fn read_raw(&self, path: impl AsRef<Path>) -> StorageResult<Vec<u8>> {
-        let path = path.as_ref();
-        fs::read(path).map_err(|e| {
-            if e.kind() == io::ErrorKind::NotFound {
-                StorageError::NotFound(path.display().to_string())
-            } else {
-                StorageError::Io(e)
-            }
-        })
-    }
-
     /// Write raw bytes atomically.
     pub fn write_raw(&self, path: impl AsRef<Path>, data: &[u8]) -> StorageResult<()> {
         self.atomic_write(path.as_ref(), data)

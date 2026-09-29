@@ -167,14 +167,6 @@ pub fn parse_drt_events(logs: &[String]) -> Vec<DrtEvent> {
     events
 }
 
-/// Fetch and parse DRT events from a confirmed transaction signature.
-pub async fn parse_events_from_signature(
-    rpc: &crate::blockchain::rpc::JsonRpcClient,
-    signature_str: &str,
-) -> Result<Vec<DrtEvent>, crate::error::ApiError> {
-    parse_events_from_signature_with_commitment(rpc, signature_str, "confirmed").await
-}
-
 /// Fetch and parse DRT events at a specific commitment level.
 pub async fn parse_events_from_signature_with_commitment(
     rpc: &crate::blockchain::rpc::JsonRpcClient,

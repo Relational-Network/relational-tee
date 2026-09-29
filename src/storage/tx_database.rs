@@ -12,7 +12,6 @@
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use std::path::Path;
 
-use super::grants::{GrantRecord, GrantStatus};
 use super::repository::transactions::{StoredTransaction, TxStatus};
 
 // ── Table definitions ──────────────────────────────────────────────
@@ -46,13 +45,6 @@ const AUDIT_EVENTS: TableDefinition<&str, &[u8]> = TableDefinition::new("audit_e
 const AUDIT_BY_RESOURCE: TableDefinition<&str, &str> = TableDefinition::new("audit_by_resource");
 /// Audit-by-date index: `{YYYY-MM-DD}|{event_id}` → `""`.
 const AUDIT_BY_DATE: TableDefinition<&str, &str> = TableDefinition::new("audit_by_date");
-
-// ── Phase 5: DRT grant mirror ──────────────────────────────────────
-/// Per-pool grant store: `{pool_pda}|{analyst_id}|{drt_name}` → GrantRecord JSON.
-const GRANTS_BY_POOL: TableDefinition<&str, &[u8]> = TableDefinition::new("grants_by_pool");
-/// Per-analyst index: `{analyst_id}|{pool_pda}|{drt_name}` → `""`.
-/// Revoked grants are removed from this index so analysts see only active access.
-const GRANTS_BY_ANALYST: TableDefinition<&str, &str> = TableDefinition::new("grants_by_analyst");
 
 /// Result alias for tx database operations.
 pub type TxDbResult<T> = Result<T, TxDbError>;
@@ -171,9 +163,6 @@ impl TxDatabase {
             let _ = write_txn.open_table(AUDIT_EVENTS)?;
             let _ = write_txn.open_table(AUDIT_BY_RESOURCE)?;
             let _ = write_txn.open_table(AUDIT_BY_DATE)?;
-            // Phase 5
-            let _ = write_txn.open_table(GRANTS_BY_POOL)?;
-            let _ = write_txn.open_table(GRANTS_BY_ANALYST)?;
         }
         write_txn.commit()?;
 
@@ -859,129 +848,6 @@ impl TxDatabase {
         write_txn.commit()?;
         Ok(removed)
     }
-
-    // ── Phase 5: DRT grants ─────────────────────────────────────────
-
-    /// Insert or update a grant record (idempotent re-grant of a previously
-    /// revoked DRT flips `status` back to active).
-    pub fn upsert_grant(&self, record: &GrantRecord) -> TxDbResult<()> {
-        let pool_key = format!(
-            "{}|{}|{}",
-            record.pool_pda, record.analyst_id, record.drt_name
-        );
-        let analyst_key = format!(
-            "{}|{}|{}",
-            record.analyst_id, record.pool_pda, record.drt_name
-        );
-        let bytes = serde_json::to_vec(record)?;
-        let write_txn = self.db.begin_write()?;
-        {
-            let mut by_pool = write_txn.open_table(GRANTS_BY_POOL)?;
-            by_pool.insert(pool_key.as_str(), bytes.as_slice())?;
-            let mut by_analyst = write_txn.open_table(GRANTS_BY_ANALYST)?;
-            // Only index active grants for the analyst-facing view.
-            if matches!(record.status, GrantStatus::Active) {
-                by_analyst.insert(analyst_key.as_str(), "")?;
-            } else {
-                by_analyst.remove(analyst_key.as_str())?;
-            }
-        }
-        write_txn.commit()?;
-        Ok(())
-    }
-
-    /// Mark a grant as revoked. Returns `false` if no matching record exists.
-    pub fn revoke_grant_local(
-        &self,
-        pool_pda: &str,
-        analyst_id: &str,
-        drt_name: &str,
-        revoked_sig: &str,
-    ) -> TxDbResult<bool> {
-        let pool_key = format!("{pool_pda}|{analyst_id}|{drt_name}");
-        let analyst_key = format!("{analyst_id}|{pool_pda}|{drt_name}");
-        let write_txn = self.db.begin_write()?;
-        let updated;
-        {
-            let mut by_pool = write_txn.open_table(GRANTS_BY_POOL)?;
-            let existing_bytes = by_pool.get(pool_key.as_str())?.map(|v| v.value().to_vec());
-            updated = if let Some(bytes) = existing_bytes {
-                let mut rec: GrantRecord = serde_json::from_slice(&bytes)?;
-                rec.status = GrantStatus::Revoked;
-                rec.revoked_at = Some(chrono::Utc::now().timestamp());
-                rec.revoked_sig = Some(revoked_sig.to_string());
-                let new_bytes = serde_json::to_vec(&rec)?;
-                by_pool.insert(pool_key.as_str(), new_bytes.as_slice())?;
-                true
-            } else {
-                false
-            };
-            let mut by_analyst = write_txn.open_table(GRANTS_BY_ANALYST)?;
-            by_analyst.remove(analyst_key.as_str())?;
-        }
-        write_txn.commit()?;
-        Ok(updated)
-    }
-
-    /// List all grants for a pool (active + revoked).
-    pub fn list_pool_grants(&self, pool_pda: &str) -> TxDbResult<Vec<GrantRecord>> {
-        let read_txn = self.db.begin_read()?;
-        let table = read_txn.open_table(GRANTS_BY_POOL)?;
-        let prefix_start = format!("{pool_pda}|");
-        let prefix_end = format!("{pool_pda}|\u{10FFFF}");
-        let mut out = Vec::new();
-        let range = table.range(prefix_start.as_str()..prefix_end.as_str())?;
-        for entry in range {
-            let entry = entry?;
-            let rec: GrantRecord = serde_json::from_slice(entry.1.value())?;
-            out.push(rec);
-        }
-        Ok(out)
-    }
-
-    /// List active grants for an analyst across all pools. Returns the
-    /// `GrantRecord` for each, looked up from the per-pool store.
-    pub fn list_grants_by_analyst(&self, analyst_id: &str) -> TxDbResult<Vec<GrantRecord>> {
-        let read_txn = self.db.begin_read()?;
-        let idx = read_txn.open_table(GRANTS_BY_ANALYST)?;
-        let by_pool = read_txn.open_table(GRANTS_BY_POOL)?;
-        let prefix_start = format!("{analyst_id}|");
-        let prefix_end = format!("{analyst_id}|\u{10FFFF}");
-        let mut out = Vec::new();
-        let range = idx.range(prefix_start.as_str()..prefix_end.as_str())?;
-        for entry in range {
-            let entry = entry?;
-            let key = entry.0.value();
-            // key = "{analyst_id}|{pool_pda}|{drt_name}" → flip to pool-key form
-            let mut parts = key.splitn(3, '|');
-            let (_a, pool, drt) = match (parts.next(), parts.next(), parts.next()) {
-                (Some(a), Some(p), Some(d)) => (a, p, d),
-                _ => continue,
-            };
-            let pool_key = format!("{pool}|{analyst_id}|{drt}");
-            if let Some(v) = by_pool.get(pool_key.as_str())? {
-                let rec: GrantRecord = serde_json::from_slice(v.value())?;
-                if matches!(rec.status, GrantStatus::Active) {
-                    out.push(rec);
-                }
-            }
-        }
-        Ok(out)
-    }
-
-    /// Returns `true` iff `analyst_id` currently has an **active** grant for
-    /// the given DRT on the given pool.
-    pub fn is_grant_active(
-        &self,
-        analyst_id: &str,
-        pool_pda: &str,
-        drt_name: &str,
-    ) -> TxDbResult<bool> {
-        let read_txn = self.db.begin_read()?;
-        let idx = read_txn.open_table(GRANTS_BY_ANALYST)?;
-        let key = format!("{analyst_id}|{pool_pda}|{drt_name}");
-        Ok(idx.get(key.as_str())?.is_some())
-    }
 }
 
 // ── Index key helpers ──────────────────────────────────────────────
@@ -1079,9 +945,8 @@ mod tests {
 
     /// Confirms the nonce-replay contract: the same nonce can only be
     /// inserted once. HTTP handlers wire this to a 409 on replay.
-    /// Today only `/v1/data/query`-adjacent flows can adopt this; the
-    /// `initialize_pool` / `issue_credentials` endpoints still need
-    /// per-request `record_nonce` wiring (security-hardening.md N6).
+    /// The `initialize_pool` / `issue_credentials` endpoints still need
+    /// per-request `record_nonce` wiring.
     #[test]
     fn record_nonce_rejects_replay() {
         let (db, path) = fresh_db();

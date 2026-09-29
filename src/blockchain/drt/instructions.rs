@@ -180,40 +180,6 @@ pub fn build_grant_right(
 }
 
 // ============================================================================
-// revoke_grant
-// ============================================================================
-
-/// Build the `revoke_grant` instruction.
-///
-/// Accounts (in IDL order): owner (writable, signer), pool, drt_config, grant
-/// (writable).
-pub fn build_revoke_grant(
-    owner: &Pubkey,
-    pool_pda: &Pubkey,
-    drt_config_pda: &Pubkey,
-    commitment: &[u8; 32],
-) -> Instruction {
-    let (grant_pda, _) = derive_grant_pda(commitment);
-
-    let mut data = Vec::with_capacity(8 + 32);
-    data.extend_from_slice(&DISC_REVOKE_GRANT);
-    data.extend_from_slice(commitment);
-
-    let accounts = vec![
-        AccountMeta::new(*owner, true),
-        AccountMeta::new_readonly(*pool_pda, false),
-        AccountMeta::new_readonly(*drt_config_pda, false),
-        AccountMeta::new(grant_pda, false),
-    ];
-
-    Instruction {
-        program_id: drt_program_id(),
-        accounts,
-        data,
-    }
-}
-
-// ============================================================================
 // seal_pool
 // ============================================================================
 

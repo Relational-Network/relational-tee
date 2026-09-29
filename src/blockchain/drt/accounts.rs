@@ -6,16 +6,13 @@
 use borsh::BorshDeserialize;
 use solana_pubkey::Pubkey;
 
-use super::types::{
-    DrtConfig, Grant, Pool, DISC_DRT_CONFIG_ACCOUNT, DISC_GRANT_ACCOUNT, DISC_POOL_ACCOUNT,
-};
+use super::types::{DrtConfig, Pool, DISC_DRT_CONFIG_ACCOUNT, DISC_POOL_ACCOUNT};
 use crate::blockchain::rpc::JsonRpcClient;
 use crate::error::ApiError;
 
 /// Account size caps to prevent unbounded Borsh allocations from untrusted RPC.
 const MAX_POOL_DATA: usize = 1024;
 const MAX_DRT_CONFIG_DATA: usize = 4 * 1024;
-const MAX_GRANT_DATA: usize = 256;
 
 fn strip_discriminator<'a>(
     data: &'a [u8],
@@ -70,16 +67,4 @@ pub async fn fetch_drt_config(
     )?;
     DrtConfig::try_from_slice(payload)
         .map_err(|e| ApiError::internal(format!("failed to deserialise drt_config: {e}")))
-}
-
-/// Fetch and deserialise a Grant account.
-pub async fn fetch_grant(rpc: &JsonRpcClient, grant_pda: &Pubkey) -> Result<Grant, ApiError> {
-    let data = rpc
-        .get_account_data(grant_pda)
-        .await
-        .map_err(|e| ApiError::not_found(format!("grant {grant_pda} not found: {e}")))?
-        .ok_or_else(|| ApiError::not_found(format!("grant {grant_pda} not found")))?;
-    let payload = strip_discriminator(&data, &DISC_GRANT_ACCOUNT, MAX_GRANT_DATA, "grant")?;
-    Grant::try_from_slice(payload)
-        .map_err(|e| ApiError::internal(format!("failed to deserialise grant: {e}")))
 }

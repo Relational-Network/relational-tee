@@ -88,20 +88,3 @@ redb = { version = "3.1", default-features = false }
 # ── In-process cache ──────────────────────────────────────────────
 lru = { version = "0.16", default-features = false }
 dashmap = { version = "6", default-features = false }
-
-# ── WASM runtime for DRT script execution ─────────────────────────
-# Cranelift JIT through wasmtime. Two reasons over wasmi:
-#   1. Cranelift produces near-native code (~30–60× faster than wasmi's
-#      interpreter on CSV-bound DRT scripts).
-#   2. `precompile_module` lets us cache `.cwasm` artifacts on the
-#      Gramine encrypted FS so warm-path instantiation is ~free.
-#
-# Gramine ≥ 1.7 supports the W^X transitions Cranelift needs via
-# `sgx.allow_jit = true` in the manifest. If a deployment must run
-# without that flag (e.g. older Gramine), swap `Strategy::Cranelift`
-# for `Strategy::Pulley` in `src/drt/runtime.rs`.
-wasmtime = { version = "43.0.2", default-features = false, features = [
-    "runtime",
-    "cranelift",
-    "parallel-compilation",
-] }

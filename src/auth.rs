@@ -411,7 +411,7 @@ impl FromRequestParts<AppState> for UserToken {
 ///
 /// Returns 403 Forbidden if the user has only read_only role.
 ///
-/// Used by `/v1/data/query` and the pool-detail / summary / audit read paths.
+/// Used by the pool-detail / summary / audit read paths.
 #[derive(Debug, Clone)]
 pub struct AnalystToken(pub TokenData);
 
