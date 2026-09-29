@@ -22,9 +22,9 @@ use crate::blockchain::signing::generate_solana_keypair;
 use crate::error::ApiError;
 use crate::state::AppState;
 use crate::storage::audit::AuditEventType;
-use crate::storage::repository::wallets::{
-    WalletMetadata, WalletRepository, WalletResponse, WalletStatus,
-};
+use crate::storage::wallets::{CreateOutcome, WalletMetadata, WalletResponse, WalletStatus};
+
+use super::{enforce_owner, load_wallet};
 
 // ============================================================================
 // Request / Response types
@@ -46,7 +46,7 @@ pub struct CreateWalletResponse {
     pub explorer_url: String,
 }
 
-/// Paginated list of wallets.
+/// The caller's wallets (at most one).
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ListWalletsResponse {
     pub wallets: Vec<WalletResponse>,
@@ -76,13 +76,14 @@ pub struct DeleteWalletResponse {
     path = "/v1/wallets",
     tag = "Wallets",
     summary = "Create wallet",
-    description = "Generate a new Solana keypair inside the worker, store it, and return its public address.",
+    description = "Generate a new Solana keypair inside the worker, store it encrypted, and return its public address. A user has at most one wallet.",
     security(("bearer_auth" = [])),
     request_body = CreateWalletRequest,
     responses(
         (status = 201, description = "Wallet created", body = CreateWalletResponse),
         (status = 400, description = "Invalid request"),
         (status = 401, description = "Unauthorized"),
+        (status = 409, description = "The user already has a wallet"),
         (status = 503, description = "Storage unavailable"),
     )
 )]
@@ -100,6 +101,7 @@ pub async fn create_wallet(
 
     // Generate Ed25519 keypair.
     let (keypair_bytes, public_address) = generate_solana_keypair()?;
+    let keypair_bytes = zeroize::Zeroizing::new(keypair_bytes);
     let wallet_id = uuid::Uuid::new_v4().to_string();
 
     let metadata = WalletMetadata {
@@ -109,27 +111,20 @@ pub async fn create_wallet(
         created_at: chrono::Utc::now(),
         status: WalletStatus::Active,
         label: payload.label,
+        version: 0,
     };
 
-    // Persist wallet to encrypted storage.
-    let repo = WalletRepository::new(&state.storage);
-    repo.create(&metadata, &keypair_bytes)?;
-
-    // Register address→wallet mapping for the tx indexer.
-    if let Err(e) = state.tx_db.register_address(&public_address, &wallet_id) {
-        tracing::warn!(error = %e, "Failed to register address in tx database");
-    }
-
-    // Register owner→wallet mapping (enforces 1-wallet-per-user).
-    match state.tx_db.register_wallet_owner(&token.sub, &wallet_id) {
-        Ok(()) => {}
-        Err(crate::storage::tx_database::TxDbError::DuplicateWallet(existing)) => {
-            return Err(ApiError::bad_request(format!(
+    match state
+        .storage
+        .wallets()
+        .create(&metadata, &keypair_bytes)
+        .await?
+    {
+        CreateOutcome::Created => {}
+        CreateOutcome::OwnerHasWallet(existing) => {
+            return Err(ApiError::conflict(format!(
                 "user already has a wallet: {existing}"
             )));
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "Failed to register wallet owner in tx database");
         }
     }
 
@@ -141,8 +136,7 @@ pub async fn create_wallet(
     );
 
     audit_log!(
-        &state.storage,
-        &state.tx_db,
+        state,
         AuditEventType::WalletCreated,
         &token.sub,
         "wallet",
@@ -179,24 +173,21 @@ pub async fn list_wallets(
     UserToken(token): UserToken,
     State(state): State<AppState>,
 ) -> Result<Json<ListWalletsResponse>, ApiError> {
-    let repo = WalletRepository::new(&state.storage);
-
-    // O(1) lookup via redb index instead of O(W) filesystem scan.
-    let wallets = match state.tx_db.get_wallet_id_by_owner(&token.sub)? {
-        Some(wallet_id) => match repo.get(&wallet_id) {
-            Ok(meta) if meta.status != WalletStatus::Deleted => vec![meta],
-            _ => Vec::new(),
-        },
-        None => Vec::new(),
+    let wallets = state.storage.wallets();
+    let mine = match wallets.wallet_id_for_owner(&token.sub).await? {
+        Some(wallet_id) => wallets
+            .get(&wallet_id)
+            .await?
+            .filter(|w| w.status != WalletStatus::Deleted && w.owner_user_id == token.sub),
+        None => None,
     };
 
-    let total = wallets.len();
     let wallet_responses: Vec<WalletResponse> =
-        wallets.into_iter().map(WalletResponse::from).collect();
+        mine.into_iter().map(WalletResponse::from).collect();
 
     Ok(Json(ListWalletsResponse {
+        total: wallet_responses.len(),
         wallets: wallet_responses,
-        total,
     }))
 }
 
@@ -223,8 +214,8 @@ pub async fn get_wallet(
     State(state): State<AppState>,
     Path(wallet_id): Path<String>,
 ) -> Result<Json<GetWalletResponse>, ApiError> {
-    let repo = WalletRepository::new(&state.storage);
-    let metadata = repo.get_owned(&wallet_id, &token.sub)?;
+    let metadata = load_wallet(&state, &wallet_id).await?;
+    enforce_owner(&metadata, &token.sub)?;
 
     if metadata.status == WalletStatus::Deleted {
         return Err(ApiError::not_found(format!("wallet {wallet_id} not found")));
@@ -258,15 +249,10 @@ pub async fn delete_wallet(
     State(state): State<AppState>,
     Path(wallet_id): Path<String>,
 ) -> Result<Json<DeleteWalletResponse>, ApiError> {
-    let repo = WalletRepository::new(&state.storage);
-    repo.get_owned(&wallet_id, &token.sub)?;
+    let wallet = load_wallet(&state, &wallet_id).await?;
+    enforce_owner(&wallet, &token.sub)?;
 
-    repo.soft_delete(&wallet_id)?;
-
-    // Remove owner → wallet mapping so user can create a new wallet.
-    if let Err(e) = state.tx_db.remove_wallet_owner(&token.sub) {
-        tracing::warn!(error = %e, "Failed to remove wallet owner from tx database");
-    }
+    state.storage.wallets().soft_delete(&wallet).await?;
 
     info!(
         wallet_id = %wallet_id,
@@ -275,8 +261,7 @@ pub async fn delete_wallet(
     );
 
     audit_log!(
-        &state.storage,
-        &state.tx_db,
+        state,
         AuditEventType::WalletDeleted,
         &token.sub,
         "wallet",

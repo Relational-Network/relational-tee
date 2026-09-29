@@ -1,25 +1,20 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Relational Network
 
-//! JWK types, sealed-upload decryption, and the per-process cursor key.
+//! JWK types and sealed-upload decryption.
 
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use base64::Engine;
 use hkdf::Hkdf;
 use p256::ecdh::diffie_hellman;
-use p256::elliptic_curve::rand_core::OsRng;
 use p256::elliptic_curve::sec1::ToEncodedPoint;
-use p256::{PublicKey, SecretKey};
+use p256::PublicKey;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::sync::OnceLock;
 use utoipa::ToSchema;
 
 use crate::tee::ReleasedKey;
-
-/// Per-process keypair, created on first use.
-static ENCLAVE_KEY: OnceLock<EnclaveKey> = OnceLock::new();
 
 /// JWK describing an EC public key (used for encryption or signing).
 #[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
@@ -47,35 +42,6 @@ pub struct Jwk {
 #[derive(Clone, Deserialize)]
 pub struct JwksResponse {
     pub keys: Vec<Jwk>,
-}
-
-/// In-memory keypair that lives as long as the process. It only signs
-/// pagination cursors, so a cursor is valid only on the worker that issued it.
-pub struct EnclaveKey {
-    private_key: SecretKey,
-}
-
-impl EnclaveKey {
-    /// Derive a purpose-bound HMAC key from the enclave's **private** scalar.
-    ///
-    /// Uses HKDF-SHA256 with a domain separator so the raw secret never
-    /// leaks beyond this derivation.  The result is suitable for audit
-    /// integrity tags, pagination cursor signing, etc.
-    pub fn hmac_key(&self, domain: &[u8]) -> [u8; 32] {
-        let scalar_bytes = self.private_key.to_bytes();
-        let hk = Hkdf::<Sha256>::new(Some(domain), scalar_bytes.as_slice());
-        let mut key = [0u8; 32];
-        hk.expand(b"relational-sdk:hmac:v1", &mut key)
-            .expect("32 bytes is a valid HMAC key length");
-        key
-    }
-}
-
-/// The per-process keypair, created on first use.
-pub fn enclave_key() -> &'static EnclaveKey {
-    ENCLAVE_KEY.get_or_init(|| EnclaveKey {
-        private_key: SecretKey::random(&mut OsRng),
-    })
 }
 
 /// Decrypt an ECDH-ES + AES-256-GCM payload sealed to the transport key,
@@ -173,6 +139,8 @@ mod tests {
     use super::*;
     use crate::tee::tests::fixed_key;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use p256::elliptic_curve::rand_core::OsRng;
+    use p256::SecretKey;
 
     /// Seal `plaintext` to `recipient` the way the dashboard does.
     fn seal(recipient: &PublicKey, plaintext: &[u8]) -> (String, String, String) {

@@ -52,7 +52,7 @@ pub struct HealthResponse {
 /// Check if the data directory exists and is accessible.
 /// Uses async I/O to avoid blocking the Tokio runtime.
 async fn check_data_dir(state: &AppState) -> Option<String> {
-    match tokio::fs::metadata(state.storage.paths().root()).await {
+    match tokio::fs::metadata(state.files.paths().root()).await {
         Ok(_) => Some("ok".to_string()),
         Err(_) => Some("missing".to_string()),
     }

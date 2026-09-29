@@ -98,3 +98,27 @@ impl From<serde_json::Error> for ApiError {
         Self::internal("internal serialization error")
     }
 }
+
+impl From<crate::storage::StoreError> for ApiError {
+    fn from(e: crate::storage::StoreError) -> Self {
+        use crate::storage::StoreError;
+        match e {
+            StoreError::NotFound => Self::not_found("not found"),
+            StoreError::PreconditionFailed => {
+                Self::conflict("the resource changed while it was being updated; retry")
+            }
+            StoreError::Integrity(m) => {
+                tracing::error!(alert = "storage_integrity", error = %m, "Stored data failed an integrity check");
+                Self::internal("stored data failed an integrity check")
+            }
+            StoreError::Unavailable(m) => {
+                tracing::error!(error = %m, "Storage unavailable");
+                Self::service_unavailable("storage unavailable")
+            }
+            StoreError::Invalid(m) => {
+                tracing::error!(error = %m, "Storage request failed");
+                Self::internal("internal storage error")
+            }
+        }
+    }
+}

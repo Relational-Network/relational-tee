@@ -16,9 +16,8 @@ use crate::auth::UserToken;
 use crate::blockchain::types::TokenBalance;
 use crate::error::ApiError;
 use crate::state::AppState;
-use crate::storage::repository::wallets::WalletRepository;
 
-use super::enforce_owner_active;
+use super::{enforce_owner_active, load_wallet};
 
 // ============================================================================
 // Response types
@@ -61,8 +60,7 @@ pub async fn get_balance(
     State(state): State<AppState>,
     Path(wallet_id): Path<String>,
 ) -> Result<Json<BalanceResponse>, ApiError> {
-    let repo = WalletRepository::new(&state.storage);
-    let wallet = repo.get(&wallet_id)?;
+    let wallet = load_wallet(&state, &wallet_id).await?;
     enforce_owner_active(&wallet, &token.sub)?;
 
     // Fetch native SOL balance.

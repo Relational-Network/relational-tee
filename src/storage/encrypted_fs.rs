@@ -24,10 +24,6 @@ pub enum StorageError {
     Json(serde_json::Error),
     /// Requested resource does not exist.
     NotFound(String),
-    /// Resource already exists (e.g., duplicate wallet ID).
-    AlreadyExists(String),
-    /// Owner mismatch — caller does not own the resource.
-    PermissionDenied { user_id: String, resource: String },
 }
 
 impl std::fmt::Display for StorageError {
@@ -36,10 +32,6 @@ impl std::fmt::Display for StorageError {
             Self::Io(e) => write!(f, "I/O error: {e}"),
             Self::Json(e) => write!(f, "JSON error: {e}"),
             Self::NotFound(r) => write!(f, "not found: {r}"),
-            Self::AlreadyExists(r) => write!(f, "already exists: {r}"),
-            Self::PermissionDenied { user_id, resource } => {
-                write!(f, "user {user_id} denied access to {resource}")
-            }
         }
     }
 }
@@ -63,11 +55,6 @@ impl From<StorageError> for crate::error::ApiError {
     fn from(e: StorageError) -> Self {
         match &e {
             StorageError::NotFound(msg) => Self::not_found(msg.clone()),
-            StorageError::AlreadyExists(msg) => Self::conflict(msg.clone()),
-            StorageError::PermissionDenied { .. } => {
-                tracing::warn!("{e}");
-                Self::forbidden("you do not own this resource")
-            }
             StorageError::Io(_) | StorageError::Json(_) => {
                 error!(error = %e, "Storage error");
                 Self::internal("internal storage error")
@@ -94,15 +81,9 @@ impl EncryptedStorage {
 
     /// Create required top-level directories. Call once at server startup.
     pub fn initialize(&mut self) -> StorageResult<()> {
-        let dirs = [
-            self.paths.wallets_dir(),
-            self.paths.audit_dir(),
-            self.paths.pools_dir(),
-        ];
-        for dir in &dirs {
-            fs::create_dir_all(dir)?;
-            debug!(path = %dir.display(), "Ensured storage directory");
-        }
+        let dir = self.paths.pools_dir();
+        fs::create_dir_all(&dir)?;
+        debug!(path = %dir.display(), "Ensured storage directory");
         Ok(())
     }
 
@@ -150,28 +131,6 @@ impl EncryptedStorage {
     /// Create a directory (+ parents).
     pub fn create_dir(&self, path: impl AsRef<Path>) -> StorageResult<()> {
         Ok(fs::create_dir_all(path.as_ref())?)
-    }
-
-    /// List immediate subdirectory names under `dir`.
-    pub fn list_dirs(&self, dir: impl AsRef<Path>) -> StorageResult<Vec<String>> {
-        let dir = dir.as_ref();
-        let mut names = Vec::new();
-        let entries = fs::read_dir(dir).map_err(|e| {
-            if e.kind() == io::ErrorKind::NotFound {
-                StorageError::NotFound(dir.display().to_string())
-            } else {
-                StorageError::Io(e)
-            }
-        })?;
-        for entry in entries {
-            let entry = entry?;
-            if entry.file_type()?.is_dir() {
-                if let Some(name) = entry.file_name().to_str() {
-                    names.push(name.to_string());
-                }
-            }
-        }
-        Ok(names)
     }
 
     // ── Internal helpers ──────────────────────────────────────────

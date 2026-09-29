@@ -5,14 +5,17 @@
 # and tools, or use your own installs of the same versions.
 #
 # Not here yet, because what they drive doesn't exist yet: stack-up and
-# stack-down (the container stack with Azurite and a fake key-release
-# sidecar), faults (the idempotency fault-injection suite) and sandbox (a
-# debug-mode confidential group on Azure).
+# stack-down (the container stack), faults (the idempotency fault-injection
+# suite) and sandbox (a debug-mode confidential group on Azure).
 
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
 # Dashboard checkout used by `just spa`.
 pilot := env_var_or_default("IOB_PILOT_DIR", "../iob-pilot")
+
+# Azurite, the local Azure Storage emulator, runs in Docker.
+azurite_image := "mcr.microsoft.com/azure-storage/azurite:latest"
+azurite_name := "relational-tee-azurite"
 
 # Image builds run in a nixos/nix container, so no Linux builder is needed.
 nix_image := "nixos/nix:latest"
@@ -50,6 +53,28 @@ cert:
 test *args:
     cargo nextest run {{ args }}
     cargo nextest run --features dev {{ args }}
+
+# Start Azurite (Blob on 127.0.0.1:10000, Table on :10002), keeping data in memory.
+azurite:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if docker container inspect {{ azurite_name }} >/dev/null 2>&1; then
+        echo "{{ azurite_name }} is already running"
+        exit 0
+    fi
+    docker run -d --rm --name {{ azurite_name }} \
+        -p 127.0.0.1:10000:10000 -p 127.0.0.1:10002:10002 \
+        {{ azurite_image }} \
+        azurite --blobHost 0.0.0.0 --tableHost 0.0.0.0 --inMemoryPersistence --skipApiVersionCheck
+    sleep 2
+
+# Stop Azurite; its data goes with it.
+azurite-stop:
+    docker stop {{ azurite_name }}
+
+# Run the storage tests against Azurite, starting it first if needed.
+test-azurite: azurite
+    cargo nextest run --features dev --run-ignored only -E 'test(azurite)'
 
 # Run every local gate.
 check: fmt-check clippy test deny-crates audit

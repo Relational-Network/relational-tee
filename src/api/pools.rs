@@ -33,31 +33,22 @@ use crate::data_validation::FieldSchema;
 use crate::error::ApiError;
 use crate::state::AppState;
 use crate::storage::audit::AuditEventType;
-use crate::storage::ownership::OwnershipEnforcer;
 use crate::storage::pool_metadata::{DrtMetadata, PoolKind, PoolMetadata, PoolState};
-use crate::storage::repository::wallets::{WalletMetadata, WalletRepository, WalletStatus};
+use crate::storage::wallets::WalletMetadata;
 
 // ============================================================================
 // Shared helpers (also used by api/credentials.rs and api/admin.rs)
 // ============================================================================
 
 /// Load a wallet keypair, verifying ownership and active status.
-pub(crate) fn load_wallet_keypair(
-    repo: &WalletRepository<'_>,
+pub(crate) async fn load_wallet_keypair(
+    state: &AppState,
     wallet_id: &str,
     caller_sub: &str,
 ) -> Result<(WalletMetadata, Keypair), ApiError> {
-    let wallet = repo.get(wallet_id)?;
-    wallet.verify_ownership(caller_sub)?;
-    if wallet.status == WalletStatus::Deleted {
-        return Err(ApiError::not_found(format!("wallet {wallet_id} not found")));
-    }
-    if wallet.status == WalletStatus::Suspended {
-        return Err(ApiError::forbidden(format!(
-            "wallet {wallet_id} is suspended"
-        )));
-    }
-    let keypair_bytes = repo.read_keypair(wallet_id)?;
+    let wallet = super::load_wallet(state, wallet_id).await?;
+    super::enforce_owner_active(&wallet, caller_sub)?;
+    let keypair_bytes = state.storage.wallets().read_keypair(wallet_id).await?;
     let keypair = keypair_from_bytes_verified(&keypair_bytes, &wallet.public_address)?;
     Ok((wallet, keypair))
 }
@@ -103,8 +94,8 @@ pub(crate) fn verify_pool_ownership(pool: &Pool, wallet: &WalletMetadata) -> Res
 
 /// Load pool metadata from enclave storage.
 pub(crate) fn load_pool_meta(state: &AppState, pool_pda: &str) -> Result<PoolMetadata, ApiError> {
-    let path = state.storage.paths().pool_meta(pool_pda);
-    state.storage.read_json::<PoolMetadata>(&path).map_err(|_| {
+    let path = state.files.paths().pool_meta(pool_pda);
+    state.files.read_json::<PoolMetadata>(&path).map_err(|_| {
         ApiError::not_found(format!(
             "pool metadata not found for {pool_pda} — pool may need creation"
         ))
@@ -308,10 +299,10 @@ fn persist_pool_metadata(
     schema_id: &str,
     validation_mode: crate::data_validation::ValidationMode,
 ) -> Result<PoolMetadata, ApiError> {
-    let paths = state.storage.paths();
+    let paths = state.files.paths();
     let dataset_dir = paths.pool_dataset_dir(pool_pda);
     state
-        .storage
+        .files
         .create_dir(&dataset_dir)
         .map_err(|e| ApiError::internal(format!("failed to create pool directory: {e}")))?;
 
@@ -333,7 +324,7 @@ fn persist_pool_metadata(
         revoked_count: 0,
     };
     state
-        .storage
+        .files
         .write_json(paths.pool_meta(pool_pda), &meta)
         .map_err(|e| ApiError::internal(format!("failed to write pool metadata: {e}")))?;
     if let Err(e) = state.tx_db.upsert_pool_meta(&meta) {
@@ -377,8 +368,7 @@ pub async fn create_malta_pool(
     }
     let (schema_id, fields) = parse_schema(&payload.schema)?;
 
-    let repo = WalletRepository::new(&state.storage);
-    let (wallet, keypair) = load_wallet_keypair(&repo, &payload.wallet_id, &token.sub)?;
+    let (wallet, keypair) = load_wallet_keypair(&state, &payload.wallet_id, &token.sub).await?;
 
     let created = create_pool_atomic(&state, &keypair, &resolved).await?;
 
@@ -399,7 +389,7 @@ pub async fn create_malta_pool(
         crate::data_validation::ValidationMode::HeadersOnly,
     )?;
 
-    crate::data_validation::save_pool_schema(state.storage.paths(), &pool_pda_str, &fields)
+    crate::data_validation::save_pool_schema(state.files.paths(), &pool_pda_str, &fields)
         .map_err(ApiError::internal)?;
 
     info!(
@@ -424,10 +414,7 @@ pub async fn create_malta_pool(
             "drt_count": meta.drts.len(),
             "chain": chain_section(&created.signatures, &created.events, pool_labels(&meta, None)),
         }));
-    crate::storage::audit::AuditRepository::new(&state.storage)
-        .with_tx_db(&state.tx_db)
-        .log(&evt)
-        .await;
+    state.storage.audit().log(evt).await;
 
     Ok((
         axum::http::StatusCode::CREATED,

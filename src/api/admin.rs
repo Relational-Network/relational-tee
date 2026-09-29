@@ -23,8 +23,13 @@ use crate::audit_log;
 use crate::auth::AdminToken;
 use crate::error::ApiError;
 use crate::state::AppState;
-use crate::storage::audit::{AuditEvent, AuditEventType, AuditRepository};
-use crate::storage::repository::wallets::{WalletRepository, WalletResponse, WalletStatus};
+use crate::storage::audit::{AuditEvent, AuditEventType, AuditEventView};
+use crate::storage::wallets::{WalletResponse, WalletStatus};
+
+use super::{load_wallet, CursorQuery};
+
+/// The cursor scope of the admin wallet list.
+const WALLETS_SCOPE: &str = "wallets";
 
 // ============================================================================
 // Response types
@@ -39,11 +44,13 @@ pub struct WalletStatsResponse {
     pub deleted_wallets: usize,
 }
 
-/// All wallets (admin view).
+/// One page of all wallets (admin view).
 #[derive(Debug, Serialize, ToSchema)]
 pub struct AdminListWalletsResponse {
     pub wallets: Vec<AdminWalletEntry>,
-    pub total: usize,
+    /// Present when there's another page; pass it as `cursor`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
 /// Extended wallet info visible to admins.
@@ -58,21 +65,22 @@ pub struct AdminWalletEntry {
 /// Audit event query params.
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct AuditQuery {
-    /// Date in `YYYY-MM-DD` format.
+    /// Date in `YYYY-MM-DD` format (default: today, UTC).
     pub date: Option<String>,
     /// Maximum number of events to return (default 50, max 200).
     #[serde(default = "super::default_page_limit")]
     pub limit: usize,
-    /// Offset for pagination (default 0).
-    #[serde(default)]
-    pub offset: usize,
+    /// `next_cursor` from the previous page.
+    pub cursor: Option<String>,
 }
 
-/// Audit log response.
+/// One page of audit events, newest first.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct AuditEventsResponse {
-    pub events: Vec<AuditEvent>,
-    pub count: usize,
+    pub events: Vec<AuditEventView>,
+    /// Present when there's another page; pass it as `cursor`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
 /// Generic status response for suspend/activate.
@@ -85,6 +93,29 @@ pub struct WalletStatusChangeResponse {
 // ============================================================================
 // Handlers
 // ============================================================================
+
+/// Move a non-deleted wallet to `status` (compare-and-swap; already being
+/// there counts as success).
+async fn set_status(
+    state: &AppState,
+    wallet_id: &str,
+    status: WalletStatus,
+    action: &str,
+) -> Result<(), ApiError> {
+    let wallet = load_wallet(state, wallet_id).await?;
+    if wallet.status == WalletStatus::Deleted {
+        return Err(ApiError::bad_request(format!(
+            "cannot {action} a deleted wallet"
+        )));
+    }
+    state
+        .storage
+        .wallets()
+        .set_status(wallet_id, status)
+        .await?
+        .ok_or_else(|| ApiError::not_found(format!("wallet {wallet_id} not found")))?;
+    Ok(())
+}
 
 /// Get aggregate wallet statistics.
 #[utoipa::path(
@@ -104,8 +135,7 @@ pub async fn get_wallet_stats(
     AdminToken(token): AdminToken,
     State(state): State<AppState>,
 ) -> Result<Json<WalletStatsResponse>, ApiError> {
-    let repo = WalletRepository::new(&state.storage);
-    let all = repo.list_all_wallets()?;
+    let all = state.storage.wallets().all().await?;
 
     let active = all
         .iter()
@@ -121,8 +151,7 @@ pub async fn get_wallet_stats(
         .count();
 
     audit_log!(
-        &state.storage,
-        &state.tx_db,
+        state,
         AuditEventType::AdminAccess,
         &token.sub,
         "system",
@@ -143,11 +172,12 @@ pub async fn get_wallet_stats(
     path = "/v1/admin/wallets",
     tag = "Admin",
     summary = "List all wallets (admin)",
-    description = "Returns all wallets across all users with pagination. Admin only.",
+    description = "Returns all wallets across all users, one cursor page at a time. Admin only.",
     security(("bearer_auth" = [])),
-    params(super::PaginationQuery),
+    params(CursorQuery),
     responses(
         (status = 200, description = "All wallets", body = AdminListWalletsResponse),
+        (status = 400, description = "Invalid cursor"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Admin role required"),
     )
@@ -155,17 +185,19 @@ pub async fn get_wallet_stats(
 pub async fn list_all_wallets(
     AdminToken(token): AdminToken,
     State(state): State<AppState>,
-    Query(pagination): Query<super::PaginationQuery>,
+    Query(query): Query<CursorQuery>,
 ) -> Result<Json<AdminListWalletsResponse>, ApiError> {
-    let repo = WalletRepository::new(&state.storage);
-    let all = repo.list_all_wallets()?;
-    let total = all.len();
-
-    let limit = pagination.clamped_limit();
-    let entries: Vec<AdminWalletEntry> = all
+    let page = state
+        .storage
+        .page_from(WALLETS_SCOPE, query.cursor.as_deref())?;
+    let got = state
+        .storage
+        .wallets()
+        .list(query.clamped_limit(), page)
+        .await?;
+    let entries: Vec<AdminWalletEntry> = got
+        .items
         .into_iter()
-        .skip(pagination.offset)
-        .take(limit)
         .map(|w| AdminWalletEntry {
             owner_user_id: w.owner_user_id.clone(),
             wallet: WalletResponse::from(w),
@@ -173,8 +205,7 @@ pub async fn list_all_wallets(
         .collect();
 
     audit_log!(
-        &state.storage,
-        &state.tx_db,
+        state,
         AuditEventType::AdminAccess,
         &token.sub,
         "system",
@@ -183,7 +214,9 @@ pub async fn list_all_wallets(
 
     Ok(Json(AdminListWalletsResponse {
         wallets: entries,
-        total,
+        next_cursor: got
+            .next
+            .map(|next| state.storage.sign_cursor(WALLETS_SCOPE, &next)),
     }))
 }
 
@@ -193,11 +226,12 @@ pub async fn list_all_wallets(
     path = "/v1/admin/audit/events",
     tag = "Admin",
     summary = "Query audit log",
-    description = "Returns audit events for a given date (default: today). Admin only.",
+    description = "Returns audit events for a given date (default: today), newest first, one cursor page at a time. Every event is verified; `hmac_valid: false` marks one that failed. Admin only.",
     security(("bearer_auth" = [])),
     params(AuditQuery),
     responses(
         (status = 200, description = "Audit events", body = AuditEventsResponse),
+        (status = 400, description = "Invalid date or cursor"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Admin role required"),
     )
@@ -207,23 +241,26 @@ pub async fn query_audit_logs(
     State(state): State<AppState>,
     Query(query): Query<AuditQuery>,
 ) -> Result<Json<AuditEventsResponse>, ApiError> {
-    let date = query
-        .date
-        .unwrap_or_else(|| chrono::Utc::now().format("%Y-%m-%d").to_string());
+    let date = match query.date.as_deref() {
+        Some(d) => chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d")
+            .map_err(|_| ApiError::bad_request("date must be in YYYY-MM-DD format"))?,
+        None => chrono::Utc::now().date_naive(),
+    };
 
-    // Validate date format (YYYY-MM-DD) to prevent filesystem scanning with invalid paths.
-    chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d")
-        .map_err(|_| ApiError::bad_request("date must be in YYYY-MM-DD format"))?;
+    let scope = format!("audit-day:{date}");
+    let page = state.storage.page_from(&scope, query.cursor.as_deref())?;
+    let got = state
+        .storage
+        .audit()
+        .day_events(date, query.limit.clamp(1, 200), page)
+        .await?;
 
-    // Query from redb audit index (O(k) prefix scan by date).
-    let limit = query.limit.clamp(1, 200);
-    let events = state
-        .tx_db
-        .list_audit_by_date(&date, limit, query.offset)
-        .map_err(|e| ApiError::internal(format!("failed to query audit events: {e}")))?;
-    let count = events.len();
-
-    Ok(Json(AuditEventsResponse { events, count }))
+    Ok(Json(AuditEventsResponse {
+        events: got.items,
+        next_cursor: got
+            .next
+            .map(|next| state.storage.sign_cursor(&scope, &next)),
+    }))
 }
 
 /// Suspend a wallet (admin action).
@@ -249,15 +286,7 @@ pub async fn suspend_wallet(
     State(state): State<AppState>,
     Path(wallet_id): Path<String>,
 ) -> Result<Json<WalletStatusChangeResponse>, ApiError> {
-    let repo = WalletRepository::new(&state.storage);
-    let mut wallet = repo.get(&wallet_id)?;
-
-    if wallet.status == WalletStatus::Deleted {
-        return Err(ApiError::bad_request("cannot suspend a deleted wallet"));
-    }
-
-    wallet.status = WalletStatus::Suspended;
-    repo.update(&wallet)?;
+    set_status(&state, &wallet_id, WalletStatus::Suspended, "suspend").await?;
 
     info!(
         wallet_id = %wallet_id,
@@ -266,8 +295,7 @@ pub async fn suspend_wallet(
     );
 
     audit_log!(
-        &state.storage,
-        &state.tx_db,
+        state,
         AuditEventType::AdminAccess,
         &token.sub,
         "wallet",
@@ -303,15 +331,7 @@ pub async fn activate_wallet(
     State(state): State<AppState>,
     Path(wallet_id): Path<String>,
 ) -> Result<Json<WalletStatusChangeResponse>, ApiError> {
-    let repo = WalletRepository::new(&state.storage);
-    let mut wallet = repo.get(&wallet_id)?;
-
-    if wallet.status == WalletStatus::Deleted {
-        return Err(ApiError::bad_request("cannot activate a deleted wallet"));
-    }
-
-    wallet.status = WalletStatus::Active;
-    repo.update(&wallet)?;
+    set_status(&state, &wallet_id, WalletStatus::Active, "activate").await?;
 
     info!(
         wallet_id = %wallet_id,
@@ -320,8 +340,7 @@ pub async fn activate_wallet(
     );
 
     audit_log!(
-        &state.storage,
-        &state.tx_db,
+        state,
         AuditEventType::AdminAccess,
         &token.sub,
         "wallet",
@@ -387,7 +406,7 @@ pub async fn log_role_change(
             "new_role": payload.new_role,
             "assigned_by": token.sub
         }));
-    AuditRepository::new(&state.storage).log(&audit_event).await;
+    state.storage.audit().log(audit_event).await;
 
     info!(
         admin = %token.sub,

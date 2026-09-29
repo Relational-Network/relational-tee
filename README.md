@@ -8,7 +8,7 @@ The worker behind IOB MicRes: an Axum server that runs Use Case 1 credential poo
 
 - **Transport.** Dev builds serve plain HTTP on `127.0.0.1:8443`, or HTTPS with a local mkcert certificate. Release builds have no plain HTTP path: they read a PEM certificate and key from `TLS_CERT_PATH` and `TLS_KEY_PATH`, and refuse to start without them.
 - **Keys.** At startup the worker obtains four P-256 keys, `transport-key`, `storage-root`, `tls-key` and `commitment-key`, and keeps them in memory only. Release builds get them from Microsoft's SKR sidecar on localhost (`KEY_PROVIDER=skr`), which releases a key only to a confidential container group whose attested policy matches the key's release policy. Dev builds default to `KEY_PROVIDER=local`, which reads dev keys from `dev/keys/` (`just dev-keys` creates them); release builds don't contain that provider and refuse `KEY_PROVIDER=local`. Uploads are sealed to `transport-key`, which every worker shares.
-- **Storage.** State lives under `DATA_DIR` as JSON files plus a redb database, **unencrypted on disk**. Use synthetic data only; the server warns about this at startup.
+- **Storage.** Wallets, transaction history and the audit log live in Azure Blob and Table storage, encrypted inside the worker with keys derived from `storage-root` (see [Storage](#storage)). Pools, their datasets, issuance records and revocations still live under `DATA_DIR` as JSON files plus a redb database, **unencrypted on disk**: use synthetic data only.
 - **Auth.** Protected endpoints still validate ES256 tokens from the Attestation Verification Service (AVS). The AVS only issues tokens to an SGX enclave it has attested, so authenticated endpoints can't be exercised locally until Entra ID validation replaces it. Public endpoints (`/health*`, `/v1/attestation/public-key`, `/docs`) work.
 - **Solana.** The public devnet RPC by default. It is rate-limited and has no SLA, and the server warns about it at startup.
 
@@ -28,7 +28,9 @@ just            # list the recipes
 | `just dev-keys` | Create any missing dev keys in `dev/keys/`: one private JWK per key, and the dev MAA signing key; existing keys are kept |
 | `just skr` | Run the fake SKR sidecar on `127.0.0.1:9000`; start the worker with `KEY_PROVIDER=skr` to use it |
 | `just cert` | Create a locally trusted mkcert certificate in `dev/certs/`; `just dev` then serves HTTPS |
-| `just test` | Run the tests with cargo-nextest, in the release and dev configurations |
+| `just test` | Run the tests with cargo-nextest, in the release and dev configurations; storage tests use the in-memory backend |
+| `just azurite` | Start Azurite, the Azure Storage emulator, in Docker (Blob on `127.0.0.1:10000`, Table on `:10002`, data in memory); `just azurite-stop` stops it |
+| `just test-azurite` | Run the storage conformance tests against Azurite, starting it first if needed |
 | `just check` | Run every gate: rustfmt, clippy (`-D warnings`, with and without all features), the tests, the banned-crate check and `cargo audit` |
 | `just spa` | Run the dashboard dev server from `../iob-pilot` (override with `IOB_PILOT_DIR`), using the host's Node and pnpm |
 | `just image` | Build the canonical x86_64-linux image with Nix and load it into Docker |
@@ -63,12 +65,27 @@ Not there yet: a container stack with several replicas and local fakes for stora
 | `MAA_ENDPOINT` | `sharedweu.weu.attest.azure.net` | same | Attestation authority the sidecar uses |
 | `KEY_VAULT_URL` | a placeholder | required | Key Vault the sidecar releases keys from |
 | `KEY_NAMES` | `transport-key,storage-root,tls-key,commitment-key` | same | Key Vault names of the four keys, in that order |
+| `STORAGE_BACKEND` | `memory` | `azure` (the only one) | `azure`, `azurite` (Azurite's dev account) or `memory` (lost on exit) |
+| `STORAGE_BLOB_URL`, `STORAGE_TABLE_URL` | Azurite's, for `azurite` | required, `https://` | Blob and Table endpoints |
+| `MANAGED_IDENTITY_CLIENT_ID` | unset | the worker identity | Which managed identity to request storage tokens for |
 | `SOLANA_RPC_URL` | `https://api.devnet.solana.com` | same | Solana RPC endpoint |
 | `SOLANA_NETWORK` | `devnet` | same | `devnet` or `mainnet`, for explorer links |
 | `AVS_JWKS_URL` | `http://127.0.0.1:9100/.well-known/jwks.json` | same | AVS signing keys |
 | `RUST_LOG` | `info` | `info` | Log filter |
 
 Dev builds are the ones with the `dev` Cargo feature (`just dev`, or `cargo run --features dev`).
+
+## Storage
+
+The worker reaches Azure Storage over its own hyper and rustls client, with Entra tokens from the managed identity endpoint (the account has shared keys disabled). It encrypts everything before it leaves the process, so storage sees only ciphertext and hashed identifiers:
+
+- **Keys.** HKDF-SHA256 over `storage-root`'s private scalar, salt `relational-tee/storage-root`, with a versioned label per purpose: `blob-kek-v1`, `table-payload-v1`, `index-hmac-v1`, `audit-hmac-v1`, `log-enc-v1` and `cursor-hmac-v1`.
+- **Blobs** get a fresh AES-256-GCM data key each, wrapped (RFC 3394) under the blob key. The additional authenticated data binds each object to its container and path.
+- **Table rows** carry their fields in one encrypted `payload` property, bound to the table and the row's keys. Plaintext properties are copies of filter fields; the worker trusts only the payload. User IDs appear in keys only as `h(x)`, an HMAC under the index key.
+- **Audit events** carry an HMAC tag under `audit-hmac-v1`, so every worker can verify every event. Each is appended encrypted to the worker's hourly append blob, then indexed by pool and by day. Reads verify each event and return failures with `hmac_valid: false` instead of dropping them.
+- **Pagination** uses signed cursors: pass a response's `next_cursor` back as `cursor`. Any worker accepts any worker's cursor.
+
+Tables and containers are created at startup if they're missing. `STORAGE_BACKEND=azurite` uses Azurite's well-known dev account key (dev builds only); `memory` keeps everything in the process.
 
 ## Build and release
 

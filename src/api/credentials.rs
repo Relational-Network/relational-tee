@@ -37,9 +37,8 @@ use crate::blockchain::drt::{
 use crate::error::ApiError;
 use crate::handlers::{parse_csv_payload, validate_payload};
 use crate::state::AppState;
-use crate::storage::audit::{AuditEvent, AuditEventType, AuditRepository};
+use crate::storage::audit::{AuditEvent, AuditEventType, AuditEventView, AuditFilter};
 use crate::storage::pool_metadata::{PoolKind, PoolMetadata, PoolState};
-use crate::storage::repository::wallets::WalletRepository;
 use crate::tee::KeyName;
 use sha2::{Digest, Sha256};
 
@@ -115,14 +114,14 @@ pub struct RevocationsResponse {
 /// Pool-scoped audit query parameters.
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct PoolAuditQuery {
-    /// Maximum number of events to return (default: 50).
+    /// Maximum number of events to return (default 50, max 200).
     #[serde(default = "default_limit")]
     pub limit: usize,
-    /// Offset for pagination (default: 0).
+    /// `next_cursor` from the previous page, with the same filters.
     #[serde(default)]
-    pub offset: usize,
-    /// Filter to events of this type (snake_case, e.g. `right_granted`).
-    /// Repeatable via comma-separated values (e.g. `right_granted,right_revoked`).
+    pub cursor: Option<String>,
+    /// Filter to events of this type (snake_case, e.g. `credential_issued`).
+    /// Repeatable via comma-separated values (e.g. `pool_created,credential_issued`).
     #[serde(default)]
     pub event_type: Option<String>,
     /// Filter to events with `user_id` equal to this (exact match).
@@ -144,12 +143,14 @@ fn default_limit() -> usize {
     50
 }
 
-/// Pool-scoped audit response.
+/// One page of a pool's audit events, newest first.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct PoolAuditResponse {
     pub pool_pda: String,
-    pub events: Vec<AuditEvent>,
-    pub total: usize,
+    pub events: Vec<AuditEventView>,
+    /// Present when there's another page; pass it as `cursor`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
 /// Pool summary response (enclave metadata + on-chain state).
@@ -173,7 +174,7 @@ pub struct PoolSummaryResponse {
     /// On-chain DRT configuration.
     pub drts: Vec<DrtConfigResponseCompact>,
     /// Recent audit events (last 10).
-    pub recent_events: Vec<AuditEvent>,
+    pub recent_events: Vec<AuditEventView>,
 }
 
 /// Compact DRT config for the summary endpoint.
@@ -359,9 +360,9 @@ fn acquire_pool_lock(state: &AppState, pool_pda: &str) -> Arc<tokio::sync::Mutex
 
 /// Load pool metadata from enclave storage, returning a helpful error if missing.
 fn load_pool_meta(state: &AppState, pool_pda: &str) -> Result<PoolMetadata, ApiError> {
-    let meta_path = state.storage.paths().pool_meta(pool_pda);
+    let meta_path = state.files.paths().pool_meta(pool_pda);
     state
-        .storage
+        .files
         .read_json::<PoolMetadata>(&meta_path)
         .map_err(|_| {
             ApiError::not_found(format!(
@@ -372,9 +373,9 @@ fn load_pool_meta(state: &AppState, pool_pda: &str) -> Result<PoolMetadata, ApiE
 
 /// Save pool metadata back to storage.
 fn save_pool_meta(state: &AppState, pool_pda: &str, meta: &PoolMetadata) -> Result<(), ApiError> {
-    let meta_path = state.storage.paths().pool_meta(pool_pda);
+    let meta_path = state.files.paths().pool_meta(pool_pda);
     state
-        .storage
+        .files
         .write_json(&meta_path, meta)
         .map_err(|e| ApiError::internal(format!("failed to write pool metadata: {e}")))
 }
@@ -382,12 +383,12 @@ fn save_pool_meta(state: &AppState, pool_pda: &str, meta: &PoolMetadata) -> Resu
 /// Recover pool directory structure if it was lost after on-chain creation.
 /// Returns true if recovery was needed.
 fn ensure_pool_dirs(state: &AppState, pool_pda: &str) -> Result<bool, ApiError> {
-    let dataset_dir = state.storage.paths().pool_dataset_dir(pool_pda);
-    if state.storage.exists(&dataset_dir) {
+    let dataset_dir = state.files.paths().pool_dataset_dir(pool_pda);
+    if state.files.exists(&dataset_dir) {
         return Ok(false);
     }
     state
-        .storage
+        .files
         .create_dir(&dataset_dir)
         .map_err(|e| ApiError::internal(format!("failed to create pool directory: {e}")))?;
     Ok(true)
@@ -479,7 +480,7 @@ pub async fn upload_schema(
     let pool = fetch_pool(state.solana_client.rpc(), &pool_pda).await?;
 
     // Verify caller is pool owner (O(1) via redb wallet index).
-    let wallet = super::get_active_wallet_for_user(&state, &token.sub)?;
+    let wallet = super::get_active_wallet_for_user(&state, &token.sub).await?;
     verify_pool_ownership(&pool, &wallet)?;
 
     // Verify pool metadata references this schema_id.
@@ -494,7 +495,7 @@ pub async fn upload_schema(
     // Save schema under the pool's directory so two pools can share a schema_id
     // without overwriting each other.
     let field_count = payload.fields.len();
-    crate::data_validation::save_pool_schema(state.storage.paths(), &pool_pda_str, &payload.fields)
+    crate::data_validation::save_pool_schema(state.files.paths(), &pool_pda_str, &payload.fields)
         .map_err(ApiError::internal)?;
 
     info!(
@@ -514,10 +515,7 @@ pub async fn upload_schema(
             "schema_id": payload.schema_id,
             "field_count": field_count,
         }));
-    AuditRepository::new(&state.storage)
-        .with_tx_db(&state.tx_db)
-        .log(&audit_event)
-        .await;
+    state.storage.audit().log(audit_event).await;
 
     Ok(Json(UploadSchemaResponse {
         schema_id: payload.schema_id,
@@ -556,7 +554,7 @@ pub async fn get_schema(
     Path(pool_pda_str): Path<String>,
 ) -> Result<Json<GetSchemaResponse>, ApiError> {
     let meta = load_pool_meta(&state, &pool_pda_str)?;
-    let fields = crate::data_validation::load_pool_schema(state.storage.paths(), &pool_pda_str)
+    let fields = crate::data_validation::load_pool_schema(state.files.paths(), &pool_pda_str)
         .ok_or_else(|| {
             ApiError::not_found(format!(
                 "no schema uploaded yet for pool {pool_pda_str} — POST one to /v1/drt/pools/{{pda}}/schema"
@@ -609,7 +607,7 @@ pub async fn initialize_pool(
     let pool = fetch_pool(state.solana_client.rpc(), &pool_pda).await?;
 
     // Load wallet for ownership verification (O(1) via redb index).
-    let wallet = super::get_active_wallet_for_user(&state, &token.sub)?;
+    let wallet = super::get_active_wallet_for_user(&state, &token.sub).await?;
 
     // Verify caller owns the on-chain pool.
     verify_pool_ownership(&pool, &wallet)?;
@@ -634,7 +632,7 @@ pub async fn initialize_pool(
 
     // Validate CSV against the pool's schema.
     let summary = validate_payload(
-        state.storage.paths(),
+        state.files.paths(),
         &pool_pda_str,
         &parsed.csv_bytes,
         meta.validation_mode,
@@ -650,12 +648,12 @@ pub async fn initialize_pool(
     let record_id = "initial".to_string();
 
     // Store the CSV dataset.
-    let dataset_dir = state.storage.paths().pool_dataset_dir(&pool_pda_str);
+    let dataset_dir = state.files.paths().pool_dataset_dir(&pool_pda_str);
     let csv_path = dataset_dir.join("initial.csv");
     let meta_file_path = dataset_dir.join("initial.meta.json");
 
     state
-        .storage
+        .files
         .write_raw(&csv_path, &parsed.csv_bytes)
         .map_err(|e| ApiError::internal(format!("failed to write initial dataset: {e}")))?;
 
@@ -672,7 +670,7 @@ pub async fn initialize_pool(
         commitment: None,
     };
     state
-        .storage
+        .files
         .write_json(&meta_file_path, &anchor)
         .map_err(|e| ApiError::internal(format!("failed to write dataset anchor: {e}")))?;
 
@@ -702,6 +700,7 @@ pub async fn initialize_pool(
     let audit_event = AuditEvent::new(AuditEventType::DatasetInitialized)
         .with_user(&token.sub)
         .with_resource("drt_pool", &pool_pda_str)
+        .with_pool_pda(&pool_pda_str)
         .with_details(serde_json::json!({
             "pool_pda": pool_pda_str,
             "record_id": record_id,
@@ -709,10 +708,7 @@ pub async fn initialize_pool(
             "schema_id": meta.schema_id,
             "state_transition": "needs_init -> ready"
         }));
-    AuditRepository::new(&state.storage)
-        .with_tx_db(&state.tx_db)
-        .log(&audit_event)
-        .await;
+    state.storage.audit().log(audit_event).await;
 
     info!(
         pool = %pool_pda_str,
@@ -787,9 +783,12 @@ pub async fn issue_credentials(
     let pool_uuid = decode_right_id(&meta.pool_uuid_hex)?;
 
     // Load caller's wallet (admin only — endpoint is `AdminToken`-gated).
-    let caller_wallet = super::get_active_wallet_for_user(&state, &token.sub)?;
-    let repo = WalletRepository::new(&state.storage);
-    let keypair_bytes = repo.read_keypair(&caller_wallet.wallet_id)?;
+    let caller_wallet = super::get_active_wallet_for_user(&state, &token.sub).await?;
+    let keypair_bytes = state
+        .storage
+        .wallets()
+        .read_keypair(&caller_wallet.wallet_id)
+        .await?;
     let keypair = crate::blockchain::signing::keypair_from_bytes_verified(
         &keypair_bytes,
         &caller_wallet.public_address,
@@ -818,7 +817,7 @@ pub async fn issue_credentials(
 
     // Validate CSV against pool's schema.
     let summary = validate_payload(
-        state.storage.paths(),
+        state.files.paths(),
         &pool_pda_str,
         &parsed.csv_bytes,
         meta.validation_mode,
@@ -861,11 +860,11 @@ pub async fn issue_credentials(
     };
 
     // 2. Store CSV dataset.
-    let dataset_dir = state.storage.paths().pool_dataset_dir(&pool_pda_str);
+    let dataset_dir = state.files.paths().pool_dataset_dir(&pool_pda_str);
     let csv_path = dataset_dir.join(format!("{record_id}.csv"));
     let meta_file_path = dataset_dir.join(format!("{record_id}.meta.json"));
 
-    if let Err(e) = state.storage.write_raw(&csv_path, &parsed.csv_bytes) {
+    if let Err(e) = state.files.write_raw(&csv_path, &parsed.csv_bytes) {
         // DRT was burned but file write failed — audit log this edge case.
         warn!(
             pool = %pool_pda_str,
@@ -877,6 +876,7 @@ pub async fn issue_credentials(
         let fail_event = AuditEvent::new(AuditEventType::CredentialIssuanceFailed)
             .with_user(&token.sub)
             .with_resource("drt_pool", &pool_pda_str)
+            .with_pool_pda(&pool_pda_str)
             .with_details(serde_json::json!({
                 "pool_pda": pool_pda_str,
                 "record_id": record_id,
@@ -895,10 +895,7 @@ pub async fn issue_credentials(
                     },
                 ),
             }));
-        AuditRepository::new(&state.storage)
-            .with_tx_db(&state.tx_db)
-            .log(&fail_event)
-            .await;
+        state.storage.audit().log(fail_event).await;
 
         return Err(ApiError::internal(format!(
             "DRT burned (sig: {sig_str}) but file write failed — contact admin for recovery"
@@ -919,7 +916,7 @@ pub async fn issue_credentials(
     };
     // Best-effort anchor write — the redb dual-write below is authoritative
     // for queryable fields; the sidecar is a tamper-evidence anchor only.
-    if let Err(e) = state.storage.write_json(&meta_file_path, &anchor) {
+    if let Err(e) = state.files.write_json(&meta_file_path, &anchor) {
         warn!(
             pool = %pool_pda_str,
             record_id = %record_id,
@@ -953,6 +950,7 @@ pub async fn issue_credentials(
     let audit_event = AuditEvent::new(AuditEventType::CredentialIssued)
         .with_user(&token.sub)
         .with_resource("drt_pool", &pool_pda_str)
+        .with_pool_pda(&pool_pda_str)
         .with_details(serde_json::json!({
             "pool_pda": pool_pda_str,
             "record_id": record_id,
@@ -972,10 +970,7 @@ pub async fn issue_credentials(
                 },
             ),
         }));
-    AuditRepository::new(&state.storage)
-        .with_tx_db(&state.tx_db)
-        .log(&audit_event)
-        .await;
+    state.storage.audit().log(audit_event).await;
 
     let explorer_url = state.solana_client.network().explorer_tx_url(&sig_str);
 
@@ -1034,8 +1029,7 @@ pub async fn revoke_credentials(
         .map_err(|_| ApiError::bad_request("invalid pool PDA address"))?;
 
     // Verify ownership.
-    let repo = WalletRepository::new(&state.storage);
-    let (wallet, _) = load_wallet_keypair(&repo, &payload.wallet_id, &token.sub)?;
+    let (wallet, _) = load_wallet_keypair(&state, &payload.wallet_id, &token.sub).await?;
 
     let pool = fetch_pool(state.solana_client.rpc(), &pool_pda).await?;
     verify_pool_ownership(&pool, &wallet)?;
@@ -1044,14 +1038,14 @@ pub async fn revoke_credentials(
     let _meta = load_pool_meta(&state, &pool_pda_str)?;
 
     // Verify each credential_id references an existing dataset file.
-    let dataset_dir = state.storage.paths().pool_dataset_dir(&pool_pda_str);
+    let dataset_dir = state.files.paths().pool_dataset_dir(&pool_pda_str);
     for cid in &payload.credential_ids {
         let csv_path = if cid == "initial" {
             dataset_dir.join("initial.csv")
         } else {
             dataset_dir.join(format!("{cid}.csv"))
         };
-        if !state.storage.exists(&csv_path) {
+        if !state.files.exists(&csv_path) {
             return Err(ApiError::not_found(format!(
                 "credential record '{cid}' not found in pool"
             )));
@@ -1059,7 +1053,7 @@ pub async fn revoke_credentials(
     }
 
     // Append revocation entries to JSONL file.
-    let revocations_path = state.storage.paths().pool_revocations(&pool_pda_str);
+    let revocations_path = state.files.paths().pool_revocations(&pool_pda_str);
     let now = Utc::now().to_rfc3339();
     let mut lines = String::new();
     for cid in &payload.credential_ids {
@@ -1116,16 +1110,14 @@ pub async fn revoke_credentials(
     let audit_event = AuditEvent::new(AuditEventType::CredentialRevoked)
         .with_user(&token.sub)
         .with_resource("drt_pool", &pool_pda_str)
+        .with_pool_pda(&pool_pda_str)
         .with_details(serde_json::json!({
             "pool_pda": pool_pda_str,
             "credential_ids": payload.credential_ids,
             "revoked_count": revoked_count,
             "reason": payload.reason
         }));
-    AuditRepository::new(&state.storage)
-        .with_tx_db(&state.tx_db)
-        .log(&audit_event)
-        .await;
+    state.storage.audit().log(audit_event).await;
 
     info!(
         pool = %pool_pda_str,
@@ -1191,14 +1183,14 @@ pub async fn list_revocations(
 
 /// Query pool-scoped audit events.
 ///
-/// Scans daily JSONL files from pool creation to now, filtering by pool PDA.
-/// Supports pagination via `limit` and `offset` query parameters.
+/// Reads the pool's audit index, newest first, verifying every event.
+/// Filters apply in storage; `cursor` continues a previous page.
 #[utoipa::path(
     get,
     path = "/v1/drt/pools/{pool_pda}/audit",
     tag = "Credentials",
     summary = "Pool audit log",
-    description = "Query audit events scoped to a specific pool. Iterates daily JSONL files and filters by pool PDA. Admin only.",
+    description = "Audit events for one pool, newest first, one cursor page at a time. Every event is verified; `hmac_valid: false` marks one that failed. Admin only.",
     security(("bearer_auth" = [])),
     params(
         ("pool_pda" = String, Path, description = "Pool PDA address (base58)"),
@@ -1206,8 +1198,8 @@ pub async fn list_revocations(
     ),
     responses(
         (status = 200, description = "Audit events", body = PoolAuditResponse),
+        (status = 400, description = "Invalid filter or cursor"),
         (status = 401, description = "Unauthorized"),
-        (status = 404, description = "Pool not found"),
     )
 )]
 pub async fn pool_audit(
@@ -1217,108 +1209,60 @@ pub async fn pool_audit(
     Query(query): Query<PoolAuditQuery>,
 ) -> Result<Json<PoolAuditResponse>, ApiError> {
     // Any admin can view audit events (no ownership check).
-
-    let limit = query.limit.min(200);
-    let has_filters = query.event_type.is_some()
-        || query.actor.is_some()
-        || query.status.is_some()
-        || query.from.is_some()
-        || query.to.is_some();
-
-    // If filters are present, over-fetch from redb and post-filter — the
-    // per-pool volume is small (hundreds at pilot scale). If no filters,
-    // the original limit/offset path through redb is faithful.
-    let fetch_limit = if has_filters { 1_000 } else { limit };
-    let fetch_offset = if has_filters { 0 } else { query.offset };
-
-    let raw_events = state
-        .tx_db
-        .list_audit_by_resource(&pool_pda_str, fetch_limit, fetch_offset)
-        .map_err(|e| ApiError::internal(format!("failed to query audit events: {e}")))?;
-
-    let event_type_filter: Option<Vec<String>> = query.event_type.as_ref().map(|s| {
-        s.split(',')
-            .map(|t| t.trim().to_string())
-            .filter(|t| !t.is_empty())
-            .collect()
-    });
-
-    let from_ts = query
-        .from
-        .as_deref()
-        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-        .map(|d| d.with_timezone(&chrono::Utc));
-    let to_ts = query
-        .to
-        .as_deref()
-        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-        .map(|d| d.with_timezone(&chrono::Utc));
-
-    let filtered: Vec<AuditEvent> = raw_events
-        .into_iter()
-        .filter(|e| {
-            if let Some(types) = &event_type_filter {
-                let kind = serde_json::to_value(&e.event_type)
-                    .ok()
-                    .and_then(|v| v.as_str().map(str::to_owned))
-                    .unwrap_or_default();
-                if !types.iter().any(|t| t == &kind) {
-                    return false;
-                }
-            }
-            if let Some(actor) = query.actor.as_deref() {
-                if e.user_id.as_deref() != Some(actor) {
-                    return false;
-                }
-            }
-            if let Some(status) = query.status.as_deref() {
-                match status {
-                    "ok" | "success" if !e.success => return false,
-                    "failed" | "error" if e.success => return false,
-                    _ => {}
-                }
-            }
-            if let Some(from) = from_ts {
-                if e.timestamp < from {
-                    return false;
-                }
-            }
-            if let Some(to) = to_ts {
-                if e.timestamp > to {
-                    return false;
-                }
-            }
-            true
-        })
-        .collect();
-
-    let total_filtered = filtered.len();
-    let page: Vec<AuditEvent> = if has_filters {
-        filtered
-            .into_iter()
-            .skip(query.offset)
-            .take(limit)
-            .collect()
-    } else {
-        filtered
+    let time = |value: &Option<String>, name: &str| {
+        value
+            .as_deref()
+            .map(|s| {
+                chrono::DateTime::parse_from_rfc3339(s)
+                    .map(|d| d.with_timezone(&chrono::Utc))
+                    .map_err(|_| ApiError::bad_request(format!("{name} must be an RFC 3339 time")))
+            })
+            .transpose()
+    };
+    let filter = AuditFilter {
+        event_types: query
+            .event_type
+            .as_deref()
+            .map(|s| {
+                s.split(',')
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        actor: query.actor.clone().filter(|a| !a.is_empty()),
+        success: match query.status.as_deref() {
+            Some("ok" | "success") => Some(true),
+            Some("failed" | "error") => Some(false),
+            _ => None,
+        },
+        from: time(&query.from, "from")?,
+        to: time(&query.to, "to")?,
     };
 
-    // When no filters are active the redb count is the authoritative total;
-    // with filters we report the count of matching rows we scanned (capped
-    // at fetch_limit).
-    let total = if has_filters {
-        total_filtered
-    } else {
-        state
-            .tx_db
-            .count_audit_by_resource(&pool_pda_str)
-            .unwrap_or(0)
-    };
+    // The cursor is bound to the pool and the filters it was issued for.
+    let scope = format!(
+        "audit:{pool_pda_str}:{}:{}:{}:{}:{}",
+        query.event_type.as_deref().unwrap_or(""),
+        query.actor.as_deref().unwrap_or(""),
+        query.status.as_deref().unwrap_or(""),
+        query.from.as_deref().unwrap_or(""),
+        query.to.as_deref().unwrap_or(""),
+    );
+    let page = state.storage.page_from(&scope, query.cursor.as_deref())?;
+    let got = state
+        .storage
+        .audit()
+        .pool_events(&pool_pda_str, &filter, query.limit.clamp(1, 200), page)
+        .await?;
 
     Ok(Json(PoolAuditResponse {
         pool_pda: pool_pda_str,
-        events: page,
-        total,
+        events: got.items,
+        next_cursor: got
+            .next
+            .map(|next| state.storage.sign_cursor(&scope, &next)),
     }))
 }
 
@@ -1375,11 +1319,13 @@ pub async fn pool_summary(
         });
     }
 
-    // Recent audit events (last 10 for this pool, from redb).
-    let recent_events: Vec<AuditEvent> = state
-        .tx_db
-        .list_audit_by_resource(&pool_pda_str, 10, 0)
-        .unwrap_or_default();
+    // The pool's 10 most recent audit events.
+    let recent_events = state
+        .storage
+        .audit()
+        .pool_events(&pool_pda_str, &AuditFilter::default(), 10, None)
+        .await?
+        .items;
 
     let state_str = match meta.state {
         PoolState::NeedsInit => "needs_init",
@@ -1431,9 +1377,8 @@ pub async fn list_pools_by_wallet(
     Query(pagination): Query<super::PaginationQuery>,
 ) -> Result<Json<PoolsByWalletResponse>, ApiError> {
     // Verify wallet ownership.
-    let repo = WalletRepository::new(&state.storage);
-    let wallet = repo.get(&wallet_id)?;
-    crate::storage::ownership::OwnershipEnforcer::verify_ownership(&wallet, &token.sub)?;
+    let wallet = super::load_wallet(&state, &wallet_id).await?;
+    super::enforce_owner(&wallet, &token.sub)?;
 
     // O(k) lookup via redb index (no dir scan).
     let metas = state

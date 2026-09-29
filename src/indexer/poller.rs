@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Relational Network
 
-//! Polling loop that fetches new Solana transaction signatures for watched
-//! addresses and upserts them into the [`TxDatabase`].
+//! Fetches new Solana transaction signatures for our wallets' addresses and
+//! stores them in each wallet's history.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,9 +14,11 @@ use tokio::time::interval;
 use tracing::{debug, info, warn};
 
 use crate::blockchain::SolanaClient;
-use crate::storage::repository::transactions::{StoredTransaction, TokenType, TxStatus};
+use crate::storage::transactions::{StoredTransaction, TokenType, TxStatus};
 use crate::storage::tx_cache::TxCache;
-use crate::storage::tx_database::TxDatabase;
+use crate::storage::Storage;
+
+type PollError = Box<dyn std::error::Error + Send + Sync>;
 
 /// Start the background indexer.
 ///
@@ -24,7 +26,7 @@ use crate::storage::tx_database::TxDatabase;
 /// Call from `main` after building `AppState`.
 pub fn spawn_indexer(
     solana: Arc<SolanaClient>,
-    tx_db: Arc<TxDatabase>,
+    storage: Arc<Storage>,
     tx_cache: Arc<TxCache>,
     poll_interval: Duration,
 ) {
@@ -37,58 +39,46 @@ pub fn spawn_indexer(
 
         loop {
             ticker.tick().await;
-            if let Err(e) = poll_once(&solana, &tx_db, &tx_cache).await {
+            if let Err(e) = poll_once(&solana, &storage, &tx_cache).await {
                 warn!(error = %e, "Indexer poll cycle failed");
             }
         }
     });
 }
 
-/// Trigger a one-shot sync for a single address.
-///
-/// Respects a per-address cooldown (`SYNC_COOLDOWN_SECS`) to prevent
-/// expensive repeated RPC calls on rapid page loads.
+/// Sync one address on demand, unless any worker synced it within the
+/// cooldown (`SYNC_COOLDOWN_SECS`), which stops repeated RPC calls on rapid
+/// page loads.
 pub async fn sync_address_once(
     solana: &SolanaClient,
-    tx_db: &TxDatabase,
+    storage: &Storage,
     tx_cache: &Arc<TxCache>,
     address: &str,
     wallet_id: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Check sync cooldown.
-    let cooldown_key = format!("last_sync_ts:{address}");
-    if let Ok(Some(ts_bytes)) = tx_db.get_indexer_state(&cooldown_key) {
-        if let Ok(ts_str) = std::str::from_utf8(&ts_bytes) {
-            if let Ok(last_ts) = ts_str.parse::<i64>() {
-                let now = Utc::now().timestamp();
-                if now - last_ts < crate::config::SYNC_COOLDOWN_SECS as i64 {
-                    debug!(address = %address, "Sync cooldown active — skipping RPC call");
-                    return Ok(());
-                }
-            }
-        }
-    }
-
-    poll_address(solana, tx_db, tx_cache, address, wallet_id).await?;
-
-    // Update cooldown timestamp.
-    let now_str = Utc::now().timestamp().to_string();
-    tx_db.set_indexer_state(&cooldown_key, now_str.as_bytes())?;
-
+) -> Result<(), PollError> {
+    let cooldown = chrono::Duration::seconds(crate::config::SYNC_COOLDOWN_SECS as i64);
+    let Some(claim) = storage.transactions().claim_sync(address, cooldown).await? else {
+        debug!(address = %address, "Sync cooldown active — skipping RPC call");
+        return Ok(());
+    };
+    let until = claim.until.clone();
+    let newest = poll_address(solana, storage, address, wallet_id, until.as_deref()).await?;
+    storage.transactions().finish_sync(claim, newest).await?;
+    tx_cache.invalidate(wallet_id);
     Ok(())
 }
 
 /// Single poll cycle: iterate all registered addresses and fetch new sigs.
 async fn poll_once(
     solana: &SolanaClient,
-    tx_db: &TxDatabase,
+    storage: &Storage,
     tx_cache: &Arc<TxCache>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let addresses = tx_db.get_all_addresses()?;
+) -> Result<(), PollError> {
+    let addresses = storage.wallets().addresses().await?;
     debug!(address_count = addresses.len(), "Indexer polling addresses");
 
     for (address, wallet_id) in &addresses {
-        if let Err(e) = poll_address(solana, tx_db, tx_cache, address, wallet_id).await {
+        if let Err(e) = sync_address_once(solana, storage, tx_cache, address, wallet_id).await {
             warn!(address = %address, error = %e, "Failed to poll address");
         }
     }
@@ -96,32 +86,25 @@ async fn poll_once(
     Ok(())
 }
 
-/// Poll a single address for new transaction signatures.
+/// Fetch signatures newer than `until` for one address and store the
+/// transactions. Returns the newest signature seen.
 async fn poll_address(
     solana: &SolanaClient,
-    tx_db: &TxDatabase,
-    tx_cache: &Arc<TxCache>,
+    storage: &Storage,
     address: &str,
     wallet_id: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    until: Option<&str>,
+) -> Result<Option<String>, PollError> {
     let pubkey = Pubkey::from_str(address)?;
-
-    // Get last-seen signature for this address (to avoid re-fetching).
-    let state_key = format!("last_sig:{address}");
-    let last_sig = tx_db.get_indexer_state(&state_key)?;
-    let until_sig = last_sig
-        .as_deref()
-        .and_then(|bytes| std::str::from_utf8(bytes).ok())
-        .map(String::from);
 
     // Fetch recent signatures via JSON-RPC.
     let sigs = solana
         .rpc()
-        .get_signatures_for_address(&pubkey, None, until_sig.as_deref(), Some(50), "confirmed")
+        .get_signatures_for_address(&pubkey, None, until, Some(50), "confirmed")
         .await?;
 
     if sigs.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
 
     debug!(
@@ -130,18 +113,19 @@ async fn poll_address(
         "Indexer found new signatures"
     );
 
-    let mut newest_sig: Option<String> = None;
+    // The first signature in the list is the most recent.
+    let newest_sig = sigs.first().map(|s| s.signature.clone());
 
     for sig_info in &sigs {
         let sig_str = &sig_info.signature;
 
-        // Track the newest signature (first in the list = most recent).
-        if newest_sig.is_none() {
-            newest_sig = Some(sig_str.clone());
-        }
-
         // Skip if we already have this tx.
-        if tx_db.get_transaction(sig_str)?.is_some() {
+        if storage
+            .transactions()
+            .get(wallet_id, sig_str)
+            .await?
+            .is_some()
+        {
             continue;
         }
 
@@ -197,8 +181,10 @@ async fn poll_address(
 
                 // Resolve counterparty wallet_id if the other address is registered.
                 let counterparty_addr = if is_sender { &to_addr } else { &from_addr };
-                let counterparty_wallet_id = tx_db
-                    .get_wallet_id_for_address(counterparty_addr)
+                let counterparty_wallet_id = storage
+                    .wallets()
+                    .wallet_id_for_address(counterparty_addr)
+                    .await
                     .ok()
                     .flatten();
 
@@ -225,9 +211,11 @@ async fn poll_address(
 
                 // Determine direction: if this address is the fee payer, it's "sent".
                 let direction = if is_sender { "sent" } else { "received" };
-                let directions = vec![(address.to_string(), direction)];
-
-                if let Err(e) = tx_db.upsert_transaction(&stored, &directions) {
+                if let Err(e) = storage
+                    .transactions()
+                    .upsert(wallet_id, &stored, direction)
+                    .await
+                {
                     warn!(sig = %sig_str, error = %e, "Failed to store indexed tx");
                 }
             }
@@ -237,13 +225,5 @@ async fn poll_address(
         }
     }
 
-    // Update the last-seen signature.
-    if let Some(newest) = newest_sig {
-        tx_db.set_indexer_state(&state_key, newest.as_bytes())?;
-    }
-
-    // Invalidate tx cache for this address so queries see fresh data.
-    tx_cache.invalidate(address);
-
-    Ok(())
+    Ok(newest_sig)
 }

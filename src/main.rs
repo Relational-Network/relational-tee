@@ -48,7 +48,8 @@ use utoipa::{openapi::security::SecurityScheme, Modify, OpenApi};
 use utoipa_swagger_ui::SwaggerUi;
 
 use config::{
-    avs_jwks_url, KeyProviderConfig, ServerConfig, Transport, AVS_AUDIENCE, MAX_BODY_SIZE,
+    avs_jwks_url, KeyProviderConfig, ServerConfig, StorageConfig, Transport, AVS_AUDIENCE,
+    MAX_BODY_SIZE,
 };
 
 use handlers::{admin_status, get_public_key, AdminStatusResponse};
@@ -161,10 +162,10 @@ Protected endpoints require a JWT issued by the Attestation Verification Service
         api::admin::AuditEventsResponse,
         api::admin::WalletStatusChangeResponse,
         // Shared domain types
-        storage::repository::wallets::WalletResponse,
-        storage::repository::transactions::StoredTransaction,
-        storage::repository::transactions::TokenType,
-        storage::repository::transactions::TxStatus,
+        storage::wallets::WalletResponse,
+        storage::transactions::StoredTransaction,
+        storage::transactions::TokenType,
+        storage::transactions::TxStatus,
         blockchain::types::TokenBalance,
         blockchain::types::SendResult,
         // DRT schemas (new contract)
@@ -199,6 +200,7 @@ Protected endpoints require a JWT issued by the Attestation Verification Service
         api::credentials::IssuanceLogResponse,
         // Audit schemas
         storage::audit::AuditEvent,
+        storage::audit::AuditEventView,
         storage::audit::AuditEventType,
     )),
     modifiers(&SecurityAddon),
@@ -310,6 +312,31 @@ fn providers(config: &KeyProviderConfig) -> (Arc<dyn KeyProvider>, Arc<dyn Attes
     }
 }
 
+/// Open the configured stores. Azure storage gets any missing container or
+/// table created.
+async fn open_storage(
+    config: &StorageConfig,
+    keys: storage::StorageKeys,
+    worker_id: String,
+) -> Result<storage::Storage, String> {
+    match config {
+        StorageConfig::Azure(azure) => {
+            let store = Arc::new(storage::azure::AzureStore::new(azure)?);
+            store
+                .ensure_layout()
+                .await
+                .map_err(|e| format!("preparing storage at {}: {e}", azure.blob_url))?;
+            info!(blob = %azure.blob_url, table = %azure.table_url, "Storage ready");
+            Ok(storage::Storage::new(store.clone(), store, keys, worker_id))
+        }
+        #[cfg(feature = "dev")]
+        StorageConfig::Memory => {
+            warn!("STORAGE_BACKEND=memory: state is lost when the worker stops (dev builds only)");
+            Ok(storage::Storage::in_memory(keys, worker_id))
+        }
+    }
+}
+
 /// Service entrypoint: read configuration, build the router, and serve.
 #[tokio::main]
 async fn main() {
@@ -354,17 +381,31 @@ async fn main() {
     ));
     attestation.spawn_refresher(attestation_provider);
 
-    // Initialize local storage.
+    // Encrypted Blob and Table storage, with keys derived from storage-root.
+    let worker_id = uuid::Uuid::new_v4().to_string();
+    info!(worker_id = %worker_id, "Worker identity for this process");
+    let storage = open_storage(
+        &server_config.storage,
+        storage::StorageKeys::derive(&keys.get(KeyName::StorageRoot).current),
+        worker_id,
+    )
+    .await
+    .unwrap_or_else(|e| {
+        tracing::error!("Storage unavailable: {e}");
+        std::process::exit(1);
+    });
+
+    // Initialize local storage for pool files.
     let data_dir = server_config.data_dir.as_path();
     let mut encrypted_storage = storage::EncryptedStorage::new(data_dir);
     match encrypted_storage.initialize() {
         Ok(()) => warn!(
             data_dir = %data_dir.display(),
-            "Local storage is plaintext on disk: synthetic data only until encrypted Azure Storage replaces it"
+            "Pool files are plaintext on disk: synthetic data only"
         ),
         Err(e) => {
             tracing::warn!(error = %e, data_dir = %data_dir.display(),
-                "Failed to initialize local storage — wallet endpoints will be unavailable");
+                "Failed to initialize local storage — pool endpoints will be unavailable");
         }
     }
 
@@ -441,9 +482,10 @@ async fn main() {
         attestation,
         audience: AVS_AUDIENCE.to_string(),
         jwks_cache: Arc::new(tokio::sync::RwLock::new(None)),
-        storage: Arc::new(encrypted_storage),
-        solana_client: Arc::new(solana_client),
+        storage: Arc::new(storage),
+        files: Arc::new(encrypted_storage),
         tx_db,
+        solana_client: Arc::new(solana_client),
         tx_cache,
         pool_locks: Arc::new(dashmap::DashMap::new()),
     };
@@ -454,7 +496,7 @@ async fn main() {
     if indexer_enabled {
         indexer::poller::spawn_indexer(
             state.solana_client.clone(),
-            state.tx_db.clone(),
+            state.storage.clone(),
             state.tx_cache.clone(),
             std::time::Duration::from_secs(indexer_interval_secs),
         );

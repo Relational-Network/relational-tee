@@ -24,11 +24,10 @@ use utoipa::IntoParams;
 
 use crate::error::ApiError;
 use crate::state::AppState;
-use crate::storage::ownership::OwnershipEnforcer;
-use crate::storage::repository::wallets::{WalletMetadata, WalletRepository, WalletStatus};
+use crate::storage::wallets::{WalletMetadata, WalletStatus};
 
 // ============================================================================
-// Shared pagination query
+// Shared pagination queries
 // ============================================================================
 
 /// Reusable pagination query parameters (limit + offset).
@@ -53,6 +52,47 @@ impl PaginationQuery {
     }
 }
 
+/// Cursor pagination: pass the previous response's `next_cursor` as
+/// `cursor` to get the next page. Cursors are signed, and any worker
+/// accepts them.
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct CursorQuery {
+    /// `next_cursor` from the previous page; omit for the first page.
+    pub cursor: Option<String>,
+    /// Maximum number of items to return (default 50, max 200).
+    #[serde(default = "default_page_limit")]
+    pub limit: usize,
+}
+
+impl CursorQuery {
+    /// Clamp limit to `[1, 200]`.
+    pub fn clamped_limit(&self) -> usize {
+        self.limit.clamp(1, 200)
+    }
+}
+
+/// Reject callers who don't own the wallet.
+pub(crate) fn enforce_owner(wallet: &WalletMetadata, caller_sub: &str) -> Result<(), ApiError> {
+    if wallet.owner_user_id != caller_sub {
+        tracing::warn!(wallet_id = %wallet.wallet_id, caller = %caller_sub, "Caller doesn't own the wallet");
+        return Err(ApiError::forbidden("you do not own this resource"));
+    }
+    Ok(())
+}
+
+/// Load a wallet, or 404.
+pub(crate) async fn load_wallet(
+    state: &AppState,
+    wallet_id: &str,
+) -> Result<WalletMetadata, ApiError> {
+    state
+        .storage
+        .wallets()
+        .get(wallet_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found(format!("wallet {wallet_id} not found")))
+}
+
 /// Check that the caller owns the wallet and the wallet is not deleted/suspended.
 ///
 /// Shared helper used by balance, transaction, and other wallet-scoped endpoints.
@@ -60,7 +100,7 @@ pub(crate) fn enforce_owner_active(
     wallet: &WalletMetadata,
     caller_sub: &str,
 ) -> Result<(), ApiError> {
-    wallet.verify_ownership(caller_sub)?;
+    enforce_owner(wallet, caller_sub)?;
     if wallet.status == WalletStatus::Deleted {
         return Err(ApiError::not_found(format!(
             "wallet {} not found",
@@ -76,21 +116,20 @@ pub(crate) fn enforce_owner_active(
     Ok(())
 }
 
-/// Resolve the active wallet for a user via the O(1) redb index.
+/// Resolve the active wallet for a user through the owner index.
 ///
 /// Returns `(WalletMetadata)` if the user has an active wallet,
 /// or an `ApiError` if no wallet found or wallet is not active.
-pub(crate) fn get_active_wallet_for_user(
+pub(crate) async fn get_active_wallet_for_user(
     state: &AppState,
     user_id: &str,
 ) -> Result<WalletMetadata, ApiError> {
-    let wallet_id = state
-        .tx_db
-        .get_wallet_id_by_owner(user_id)?
-        .ok_or_else(|| ApiError::bad_request("no wallet found for user"))?;
-
-    let repo = WalletRepository::new(&state.storage);
-    let meta = repo.get(&wallet_id)?;
+    let wallets = state.storage.wallets();
+    let meta = match wallets.wallet_id_for_owner(user_id).await? {
+        Some(wallet_id) => wallets.get(&wallet_id).await?,
+        None => None,
+    }
+    .ok_or_else(|| ApiError::bad_request("no wallet found for user"))?;
 
     if meta.status != WalletStatus::Active {
         return Err(ApiError::bad_request("wallet is not active"));

@@ -24,45 +24,6 @@ impl StoragePaths {
         &self.root
     }
 
-    // ── Wallets ──────────────────────────────────────────────────
-
-    /// `{data_dir}/wallets/`
-    pub fn wallets_dir(&self) -> PathBuf {
-        self.root.join("wallets")
-    }
-
-    /// `{data_dir}/wallets/{wallet_id}/`
-    pub fn wallet_dir(&self, wallet_id: &str) -> PathBuf {
-        self.wallets_dir().join(wallet_id)
-    }
-
-    /// `{data_dir}/wallets/{wallet_id}/meta.json`
-    pub fn wallet_meta(&self, wallet_id: &str) -> PathBuf {
-        self.wallet_dir(wallet_id).join("meta.json")
-    }
-
-    /// `{data_dir}/wallets/{wallet_id}/keypair.json`
-    pub fn wallet_keypair(&self, wallet_id: &str) -> PathBuf {
-        self.wallet_dir(wallet_id).join("keypair.json")
-    }
-
-    // ── Audit ────────────────────────────────────────────────────
-
-    /// `{data_dir}/audit/`
-    pub fn audit_dir(&self) -> PathBuf {
-        self.root.join("audit")
-    }
-
-    /// `{data_dir}/audit/{date}.jsonl` (e.g., `2026-02-24.jsonl`).
-    pub fn audit_events_file(&self, date: &str) -> PathBuf {
-        self.audit_dir().join(format!("{date}.jsonl"))
-    }
-
-    /// `{data_dir}/audit/.hmac-key`
-    pub fn audit_hmac_key(&self) -> PathBuf {
-        self.audit_dir().join(".hmac-key")
-    }
-
     // ── Pools ─────────────────────────────────────────────────────
 
     /// `{data_dir}/pools/`

@@ -10,6 +10,7 @@ use std::env;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 
+use crate::storage::azure::{AzureConfig, CredentialConfig};
 use crate::tee::skr::SkrConfig;
 
 // ============================================================================
@@ -90,6 +91,22 @@ pub const DEFAULT_MAA_ENDPOINT: &str = "sharedweu.weu.attest.azure.net";
 #[cfg(feature = "dev")]
 const DEV_KEY_VAULT_URL: &str = "https://dev.vault.azure.net";
 
+/// Where durable state lives (`STORAGE_BACKEND`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StorageConfig {
+    /// `azure`: Azure Blob and Table storage (in dev builds, also `azurite`).
+    Azure(AzureConfig),
+    /// `memory`: in memory, lost when the worker stops. Dev builds only.
+    #[cfg(feature = "dev")]
+    Memory,
+}
+
+/// Azurite's default endpoints, for `STORAGE_BACKEND=azurite`.
+#[cfg(feature = "dev")]
+pub const AZURITE_BLOB_URL: &str = "http://127.0.0.1:10000/devstoreaccount1";
+#[cfg(feature = "dev")]
+pub const AZURITE_TABLE_URL: &str = "http://127.0.0.1:10002/devstoreaccount1";
+
 /// Process configuration read once from the environment at startup.
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -97,11 +114,13 @@ pub struct ServerConfig {
     pub data_dir: PathBuf,
     pub transport: Transport,
     pub keys: KeyProviderConfig,
+    pub storage: StorageConfig,
 }
 
 impl ServerConfig {
-    /// Read `BIND_ADDR`, `PORT`, `DATA_DIR`, `TLS_CERT_PATH`, `TLS_KEY_PATH`
-    /// and the key provider settings (see [`key_provider_from_lookup`]).
+    /// Read `BIND_ADDR`, `PORT`, `DATA_DIR`, `TLS_CERT_PATH`, `TLS_KEY_PATH`,
+    /// and the key provider and storage settings (see
+    /// [`key_provider_from_lookup`] and [`storage_from_lookup`]).
     pub fn from_env() -> Result<Self, String> {
         Self::from_lookup(|key| env::var(key).ok().filter(|v| !v.is_empty()))
     }
@@ -146,7 +165,60 @@ impl ServerConfig {
             data_dir,
             transport,
             keys: key_provider_from_lookup(&lookup)?,
+            storage: storage_from_lookup(&lookup)?,
         })
+    }
+}
+
+/// Read `STORAGE_BACKEND` and its settings: `STORAGE_BLOB_URL`,
+/// `STORAGE_TABLE_URL` and `MANAGED_IDENTITY_CLIENT_ID` for `azure`. Dev
+/// builds add `azurite` (Azurite's dev account, default endpoints on
+/// localhost) and `memory`, their default; release builds have only `azure`,
+/// and require HTTPS endpoints.
+fn storage_from_lookup(lookup: &impl Fn(&str) -> Option<String>) -> Result<StorageConfig, String> {
+    #[cfg(feature = "dev")]
+    let default = "memory";
+    #[cfg(not(feature = "dev"))]
+    let default = "azure";
+
+    match lookup("STORAGE_BACKEND").as_deref().unwrap_or(default) {
+        "azure" => {
+            let url = |name: &str| {
+                lookup(name).ok_or_else(|| format!("{name} is required when STORAGE_BACKEND=azure"))
+            };
+            let (blob_url, table_url) = (url("STORAGE_BLOB_URL")?, url("STORAGE_TABLE_URL")?);
+            #[cfg(not(feature = "dev"))]
+            for (name, value) in [
+                ("STORAGE_BLOB_URL", &blob_url),
+                ("STORAGE_TABLE_URL", &table_url),
+            ] {
+                if !value.starts_with("https://") {
+                    return Err(format!("{name} must be an https:// URL"));
+                }
+            }
+            Ok(StorageConfig::Azure(AzureConfig {
+                blob_url,
+                table_url,
+                credential: CredentialConfig::ManagedIdentity {
+                    client_id: lookup("MANAGED_IDENTITY_CLIENT_ID"),
+                },
+            }))
+        }
+        #[cfg(feature = "dev")]
+        "azurite" => Ok(StorageConfig::Azure(AzureConfig {
+            blob_url: lookup("STORAGE_BLOB_URL").unwrap_or_else(|| AZURITE_BLOB_URL.into()),
+            table_url: lookup("STORAGE_TABLE_URL").unwrap_or_else(|| AZURITE_TABLE_URL.into()),
+            credential: CredentialConfig::AzuriteDevAccount,
+        })),
+        #[cfg(feature = "dev")]
+        "memory" => Ok(StorageConfig::Memory),
+        #[cfg(not(feature = "dev"))]
+        other @ ("azurite" | "memory") => Err(format!(
+            "STORAGE_BACKEND={other} isn't available: release builds contain only azure"
+        )),
+        other => Err(format!(
+            "STORAGE_BACKEND {other:?} is unknown: use azure, azurite or memory"
+        )),
     }
 }
 
@@ -410,15 +482,40 @@ mod tests {
         })
     }
 
+    /// Settings a release build requires.
+    const RELEASE_BASE: [(&str, &str); 5] = [
+        ("TLS_CERT_PATH", "c"),
+        ("TLS_KEY_PATH", "k"),
+        ("KEY_VAULT_URL", "kv.vault.azure.net"),
+        ("STORAGE_BLOB_URL", "https://acct.blob.core.windows.net"),
+        ("STORAGE_TABLE_URL", "https://acct.table.core.windows.net"),
+    ];
+
+    /// `extra` followed by [`RELEASE_BASE`]; the first match wins, so `extra`
+    /// overrides the base.
+    fn complete(extra: &[(&'static str, &'static str)]) -> Result<ServerConfig, String> {
+        let mut vars = extra.to_vec();
+        vars.extend(RELEASE_BASE);
+        config_from(&vars)
+    }
+
+    /// [`RELEASE_BASE`] without the named settings.
+    #[cfg(not(feature = "dev"))]
+    fn base_without(names: &[&str]) -> Vec<(&'static str, &'static str)> {
+        RELEASE_BASE
+            .into_iter()
+            .filter(|(k, _)| !names.contains(k))
+            .collect()
+    }
+
     #[test]
     fn server_config_reads_overrides() {
-        let config = config_from(&[
+        let config = complete(&[
             ("BIND_ADDR", "::1"),
             ("PORT", "9443"),
             ("DATA_DIR", "/var/lib/rt"),
             ("TLS_CERT_PATH", "cert.pem"),
             ("TLS_KEY_PATH", "key.pem"),
-            ("KEY_VAULT_URL", "kv.vault.azure.net"),
         ])
         .expect("valid config");
         assert_eq!(config.addr, "[::1]:9443".parse().unwrap());
@@ -436,9 +533,8 @@ mod tests {
     fn server_config_rejects_half_a_tls_pair_and_bad_values() {
         assert!(config_from(&[("TLS_CERT_PATH", "cert.pem")]).is_err());
         assert!(config_from(&[("TLS_KEY_PATH", "key.pem")]).is_err());
-        let tls = [("TLS_CERT_PATH", "c"), ("TLS_KEY_PATH", "k")];
-        assert!(config_from(&[tls[0], tls[1], ("PORT", "http")]).is_err());
-        assert!(config_from(&[tls[0], tls[1], ("BIND_ADDR", "localhost")]).is_err());
+        assert!(complete(&[("PORT", "http")]).is_err());
+        assert!(complete(&[("BIND_ADDR", "localhost")]).is_err());
     }
 
     #[cfg(feature = "dev")]
@@ -453,22 +549,16 @@ mod tests {
     #[cfg(not(feature = "dev"))]
     #[test]
     fn release_build_requires_tls() {
-        let vault = ("KEY_VAULT_URL", "kv.vault.azure.net");
-        assert!(config_from(&[vault]).is_err());
-        let config =
-            config_from(&[RELEASE_TLS[0], RELEASE_TLS[1], vault]).expect("release config with TLS");
+        assert!(config_from(&base_without(&["TLS_CERT_PATH", "TLS_KEY_PATH"])).is_err());
+        let config = complete(&[]).expect("release config with TLS");
         assert_eq!(config.addr, "0.0.0.0:8443".parse().unwrap());
         assert_eq!(config.data_dir, PathBuf::from("/data"));
     }
 
-    const RELEASE_TLS: [(&str, &str); 2] = [("TLS_CERT_PATH", "c"), ("TLS_KEY_PATH", "k")];
-
     #[test]
     #[allow(clippy::infallible_destructuring_match)] // release builds have only the skr provider
     fn skr_settings_are_read_as_bare_hosts() {
-        let config = config_from(&[
-            RELEASE_TLS[0],
-            RELEASE_TLS[1],
+        let config = complete(&[
             ("KEY_PROVIDER", "skr"),
             ("SKR_ENDPOINT", "http://127.0.0.1:9000"),
             ("MAA_ENDPOINT", "https://sharedweu.weu.attest.azure.net/"),
@@ -492,16 +582,8 @@ mod tests {
 
     #[test]
     fn skr_settings_reject_bad_values() {
-        // The first match wins, so `extra` overrides the defaults after it.
-        let with = |extra: (&str, &str)| {
-            config_from(&[
-                extra,
-                RELEASE_TLS[0],
-                RELEASE_TLS[1],
-                ("KEY_PROVIDER", "skr"),
-                ("KEY_VAULT_URL", "kv.vault.azure.net"),
-            ])
-        };
+        let with =
+            |extra: (&'static str, &'static str)| complete(&[extra, ("KEY_PROVIDER", "skr")]);
         assert!(with(("PORT", "9443")).is_ok());
         assert!(with(("KEY_NAMES", "a,b,c")).is_err());
         assert!(with(("SKR_ENDPOINT", "https://localhost:9000")).is_err());
@@ -509,9 +591,35 @@ mod tests {
         assert!(with(("KEY_PROVIDER", "vault")).is_err());
     }
 
+    #[test]
+    #[allow(clippy::infallible_destructuring_match)] // release builds have only the azure backend
+    fn azure_storage_uses_the_managed_identity() {
+        let config = complete(&[
+            ("STORAGE_BACKEND", "azure"),
+            (
+                "MANAGED_IDENTITY_CLIENT_ID",
+                "00000000-0000-0000-0000-000000000001",
+            ),
+        ])
+        .expect("valid config");
+        let azure = match config.storage {
+            StorageConfig::Azure(azure) => azure,
+            #[cfg(feature = "dev")]
+            other => panic!("expected azure storage, got {other:?}"),
+        };
+        assert_eq!(azure.blob_url, "https://acct.blob.core.windows.net");
+        assert_eq!(
+            azure.credential,
+            CredentialConfig::ManagedIdentity {
+                client_id: Some("00000000-0000-0000-0000-000000000001".into())
+            }
+        );
+        assert!(complete(&[("STORAGE_BACKEND", "s3")]).is_err());
+    }
+
     #[cfg(feature = "dev")]
     #[test]
-    fn dev_build_defaults_to_local_dev_keys() {
+    fn dev_build_defaults_to_local_dev_keys_and_memory_storage() {
         let config = config_from(&[]).expect("dev defaults");
         assert_eq!(
             config.keys,
@@ -519,30 +627,36 @@ mod tests {
                 dir: PathBuf::from("dev/keys")
             }
         );
+        assert_eq!(config.storage, StorageConfig::Memory);
+        let azurite = config_from(&[("STORAGE_BACKEND", "azurite")]).unwrap();
+        assert_eq!(
+            azurite.storage,
+            StorageConfig::Azure(AzureConfig {
+                blob_url: AZURITE_BLOB_URL.into(),
+                table_url: AZURITE_TABLE_URL.into(),
+                credential: CredentialConfig::AzuriteDevAccount,
+            })
+        );
     }
 
     #[cfg(not(feature = "dev"))]
     #[test]
-    fn release_build_rejects_the_local_key_provider() {
-        let err = config_from(&[RELEASE_TLS[0], RELEASE_TLS[1], ("KEY_PROVIDER", "local")])
-            .expect_err("local isn't compiled in");
+    fn release_build_rejects_dev_providers_and_plain_http_storage() {
+        let err = complete(&[("KEY_PROVIDER", "local")]).expect_err("local isn't compiled in");
         assert!(err.contains("KEY_PROVIDER=local"), "{err}");
+        assert!(complete(&[("STORAGE_BACKEND", "memory")]).is_err());
+        assert!(complete(&[("STORAGE_BACKEND", "azurite")]).is_err());
+        assert!(complete(&[("STORAGE_BLOB_URL", "http://acct.blob.core.windows.net")]).is_err());
+        assert!(config_from(&base_without(&["STORAGE_TABLE_URL"])).is_err());
     }
 
     #[cfg(not(feature = "dev"))]
     #[test]
     fn release_build_requires_a_vault_and_a_loopback_sidecar() {
-        assert!(config_from(&[RELEASE_TLS[0], RELEASE_TLS[1]]).is_err());
-        let vault = ("KEY_VAULT_URL", "kv.vault.azure.net");
-        let config = config_from(&[RELEASE_TLS[0], RELEASE_TLS[1], vault]).expect("skr default");
+        assert!(config_from(&base_without(&["KEY_VAULT_URL"])).is_err());
+        let config = complete(&[]).expect("skr default");
         assert!(matches!(config.keys, KeyProviderConfig::Skr(_)));
-        assert!(config_from(&[
-            RELEASE_TLS[0],
-            RELEASE_TLS[1],
-            vault,
-            ("SKR_ENDPOINT", "http://10.0.0.5:9000")
-        ])
-        .is_err());
+        assert!(complete(&[("SKR_ENDPOINT", "http://10.0.0.5:9000")]).is_err());
     }
 
     #[test]

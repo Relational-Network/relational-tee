@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
-use hyper::{header, Method, Request, StatusCode};
+use hyper::{header, HeaderMap, Method, Request, StatusCode};
 use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use hyper_util::rt::TokioExecutor;
@@ -122,7 +122,8 @@ impl HttpClient {
             .map_err(|e| HttpError::new(format!("request failed: {e}")))?;
 
         let status = resp.status();
-        let collected = tokio::time::timeout(self.timeout, resp.into_body().collect())
+        let (parts, body) = resp.into_parts();
+        let collected = tokio::time::timeout(self.timeout, body.collect())
             .await
             .map_err(|_| HttpError::new("timed out reading the response body"))?
             .map_err(|e| HttpError::new(format!("read response body: {e}")))?
@@ -130,6 +131,7 @@ impl HttpClient {
 
         Ok(Response {
             status,
+            headers: parts.headers,
             body: collected,
         })
     }
@@ -194,6 +196,7 @@ impl Default for HttpClient {
 /// Fully-buffered HTTP response.
 pub struct Response {
     status: StatusCode,
+    headers: HeaderMap,
     body: Bytes,
 }
 
@@ -204,6 +207,16 @@ impl Response {
 
     pub fn is_success(&self) -> bool {
         self.status.is_success()
+    }
+
+    /// A response header, if present and valid ASCII.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers.get(name).and_then(|v| v.to_str().ok())
+    }
+
+    /// Consume the response, returning the raw body.
+    pub fn into_body(self) -> Bytes {
+        self.body
     }
 
     /// Consume the response, returning the body as a UTF-8 string.

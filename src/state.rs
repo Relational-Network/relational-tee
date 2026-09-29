@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Relational Network
 
-//! Extended application state with wallet service dependencies.
+//! Shared application state.
 
 use std::sync::Arc;
 
@@ -10,7 +10,7 @@ use crate::auth::JwksCache;
 use crate::blockchain::SolanaClient;
 use crate::storage::tx_cache::TxCache;
 use crate::storage::tx_database::TxDatabase;
-use crate::storage::EncryptedStorage;
+use crate::storage::{EncryptedStorage, Storage};
 use crate::tee::WorkerKeys;
 
 /// Shared application state passed to every handler via Axum's `State` extractor.
@@ -27,13 +27,17 @@ pub struct AppState {
     /// Cached AVS JWKS keys for token verification.
     pub jwks_cache: Arc<tokio::sync::RwLock<Option<JwksCache>>>,
 
-    // ── Wallet service ──────────────────────────────────────────
-    /// Encrypted filesystem for wallet metadata + keypairs.
-    pub storage: Arc<EncryptedStorage>,
+    // ── Storage ─────────────────────────────────────────────────
+    /// Encrypted Blob and Table storage: wallets, transactions, audit.
+    pub storage: Arc<Storage>,
+    /// Local files for pool metadata and datasets.
+    pub files: Arc<EncryptedStorage>,
+    /// Embedded database (redb) for pool indexes.
+    pub tx_db: Arc<TxDatabase>,
+
+    // ── Chain ───────────────────────────────────────────────────
     /// Solana RPC client.
     pub solana_client: Arc<SolanaClient>,
-    /// Embedded transaction database (redb). Required — enclave panics if init fails.
-    pub tx_db: Arc<TxDatabase>,
     /// LRU cache for first-page tx queries.
     pub tx_cache: Arc<TxCache>,
 

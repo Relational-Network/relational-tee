@@ -1,27 +1,36 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Relational Network
 
-//! Audit event logging (daily JSONL append) with HMAC integrity.
+//! The audit log.
 //!
-//! Each day's events are written to `{data_dir}/audit/{YYYY-MM-DD}.jsonl`.
-//! Events are **appended** (never overwritten) for tamper-evident logging.
-//! An HMAC-SHA256 tag is computed over each event's canonical JSON so that
-//! any post-hoc modification of the log file is detectable.
+//! Each event carries an HMAC-SHA256 tag over its canonical JSON (the event
+//! with `hmac` unset, fields in declaration order), under a key derived from
+//! `storage-root`, so every worker can verify every event.
+//!
+//! - **Write:** append the encrypted line to this worker's hourly append blob
+//!   `audit/{yyyy}/{mm}/{dd}/{hh}/{worker_id}.jsonl`, then insert the index
+//!   rows in Table `audit`: `{pool_pda}` (or `global`) and `date:{yyyy-mm-dd}`,
+//!   both with row key `{inverted_ts}:{event_id}`. An existing row means a
+//!   duplicate, which is ignored.
+//! - **Read:** queries use the index, and every returned event is verified.
+//!   An event that fails comes back with `hmac_valid: false` and raises an
+//!   alert; it is never silently dropped.
 
-use std::sync::OnceLock;
-
-use chrono::{DateTime, Utc};
-use hmac::{Hmac, Mac};
-use p256::elliptic_curve::rand_core::{OsRng, RngCore};
+use bytes::Bytes;
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
-use tokio::io::AsyncWriteExt;
-use tracing::warn;
+use tracing::{error, warn};
 
-use super::encrypted_fs::EncryptedStorage;
+use super::store::{
+    Container, Continuation, Entity, Filter, InsertOutcome, Page, Prop, RkRange, StoreError, Table,
+};
+use super::{inverted_millis, Storage};
+
+const PAYLOAD_VERSION: u32 = 1;
+const GLOBAL_PK: &str = "global";
 
 /// Categories of auditable events.
-#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditEventType {
     WalletCreated,
@@ -39,15 +48,22 @@ pub enum AuditEventType {
     CredentialIssuanceFailed,
     CredentialRevoked,
     RoleAssigned,
-    // ── DRT marketplace events ───────────────────────────────────
-    DrtPurchased,
-    DrtRedeemed,
     SchemaUploaded,
     // ── DRT grant lifecycle (new contract) ───────────────────────
     RightGranted,
     RightRevoked,
     // ── DRT execution (analyst runs a script in the enclave) ─────
     DrtExecuted,
+}
+
+impl AuditEventType {
+    /// The snake_case name, as serialized.
+    pub fn as_str(&self) -> String {
+        serde_json::to_value(self)
+            .ok()
+            .and_then(|v| v.as_str().map(String::from))
+            .unwrap_or_default()
+    }
 }
 
 /// A single audit event.
@@ -76,49 +92,6 @@ pub struct AuditEvent {
     /// Pool PDA for pool-scoped events (previously buried in `details` JSON).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pool_pda: Option<String>,
-}
-
-type HmacSha256 = Hmac<Sha256>;
-
-/// Stable 32-byte HMAC key, persisted at `{data_dir}/audit/.hmac-key`.
-///
-/// On first call the key is loaded from disk (or generated and saved if the
-/// file does not yet exist).  The result is cached for the lifetime of the
-/// process so the file is read at most once.
-static AUDIT_HMAC_KEY: OnceLock<[u8; 32]> = OnceLock::new();
-
-fn audit_hmac_key(key_path: &std::path::Path) -> [u8; 32] {
-    *AUDIT_HMAC_KEY.get_or_init(|| {
-        // Try to read an existing key.
-        if let Ok(bytes) = std::fs::read(key_path) {
-            if bytes.len() == 32 {
-                let mut key = [0u8; 32];
-                key.copy_from_slice(&bytes);
-                return key;
-            }
-            warn!("Corrupt audit HMAC key file ({} bytes) — regenerating", bytes.len());
-        }
-
-        // Generate a fresh key and persist it.
-        let mut key = [0u8; 32];
-        OsRng.fill_bytes(&mut key);
-
-        if let Some(parent) = key_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Err(e) = std::fs::write(key_path, key) {
-            tracing::error!(error = %e, "Failed to persist audit HMAC key — events will not survive restart");
-        }
-        key
-    })
-}
-
-/// Compute HMAC-SHA256 of a canonical JSON blob.
-fn compute_hmac(key_path: &std::path::Path, json_bytes: &[u8]) -> String {
-    let key = audit_hmac_key(key_path);
-    let mut mac = HmacSha256::new_from_slice(&key).expect("HMAC can take key of any size");
-    mac.update(json_bytes);
-    hex::encode(mac.finalize().into_bytes())
 }
 
 impl AuditEvent {
@@ -167,149 +140,406 @@ impl AuditEvent {
         self.pool_pda = Some(pda.into());
         self
     }
+
+    /// The JSON the tag covers: the event with `hmac` unset.
+    fn canonical(&self) -> Vec<u8> {
+        let mut unsigned = self.clone();
+        unsigned.hmac = None;
+        serde_json::to_vec(&unsigned).expect("audit events serialize")
+    }
 }
 
-use super::tx_database::TxDatabase;
-
-/// Writes [`AuditEvent`]s to daily JSONL files and optionally to redb.
-pub struct AuditRepository<'a> {
-    storage: &'a EncryptedStorage,
-    tx_db: Option<&'a TxDatabase>,
+/// An event as read back, with the result of its integrity check.
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+pub struct AuditEventView {
+    #[serde(flatten)]
+    pub event: AuditEvent,
+    /// `false` if the event's tag or its row failed verification.
+    pub hmac_valid: bool,
 }
 
-impl<'a> AuditRepository<'a> {
-    pub fn new(storage: &'a EncryptedStorage) -> Self {
-        Self {
-            storage,
-            tx_db: None,
+/// Filters for a pool's events. Empty fields match everything.
+#[derive(Debug, Clone, Default)]
+pub struct AuditFilter {
+    /// Any of these event types (snake_case).
+    pub event_types: Vec<String>,
+    /// Events by this user.
+    pub actor: Option<String>,
+    pub success: Option<bool>,
+    /// Inclusive time bounds.
+    pub from: Option<DateTime<Utc>>,
+    pub to: Option<DateTime<Utc>>,
+}
+
+/// The audit log.
+pub struct AuditLog<'a> {
+    s: &'a Storage,
+}
+
+fn blob_path(at: DateTime<Utc>, worker_id: &str) -> String {
+    format!("{}/{worker_id}.jsonl", at.format("%Y/%m/%d/%H"))
+}
+
+fn date_pk(date: NaiveDate) -> String {
+    format!("date:{}", date.format("%Y-%m-%d"))
+}
+
+impl<'a> AuditLog<'a> {
+    pub(crate) fn new(s: &'a Storage) -> Self {
+        Self { s }
+    }
+
+    fn actor_hash(&self, user_id: &str) -> String {
+        self.s.keys().index_hash(user_id)
+    }
+
+    /// Record an event. Failures are logged and never returned: auditing
+    /// must not block the request that caused the event.
+    pub async fn log(&self, event: AuditEvent) {
+        let event_id = event.event_id.clone();
+        if let Err(e) = self.try_log(event).await {
+            error!(event_id = %event_id, error = %e, "Audit event not stored");
         }
     }
 
-    /// Attach a `TxDatabase` reference for dual-write to redb audit tables.
-    pub fn with_tx_db(mut self, tx_db: &'a TxDatabase) -> Self {
-        self.tx_db = Some(tx_db);
-        self
+    async fn try_log(&self, mut event: AuditEvent) -> Result<(), StoreError> {
+        event.hmac = Some(self.s.keys().audit_tag(&event.canonical()));
+        let signed = zeroize::Zeroizing::new(
+            serde_json::to_vec(&event).map_err(|e| StoreError::Invalid(e.to_string()))?,
+        );
+
+        let path = blob_path(event.timestamp, self.s.worker_id());
+        let line = self
+            .s
+            .keys()
+            .seal_log_line(Container::Audit, &path, &event.event_id, &signed);
+        self.s
+            .objects()
+            .append(Container::Audit, &path, Bytes::from(line))
+            .await?;
+
+        let rk = format!("{}:{}", inverted_millis(event.timestamp), event.event_id);
+        let partition = event.pool_pda.clone().unwrap_or_else(|| GLOBAL_PK.into());
+        for pk in [partition, date_pk(event.timestamp.date_naive())] {
+            let mut row = self
+                .s
+                .sealed_row(Table::Audit, &pk, &rk, PAYLOAD_VERSION, &event)?
+                .with("event_type", Prop::Str(event.event_type.as_str()))
+                .with("success", Prop::Bool(event.success));
+            if let Some(user) = &event.user_id {
+                row = row.with("actor_h", Prop::Str(self.actor_hash(user)));
+            }
+            if self.s.index().insert(Table::Audit, row).await? == InsertOutcome::Conflict {
+                warn!(event_id = %event.event_id, pk = %pk, "Duplicate audit index row ignored");
+            }
+        }
+        Ok(())
     }
 
-    /// Append an event to today's audit log.
-    ///
-    /// The HMAC tag is computed over the canonical JSON (with the `hmac` field
-    /// absent), then the full event including `hmac` is serialised and appended.
-    ///
-    /// Errors are logged but **not** propagated — audit logging must never
-    /// block business logic.
-    pub async fn log(&self, event: &AuditEvent) {
-        let date = event.timestamp.format("%Y-%m-%d").to_string();
-        let path = self.storage.paths().audit_events_file(&date);
-
-        // Ensure audit directory exists.
-        if let Some(parent) = path.parent() {
-            let _ = tokio::fs::create_dir_all(parent).await;
+    /// One page of a pool's events, newest first.
+    pub async fn pool_events(
+        &self,
+        pool_pda: &str,
+        filter: &AuditFilter,
+        limit: usize,
+        page: Option<Continuation>,
+    ) -> Result<Page<AuditEventView>, StoreError> {
+        let mut clauses = Vec::new();
+        if !filter.event_types.is_empty() {
+            clauses.push(Filter::Or(
+                filter
+                    .event_types
+                    .iter()
+                    .map(|t| Filter::eq("event_type", Prop::Str(t.clone())))
+                    .collect(),
+            ));
         }
+        if let Some(actor) = &filter.actor {
+            clauses.push(Filter::eq("actor_h", Prop::Str(self.actor_hash(actor))));
+        }
+        if let Some(success) = filter.success {
+            clauses.push(Filter::eq("success", Prop::Bool(success)));
+        }
+        // Row keys sort newest first: `to` bounds the start, `from` the end.
+        let range = RkRange::between(
+            filter.to.map(inverted_millis),
+            filter
+                .from
+                .map(|from| format!("{};", inverted_millis(from))),
+        );
+        let filter = (!clauses.is_empty()).then_some(Filter::And(clauses));
+        self.events(pool_pda, range, filter, limit, page).await
+    }
 
-        // Compute the HMAC tag once over the canonical (hmac-less) JSON,
-        // then write the **signed** event to both stores so the redb copy
-        // also carries the tag — list_audit_by_resource returns whatever
-        // bytes redb holds.
-        let mut canonical = event.clone();
-        canonical.hmac = None;
-        let signed = match serde_json::to_string(&canonical) {
-            Ok(canonical_json) => {
-                let mut signed = event.clone();
-                signed.hmac = Some(compute_hmac(
-                    &self.storage.paths().audit_hmac_key(),
-                    canonical_json.as_bytes(),
-                ));
-                signed
+    /// One page of a day's events across all pools, newest first.
+    pub async fn day_events(
+        &self,
+        date: NaiveDate,
+        limit: usize,
+        page: Option<Continuation>,
+    ) -> Result<Page<AuditEventView>, StoreError> {
+        self.events(&date_pk(date), RkRange::all(), None, limit, page)
+            .await
+    }
+
+    async fn events(
+        &self,
+        pk: &str,
+        range: RkRange,
+        filter: Option<Filter>,
+        limit: usize,
+        page: Option<Continuation>,
+    ) -> Result<Page<AuditEventView>, StoreError> {
+        let rows = self
+            .s
+            .query_rows(Table::Audit, pk, range, filter, limit, page)
+            .await?;
+        Ok(Page {
+            items: rows
+                .items
+                .iter()
+                .filter_map(|row| self.verify(row))
+                .collect(),
+            next: rows.next,
+        })
+    }
+
+    /// Decrypt a row and check the event's tag, and that the row's keys and
+    /// plaintext properties agree with the event.
+    fn verify(&self, row: &Entity) -> Option<AuditEventView> {
+        match self
+            .s
+            .open_row::<AuditEvent>(Table::Audit, PAYLOAD_VERSION, row)
+        {
+            Ok(event) => {
+                let tag_valid = event
+                    .hmac
+                    .as_deref()
+                    .is_some_and(|tag| self.s.keys().audit_tag_valid(&event.canonical(), tag));
+                let row_matches = row.rk.ends_with(&format!(":{}", event.event_id))
+                    && row.str("event_type") == Some(event.event_type.as_str().as_str())
+                    && row.bool("success") == Some(event.success)
+                    && row.str("actor_h").map(String::from)
+                        == event.user_id.as_deref().map(|u| self.actor_hash(u));
+                let hmac_valid = tag_valid && row_matches;
+                if !hmac_valid {
+                    error!(alert = "audit_integrity", event_id = %event.event_id, pk = %row.pk,
+                        tag_valid, row_matches, "Audit event failed its integrity check");
+                }
+                Some(AuditEventView { event, hmac_valid })
             }
             Err(e) => {
-                warn!(error = %e, "Failed to serialize audit event for HMAC");
-                return;
-            }
-        };
-
-        match serde_json::to_string(&signed) {
-            Ok(mut line) => {
-                line.push('\n');
-                match tokio::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&path)
-                    .await
-                {
-                    Ok(mut f) => {
-                        if let Err(e) = f.write_all(line.as_bytes()).await {
-                            warn!(error = %e, path = %path.display(), "Failed to write audit event");
-                        }
-                    }
-                    Err(e) => {
-                        warn!(error = %e, path = %path.display(), "Failed to open audit log file");
-                    }
-                }
-            }
-            Err(e) => warn!(error = %e, "Failed to serialize signed audit event"),
-        }
-
-        // Dual-write: persist the signed event to redb audit tables.
-        if let Some(tx_db) = self.tx_db {
-            if let Err(e) = tx_db.log_audit_event(&signed) {
-                warn!(error = %e, event_id = %event.event_id, "Failed to write audit event to redb");
+                error!(alert = "audit_integrity", pk = %row.pk, rk = %row.rk, error = %e,
+                    "Audit row failed its integrity check");
+                self.stub(row, &e)
             }
         }
     }
 
-    /// Read only events with a valid HMAC for the given date.
-    ///
-    /// Events missing an HMAC or whose tag does not verify are excluded.
-    #[allow(dead_code)] //TODO
-    pub fn read_verified_events(&self, date: &str) -> Vec<AuditEvent> {
-        let path = self.storage.paths().audit_events_file(date);
-        let data = match std::fs::read_to_string(&path) {
-            Ok(d) => d,
-            Err(_) => return Vec::new(),
-        };
-        data.lines()
-            .filter_map(|line| {
-                let event: AuditEvent = serde_json::from_str(line).ok()?;
-                let tag = event.hmac.as_ref()?;
-                let mut canonical = event.clone();
-                canonical.hmac = None;
-                let canonical_json = serde_json::to_string(&canonical).ok()?;
-                let expected = compute_hmac(
-                    &self.storage.paths().audit_hmac_key(),
-                    canonical_json.as_bytes(),
-                );
-                if tag == &expected {
-                    Some(event)
-                } else {
-                    warn!(
-                        event_id = %event.event_id,
-                        "Audit event HMAC mismatch — excluding"
-                    );
-                    None
-                }
-            })
-            .collect()
+    /// What the plaintext row still tells us about an event whose payload
+    /// doesn't decrypt.
+    fn stub(&self, row: &Entity, e: &StoreError) -> Option<AuditEventView> {
+        let (inverted, event_id) = row.rk.split_once(':')?;
+        let millis = u64::MAX - u64::from_str_radix(inverted, 16).ok()?;
+        let event_type = serde_json::from_value(serde_json::Value::String(
+            row.str("event_type")?.to_string(),
+        ))
+        .ok()?;
+        let mut event = AuditEvent::new(event_type);
+        event.event_id = event_id.to_string();
+        event.timestamp = DateTime::from_timestamp_millis(millis as i64)?;
+        event.success = row.bool("success").unwrap_or(false);
+        event.details = Some(serde_json::json!({ "integrity_error": e.to_string() }));
+        Some(AuditEventView {
+            event,
+            hmac_valid: false,
+        })
     }
 }
 
-/// Convenience macro for fire-and-forget audit logging.
-///
-/// Must be called from inside an async context (handler). The `.await` is
-/// non-blocking because it uses `tokio::fs` internally.
+/// Record an audit event from a handler. Never fails the request.
 ///
 /// ```rust,ignore
-/// audit_log!(storage, tx_db, AuditEventType::WalletCreated, "user_123", "wallet", "wallet_456");
+/// audit_log!(state, AuditEventType::WalletCreated, &user_id, "wallet", &wallet_id);
 /// ```
 #[macro_export]
 macro_rules! audit_log {
-    ($storage:expr, $tx_db:expr, $event_type:expr, $user_id:expr, $resource_type:expr, $resource_id:expr) => {{
-        let repo = $crate::storage::audit::AuditRepository::new($storage).with_tx_db($tx_db);
-        repo.log(
-            &$crate::storage::audit::AuditEvent::new($event_type)
-                .with_user($user_id)
-                .with_resource($resource_type, $resource_id),
-        )
-        .await;
+    ($state:expr, $event_type:expr, $user_id:expr, $resource_type:expr, $resource_id:expr) => {{
+        $state
+            .storage
+            .audit()
+            .log(
+                $crate::storage::audit::AuditEvent::new($event_type)
+                    .with_user($user_id)
+                    .with_resource($resource_type, $resource_id),
+            )
+            .await;
     }};
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::memory::MemoryStore;
+    use crate::storage::StorageKeys;
+    use crate::tee::tests::fixed_key;
+    use std::sync::Arc;
+
+    fn storage() -> (Storage, Arc<MemoryStore>) {
+        let store = Arc::new(MemoryStore::new());
+        let s = Storage::new(
+            store.clone(),
+            store.clone(),
+            StorageKeys::derive(&fixed_key(1)),
+            "worker-a".into(),
+        );
+        (s, store)
+    }
+
+    fn pool_event(kind: AuditEventType, user: &str, at_millis: i64) -> AuditEvent {
+        let mut event = AuditEvent::new(kind)
+            .with_user(user)
+            .with_resource("drt_pool", "Pool1")
+            .with_pool_pda("Pool1");
+        event.timestamp = DateTime::from_timestamp_millis(at_millis).unwrap();
+        event
+    }
+
+    #[tokio::test]
+    async fn events_are_logged_encrypted_indexed_and_verified() {
+        let (s, store) = storage();
+        let audit = s.audit();
+        audit
+            .log(pool_event(AuditEventType::PoolCreated, "alice", 1_000))
+            .await;
+        audit
+            .log(pool_event(AuditEventType::CredentialIssued, "bob", 2_000))
+            .await;
+        audit
+            .log(AuditEvent::new(AuditEventType::AdminAccess).with_user("alice"))
+            .await;
+
+        let all = audit
+            .pool_events("Pool1", &AuditFilter::default(), 10, None)
+            .await
+            .unwrap();
+        let kinds: Vec<_> = all
+            .items
+            .iter()
+            .map(|v| v.event.event_type.clone())
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                AuditEventType::CredentialIssued,
+                AuditEventType::PoolCreated
+            ]
+        );
+        assert!(all.items.iter().all(|v| v.hmac_valid));
+
+        let by_bob = AuditFilter {
+            actor: Some("bob".into()),
+            ..Default::default()
+        };
+        let got = audit.pool_events("Pool1", &by_bob, 10, None).await.unwrap();
+        assert_eq!(got.items.len(), 1);
+        let issued_only = AuditFilter {
+            event_types: vec!["pool_created".into()],
+            to: DateTime::from_timestamp_millis(1_500),
+            ..Default::default()
+        };
+        let got = audit
+            .pool_events("Pool1", &issued_only, 10, None)
+            .await
+            .unwrap();
+        assert_eq!(got.items.len(), 1);
+
+        let day = audit
+            .day_events(NaiveDate::from_ymd_opt(1970, 1, 1).unwrap(), 10, None)
+            .await
+            .unwrap();
+        assert_eq!(day.items.len(), 2);
+
+        // The blob holds one encrypted line per event, which opens and verifies.
+        let path = blob_path(DateTime::from_timestamp_millis(1_000).unwrap(), "worker-a");
+        let blob = s
+            .objects()
+            .get(Container::Audit, &path)
+            .await
+            .unwrap()
+            .unwrap();
+        let text = String::from_utf8(blob.body.to_vec()).unwrap();
+        assert_eq!(text.lines().count(), 2);
+        assert!(!text.contains("alice"));
+        for line in text.lines() {
+            let (_, plain) = s
+                .keys()
+                .open_log_line(Container::Audit, &path, line)
+                .unwrap();
+            let event: AuditEvent = serde_json::from_slice(&plain).unwrap();
+            assert!(s
+                .keys()
+                .audit_tag_valid(&event.canonical(), event.hmac.as_deref().unwrap()));
+        }
+        drop(store);
+    }
+
+    #[tokio::test]
+    async fn tampered_rows_come_back_flagged_not_dropped() {
+        let (s, store) = storage();
+        let audit = s.audit();
+        audit
+            .log(pool_event(AuditEventType::PoolCreated, "alice", 1_000))
+            .await;
+        audit
+            .log(pool_event(AuditEventType::CredentialIssued, "alice", 2_000))
+            .await;
+        let rows = s
+            .query_all(Table::Audit, "Pool1", RkRange::all(), None)
+            .await
+            .unwrap();
+
+        // Flip a plaintext filter property.
+        store.tamper_row(Table::Audit, "Pool1", &rows[0].rk, |props| {
+            props.insert("success".into(), Prop::Bool(false));
+        });
+        // Corrupt the other row's payload.
+        store.tamper_row(Table::Audit, "Pool1", &rows[1].rk, |props| {
+            if let Some(Prop::Bin(payload)) = props.get_mut("payload") {
+                payload[20] ^= 1;
+            }
+        });
+
+        let got = audit
+            .pool_events("Pool1", &AuditFilter::default(), 10, None)
+            .await
+            .unwrap();
+        assert_eq!(got.items.len(), 2);
+        assert!(got.items.iter().all(|v| !v.hmac_valid));
+        assert_eq!(got.items[1].event.event_type, AuditEventType::PoolCreated);
+    }
+
+    #[tokio::test]
+    async fn a_tampered_log_line_fails_to_open() {
+        let (s, store) = storage();
+        s.audit()
+            .log(pool_event(AuditEventType::PoolCreated, "alice", 1_000))
+            .await;
+        let path = blob_path(DateTime::from_timestamp_millis(1_000).unwrap(), "worker-a");
+        store.tamper_blob(Container::Audit, &path, |bytes| {
+            let i = bytes.len() - 10;
+            bytes[i] = if bytes[i] == b'A' { b'B' } else { b'A' };
+        });
+        let blob = s
+            .objects()
+            .get(Container::Audit, &path)
+            .await
+            .unwrap()
+            .unwrap();
+        let line = String::from_utf8(blob.body.to_vec()).unwrap();
+        assert!(s
+            .keys()
+            .open_log_line(Container::Audit, &path, line.trim_end())
+            .is_err());
+    }
 }
