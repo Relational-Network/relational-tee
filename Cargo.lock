@@ -1580,6 +1580,7 @@ dependencies = [
  "bytes",
  "chrono",
  "csv",
+ "futures-util",
  "hex",
  "hkdf",
  "hmac",

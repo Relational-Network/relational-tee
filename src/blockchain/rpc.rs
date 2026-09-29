@@ -329,11 +329,7 @@ impl JsonRpcClient {
             return Err(RpcError::new(format!("transaction {signature} not found")));
         }
 
-        Ok(TransactionDetail {
-            slot: result["slot"].as_u64().unwrap_or(0),
-            meta: parse_tx_meta(&result["meta"]),
-            transaction: parse_tx_envelope(&result["transaction"]),
-        })
+        Ok(parse_transaction(&result))
     }
 
     /// `getSignaturesForAddress` → recent signatures.
@@ -392,13 +388,14 @@ pub struct TokenAmountInfo {
 #[derive(Debug)]
 pub struct TransactionDetail {
     pub slot: u64,
+    /// Unix seconds, when the node knows it.
+    pub block_time: Option<i64>,
     pub meta: Option<TransactionMeta>,
     pub transaction: TransactionEnvelope,
 }
 
 /// Transaction metadata (fee, logs, balances, etc.).
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct TransactionMeta {
     pub fee: u64,
     pub log_messages: Vec<String>,
@@ -407,6 +404,21 @@ pub struct TransactionMeta {
     pub pre_balances: Vec<u64>,
     /// Post-transaction balances (in lamports) for each account in account_keys order.
     pub post_balances: Vec<u64>,
+    /// SPL token balances before and after, for the token accounts involved.
+    pub pre_token_balances: Vec<TokenBalanceEntry>,
+    pub post_token_balances: Vec<TokenBalanceEntry>,
+}
+
+/// One token account's balance in `preTokenBalances` or `postTokenBalances`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenBalanceEntry {
+    pub account_index: u64,
+    pub mint: String,
+    /// The wallet that owns the token account.
+    pub owner: Option<String>,
+    /// In the token's smallest units.
+    pub amount: u128,
+    pub decimals: u8,
 }
 
 /// Parsed transaction envelope (account keys for fee-payer extraction).
@@ -432,11 +444,44 @@ pub struct SignatureInfo {
 // Helpers
 // ============================================================================
 
+/// A `getTransaction` result in `jsonParsed` encoding.
+pub fn parse_transaction(result: &Value) -> TransactionDetail {
+    TransactionDetail {
+        slot: result["slot"].as_u64().unwrap_or(0),
+        block_time: result["blockTime"].as_i64(),
+        meta: parse_tx_meta(&result["meta"]),
+        transaction: parse_tx_envelope(&result["transaction"]),
+    }
+}
+
+fn parse_token_balances(v: &Value) -> Vec<TokenBalanceEntry> {
+    v.as_array()
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|e| {
+                    Some(TokenBalanceEntry {
+                        account_index: e["accountIndex"].as_u64()?,
+                        mint: e["mint"].as_str()?.to_string(),
+                        owner: e["owner"].as_str().map(String::from),
+                        amount: e["uiTokenAmount"]["amount"].as_str()?.parse().ok()?,
+                        decimals: e["uiTokenAmount"]["decimals"]
+                            .as_u64()
+                            .and_then(|d| u8::try_from(d).ok())?,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn parse_tx_meta(v: &Value) -> Option<TransactionMeta> {
     if v.is_null() {
         return None;
     }
     Some(TransactionMeta {
+        pre_token_balances: parse_token_balances(&v["preTokenBalances"]),
+        post_token_balances: parse_token_balances(&v["postTokenBalances"]),
         fee: v["fee"].as_u64().unwrap_or(0),
         log_messages: v["logMessages"]
             .as_array()

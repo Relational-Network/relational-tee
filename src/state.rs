@@ -9,7 +9,7 @@ use crate::attestation::Attestation;
 use crate::auth::JwksCache;
 use crate::blockchain::SolanaClient;
 use crate::health::Health;
-use crate::storage::tx_cache::TxCache;
+use crate::history::History;
 use crate::storage::Storage;
 use crate::tee::WorkerKeys;
 
@@ -36,8 +36,8 @@ pub struct AppState {
     // ── Chain ───────────────────────────────────────────────────
     /// Solana RPC client.
     pub solana_client: Arc<SolanaClient>,
-    /// LRU cache for first-page tx queries.
-    pub tx_cache: Arc<TxCache>,
+    /// Wallet history pages and parsed transactions, read from the chain.
+    pub history: Arc<History>,
 }
 
 #[cfg(test)]
@@ -66,7 +66,7 @@ impl AppState {
                 unreachable,
                 crate::blockchain::types::devnet_config(unreachable),
             )),
-            tx_cache: Arc::new(TxCache::new(8, std::time::Duration::from_secs(30))),
+            history: Arc::new(History::new(8, std::time::Duration::from_secs(30), 8)),
         }
     }
 }

@@ -342,30 +342,17 @@ pub fn solana_network() -> String {
 }
 
 // ============================================================================
-// Background Indexer
+// Transaction history
 // ============================================================================
 
-/// Whether the background tx indexer runs continuously.
-///
-/// Hardcoded to `false` — transaction updates are pulled on-demand by API
-/// handlers.  Flip to `true` and rebuild to enable continuous polling.
-pub const INDEXER_ENABLED: bool = false;
-
-/// Tx indexer poll interval in seconds (when enabled).
-pub const INDEXER_POLL_INTERVAL_SECS: u64 = 60;
-
-/// Minimum seconds between on-demand Solana RPC syncs for the same address.
-///
-/// Prevents expensive repeated RPC calls on rapid page loads.
-/// After syncing an address, subsequent requests within this window
-/// skip the RPC call and return the stored history.
-pub const SYNC_COOLDOWN_SECS: u64 = 10;
-
-/// LRU cache capacity (number of wallet first-pages cached).
+/// History pages cached per worker.
 pub const TX_CACHE_CAPACITY: usize = 128;
 
-/// LRU cache entry TTL (seconds).
+/// How long a cached history page is served (seconds).
 pub const TX_CACHE_TTL_SECS: u64 = 30;
+
+/// Parsed transactions cached per worker, by signature.
+pub const TX_DETAIL_CACHE_CAPACITY: usize = 1024;
 
 // ============================================================================
 // Storage

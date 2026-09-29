@@ -70,19 +70,17 @@ pub enum Table {
     Records,
     Revocations,
     Wallets,
-    Transactions,
     Audit,
     Idempotency,
     Identities,
 }
 
 impl Table {
-    pub const ALL: [Table; 8] = [
+    pub const ALL: [Table; 7] = [
         Table::Pools,
         Table::Records,
         Table::Revocations,
         Table::Wallets,
-        Table::Transactions,
         Table::Audit,
         Table::Idempotency,
         Table::Identities,
@@ -94,7 +92,6 @@ impl Table {
             Table::Records => "records",
             Table::Revocations => "revocations",
             Table::Wallets => "wallets",
-            Table::Transactions => "transactions",
             Table::Audit => "audit",
             Table::Idempotency => "idempotency",
             Table::Identities => "identities",

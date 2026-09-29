@@ -60,6 +60,7 @@ hyper-util = { version = "0.1", default-features = false, features = ["client-le
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1"] }
 http-body-util = { version = "0.1", default-features = false }
 bytes = { version = "1", default-features = false }
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 rustls-pemfile = { version = "2", default-features = false, features = ["std"] }
 webpki-roots = { version = "1", default-features = false }
 

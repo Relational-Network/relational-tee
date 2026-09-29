@@ -7,27 +7,26 @@
 //! - `POST /v1/wallets/{id}/send`                  — sign & broadcast transfer
 //! - `GET  /v1/wallets/{id}/transactions`           — list tx history
 //! - `GET  /v1/wallets/{id}/transactions/{sig}`     — single tx status
+//!
+//! History is read from Solana on demand (see [`crate::history`]).
 
 use axum::{
     extract::{Path, Query, State},
     Json,
 };
-use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use solana_pubkey::Pubkey;
 use std::str::FromStr;
-use tracing::{info, warn};
+use tracing::info;
 use utoipa::{IntoParams, ToSchema};
 
 use crate::audit_log;
 use crate::auth::UserToken;
 use crate::blockchain::signing::keypair_from_bytes_verified;
 use crate::error::ApiError;
-use crate::indexer;
+use crate::history::{WalletRef, WalletTransaction};
 use crate::state::AppState;
 use crate::storage::audit::AuditEventType;
-use crate::storage::transactions::{StoredTransaction, TokenType, TxStatus};
-use crate::storage::tx_cache::FirstPage;
 
 use super::{enforce_owner_active, load_wallet};
 
@@ -86,31 +85,17 @@ pub struct SendTransactionResponse {
 /// Query params for listing transactions.
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct ListTransactionsQuery {
-    /// `next_cursor` from the previous page; any worker accepts it.
+    /// `next_cursor` from the previous page: the last signature it showed.
     pub cursor: Option<String>,
     /// Max items per page (default 20, max 100).
     pub limit: Option<usize>,
 }
 
-/// The cursor scope of a wallet's transaction list.
-fn tx_scope(wallet_id: &str) -> String {
-    format!("tx:{wallet_id}")
-}
-
-/// Single transaction in the list.
-#[derive(Debug, Serialize, ToSchema)]
-pub struct TransactionEntry {
-    #[serde(flatten)]
-    pub tx: StoredTransaction,
-    /// Whether the wallet was sender or receiver.
-    pub direction: String,
-}
-
-/// Paginated transaction list response.
+/// One page of a wallet's history, newest first.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ListTransactionsResponse {
-    pub transactions: Vec<TransactionEntry>,
-    /// If present, pass as `cursor` in the next request to get more results.
+    pub transactions: Vec<WalletTransaction>,
+    /// Present when the page is full; pass it as `cursor` for the next one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
 }
@@ -118,7 +103,7 @@ pub struct ListTransactionsResponse {
 /// Single transaction status response.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct TransactionStatusResponse {
-    pub transaction: StoredTransaction,
+    pub transaction: WalletTransaction,
 }
 
 // ============================================================================
@@ -215,22 +200,19 @@ pub async fn send_transaction(
     let keypair_bytes = state.storage.wallets().read_keypair(&wallet_id).await?;
     let keypair = keypair_from_bytes_verified(&keypair_bytes, &wallet.public_address)?;
 
-    // Determine token type and send.
-    let (result, token_type) = if payload.token == "native" {
-        let r = state
+    let result = if payload.token == "native" {
+        state
             .solana_client
             .send_native(&keypair, &payload.recipient, payload.amount)
-            .await?;
-        (r, TokenType::Native)
+            .await?
     } else if let Some(mint) = payload.token.strip_prefix("spl:") {
         let decimals = payload
             .decimals
             .ok_or_else(|| ApiError::bad_request("decimals required for SPL transfers"))?;
-        let r = state
+        state
             .solana_client
             .send_spl_token(&keypair, &payload.recipient, mint, payload.amount, decimals)
-            .await?;
-        (r, TokenType::SplToken(mint.to_string()))
+            .await?
     } else {
         return Err(ApiError::bad_request(
             "invalid token type — use \"native\" or \"spl:{mint}\"",
@@ -244,52 +226,8 @@ pub async fn send_transaction(
         amount = payload.amount,
         "Transaction sent"
     );
-
-    // Store transaction in database.
-    {
-        let now = Utc::now();
-        let stored = StoredTransaction {
-            signature: result.signature.clone(),
-            wallet_id: wallet_id.clone(),
-            counterparty_wallet_id: None,
-            from: wallet.public_address.clone(),
-            to: payload.recipient.clone(),
-            amount: payload.amount.to_string(),
-            amount_lamports: Some(payload.amount),
-            token: token_type,
-            network: state.solana_client.network().name.to_string(),
-            status: TxStatus::Confirmed,
-            slot: None,
-            fee_lamports: None,
-            explorer_url: result.explorer_url.clone(),
-            created_at: now,
-            updated_at: now,
-        };
-
-        // The recipient's history gets it too when it's one of our wallets.
-        let recipient_wallet = state
-            .storage
-            .wallets()
-            .wallet_id_for_address(&payload.recipient)
-            .await
-            .unwrap_or_else(|e| {
-                warn!(error = %e, "Recipient wallet lookup failed");
-                None
-            });
-        let mut histories = vec![(wallet_id.clone(), "sent")];
-        histories.extend(recipient_wallet.map(|id| (id, "received")));
-        for (history, direction) in histories {
-            if let Err(e) = state
-                .storage
-                .transactions()
-                .upsert(&history, &stored, direction)
-                .await
-            {
-                warn!(error = %e, wallet_id = %history, "Failed to store the transaction");
-            }
-            state.tx_cache.invalidate(&history);
-        }
-    }
+    state.history.invalidate(&wallet.public_address);
+    state.history.invalidate(&payload.recipient);
 
     audit_log!(
         state,
@@ -312,7 +250,7 @@ pub async fn send_transaction(
     path = "/v1/wallets/{wallet_id}/transactions",
     tag = "Transactions",
     summary = "List transactions",
-    description = "Cursor-paginated transaction history for a wallet.",
+    description = "The wallet's history, read from Solana, newest first. The cursor is the last signature of the previous page.",
     security(("bearer_auth" = [])),
     params(
         ("wallet_id" = String, Path, description = "Wallet UUID"),
@@ -320,9 +258,11 @@ pub async fn send_transaction(
     ),
     responses(
         (status = 200, description = "Transaction list", body = ListTransactionsResponse),
+        (status = 400, description = "Invalid cursor"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden"),
         (status = 404, description = "Wallet not found"),
+        (status = 503, description = "Solana RPC unavailable"),
     )
 )]
 pub async fn list_transactions(
@@ -335,74 +275,23 @@ pub async fn list_transactions(
     enforce_owner_active(&wallet, &token.sub)?;
 
     let limit = query.limit.unwrap_or(20).clamp(1, 100);
-    let scope = tx_scope(&wallet_id);
-    let page = state.storage.page_from(&scope, query.cursor.as_deref())?;
-    let is_first_page = page.is_none();
-
-    // Serve from cache when the caller requests the first page (no cursor).
-    if is_first_page {
-        if let Some(cached) = state.tx_cache.get_first_page(&wallet_id, limit) {
-            return Ok(Json(ListTransactionsResponse {
-                transactions: cached
-                    .items
-                    .into_iter()
-                    .map(|(tx, direction)| TransactionEntry { tx, direction })
-                    .collect(),
-                next_cursor: cached.next_cursor,
-            }));
-        }
-
-        // Pull fresh tx signatures for this wallet on demand.
-        if let Err(e) = indexer::poller::sync_address_once(
-            state.solana_client.as_ref(),
-            &state.storage,
-            &state.tx_cache,
-            &wallet.public_address,
-            &wallet_id,
-        )
-        .await
-        {
-            warn!(
-                wallet_id = %wallet_id,
-                address = %wallet.public_address,
-                error = %e,
-                "On-demand transaction sync failed"
-            );
-        }
-    }
-
-    let got = state
-        .storage
-        .transactions()
-        .list(&wallet_id, limit, page)
-        .await?;
-    let next_cursor = got
-        .next
-        .as_ref()
-        .map(|next| state.storage.sign_cursor(&scope, next));
-
-    // Populate cache for first-page results so subsequent identical requests
-    // are served without a storage query.
-    if is_first_page {
-        state.tx_cache.put_first_page(
-            &wallet_id,
-            FirstPage {
-                limit,
-                items: got.items.clone(),
-                next_cursor: next_cursor.clone(),
+    let cursor = query.cursor.as_deref().filter(|c| !c.is_empty());
+    let page = state
+        .history
+        .page(
+            &state.solana_client,
+            &WalletRef {
+                wallet_id: &wallet_id,
+                address: &wallet.public_address,
             },
-        );
-    }
-
-    let transactions: Vec<TransactionEntry> = got
-        .items
-        .into_iter()
-        .map(|(tx, direction)| TransactionEntry { tx, direction })
-        .collect();
+            cursor,
+            limit,
+        )
+        .await?;
 
     Ok(Json(ListTransactionsResponse {
-        transactions,
-        next_cursor,
+        transactions: page.items,
+        next_cursor: page.next_cursor,
     }))
 }
 
@@ -412,7 +301,7 @@ pub async fn list_transactions(
     path = "/v1/wallets/{wallet_id}/transactions/{signature}",
     tag = "Transactions",
     summary = "Get transaction",
-    description = "Get details of a single transaction by its signature.",
+    description = "One transaction that touches the wallet, read from Solana by its signature.",
     security(("bearer_auth" = [])),
     params(
         ("wallet_id" = String, Path, description = "Wallet UUID"),
@@ -433,29 +322,17 @@ pub async fn get_transaction_status(
     let wallet = load_wallet(&state, &wallet_id).await?;
     enforce_owner_active(&wallet, &token.sub)?;
 
-    // Refresh this wallet before looking up the requested signature.
-    if let Err(e) = indexer::poller::sync_address_once(
-        state.solana_client.as_ref(),
-        &state.storage,
-        &state.tx_cache,
-        &wallet.public_address,
-        &wallet_id,
-    )
-    .await
-    {
-        warn!(
-            wallet_id = %wallet_id,
-            address = %wallet.public_address,
-            error = %e,
-            "On-demand transaction sync failed"
-        );
-    }
-
-    // Only transactions in this wallet's own history are visible.
-    let (tx, _) = state
-        .storage
-        .transactions()
-        .get(&wallet_id, &signature)
+    // Only transactions that touch this wallet are visible.
+    let transaction = state
+        .history
+        .transaction(
+            &state.solana_client,
+            &WalletRef {
+                wallet_id: &wallet_id,
+                address: &wallet.public_address,
+            },
+            &signature,
+        )
         .await?
         .ok_or_else(|| {
             ApiError::not_found(format!(
@@ -463,5 +340,5 @@ pub async fn get_transaction_status(
             ))
         })?;
 
-    Ok(Json(TransactionStatusResponse { transaction: tx }))
+    Ok(Json(TransactionStatusResponse { transaction }))
 }

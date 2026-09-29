@@ -25,8 +25,8 @@ mod data_validation;
 mod error;
 mod handlers;
 mod health;
+mod history;
 mod http_client;
-mod indexer;
 mod request_id;
 mod state;
 mod storage;
@@ -162,7 +162,6 @@ Protected endpoints require a JWT issued by the Attestation Verification Service
         api::transactions::EstimateFeeResponse,
         api::transactions::SendTransactionRequest,
         api::transactions::SendTransactionResponse,
-        api::transactions::TransactionEntry,
         api::transactions::ListTransactionsResponse,
         api::transactions::TransactionStatusResponse,
         api::admin::WalletStatsResponse,
@@ -172,9 +171,9 @@ Protected endpoints require a JWT issued by the Attestation Verification Service
         api::admin::WalletStatusChangeResponse,
         // Shared domain types
         storage::wallets::WalletResponse,
-        storage::transactions::StoredTransaction,
-        storage::transactions::TokenType,
-        storage::transactions::TxStatus,
+        history::WalletTransaction,
+        history::TokenType,
+        history::TxStatus,
         blockchain::types::TokenBalance,
         blockchain::types::SendResult,
         // DRT schemas (new contract)
@@ -458,10 +457,10 @@ async fn main() {
     let solana_client =
         blockchain::SolanaClient::new(&network_config.rpc_url.clone(), network_config);
 
-    // Initialize transaction cache.
-    let tx_cache = Arc::new(storage::tx_cache::TxCache::new(
+    let history = Arc::new(history::History::new(
         config::TX_CACHE_CAPACITY,
         std::time::Duration::from_secs(config::TX_CACHE_TTL_SECS),
+        config::TX_DETAIL_CACHE_CAPACITY,
     ));
 
     // What readiness reports, kept current in the background.
@@ -485,22 +484,8 @@ async fn main() {
         jwks_cache: Arc::new(tokio::sync::RwLock::new(None)),
         storage: Arc::new(storage),
         solana_client: Arc::new(solana_client),
-        tx_cache,
+        history,
     };
-
-    // Spawn background transaction indexer only when explicitly enabled.
-    let indexer_enabled = config::INDEXER_ENABLED;
-    let indexer_interval_secs = config::INDEXER_POLL_INTERVAL_SECS;
-    if indexer_enabled {
-        indexer::poller::spawn_indexer(
-            state.solana_client.clone(),
-            state.storage.clone(),
-            state.tx_cache.clone(),
-            std::time::Duration::from_secs(indexer_interval_secs),
-        );
-    } else {
-        info!("Transaction indexer disabled; using on-demand API sync");
-    }
 
     state.health.spawn_canary(state.storage.clone());
     state.health.spawn_rpc_check(state.solana_client.clone());

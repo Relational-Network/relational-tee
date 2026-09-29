@@ -8,8 +8,7 @@
 //!   encrypts them itself.
 //! - Table `wallets`: `wallet` / `{wallet_id}` holds the metadata; the owner
 //!   index `owner:{h(user_id)}` / `wallet` holds one row per user, so a user
-//!   has at most one wallet; the address index `addr` / `{public_address}`
-//!   maps on-chain addresses back to wallets.
+//!   has at most one wallet.
 //!
 //! Status changes are compare-and-swap writes, retried a few times on
 //! conflict. Plaintext `status` and `created_at` properties are copies for
@@ -20,7 +19,6 @@ use std::time::Duration;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use tracing::warn;
 use zeroize::Zeroizing;
 
 use super::store::{
@@ -31,7 +29,6 @@ use super::Storage;
 
 const WALLET_PK: &str = "wallet";
 const OWNER_RK: &str = "wallet";
-const ADDRESS_PK: &str = "addr";
 const PAYLOAD_VERSION: u32 = 1;
 /// Compare-and-swap attempts (the first try and three retries) before a write
 /// gives up with a conflict.
@@ -148,9 +145,9 @@ impl<'a> Wallets<'a> {
     }
 
     /// Create a wallet: first claim the owner's index row (one wallet per
-    /// user), then store the keypair create-only, then the wallet and address
-    /// rows. An index row left by an interrupted create, or pointing at a
-    /// deleted wallet, is taken over.
+    /// user), then store the keypair create-only, then the wallet row. An
+    /// index row left by an interrupted create, or pointing at a deleted
+    /// wallet, is taken over.
     pub async fn create(
         &self,
         meta: &WalletMetadata,
@@ -233,14 +230,6 @@ impl<'a> Wallets<'a> {
                 meta.wallet_id
             )));
         }
-        let address_row = self.s.sealed_row(
-            Table::Wallets,
-            ADDRESS_PK,
-            &meta.public_address,
-            PAYLOAD_VERSION,
-            &pointer,
-        )?;
-        self.s.index().upsert(Table::Wallets, address_row).await?;
         Ok(CreateOutcome::Created)
     }
 
@@ -376,36 +365,6 @@ impl<'a> Wallets<'a> {
             .keys()
             .open_blob(Container::Wallets, &path, &object.body)
     }
-
-    /// The wallet that owns an on-chain address, if it's one of ours.
-    pub async fn wallet_id_for_address(&self, address: &str) -> Result<Option<String>, StoreError> {
-        Ok(self
-            .s
-            .get_sealed::<WalletPointer>(Table::Wallets, ADDRESS_PK, address, PAYLOAD_VERSION)
-            .await?
-            .map(|(pointer, _)| pointer.wallet_id))
-    }
-
-    /// Every `(address, wallet_id)` pair.
-    pub async fn addresses(&self) -> Result<Vec<(String, String)>, StoreError> {
-        let rows = self
-            .s
-            .query_all(Table::Wallets, ADDRESS_PK, RkRange::all(), None)
-            .await?;
-        let mut out = Vec::with_capacity(rows.len());
-        for row in rows {
-            match self
-                .s
-                .open_row::<WalletPointer>(Table::Wallets, PAYLOAD_VERSION, &row)
-            {
-                Ok(pointer) => out.push((row.rk.clone(), pointer.wallet_id)),
-                Err(e) => {
-                    warn!(address = %row.rk, error = %e, "Skipping an unreadable address row")
-                }
-            }
-        }
-        Ok(out)
-    }
 }
 
 #[cfg(test)]
@@ -456,14 +415,6 @@ mod tests {
         assert_eq!(
             wallets.read_keypair("w1").await.unwrap().as_slice(),
             &[7; 64]
-        );
-        assert_eq!(
-            wallets
-                .wallet_id_for_address("addr-w1")
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("w1")
         );
 
         wallets.soft_delete(&first).await.unwrap();

@@ -4,7 +4,7 @@
 //! Durable state: envelope-encrypted objects in Blob storage and rows in
 //! Table storage, behind the [`store::ObjectStore`] and [`store::IndexStore`]
 //! traits. The repositories ([`pools`], [`records`], [`revocations`],
-//! [`wallets`], [`transactions`], [`audit`]) seal everything before it
+//! [`wallets`], [`audit`]) seal everything before it
 //! reaches a store, so a storage administrator sees only ciphertext and
 //! hashed identifiers. Workers keep no durable local state.
 
@@ -31,8 +31,6 @@ pub mod pools;
 pub mod records;
 pub mod revocations;
 pub mod store;
-pub mod transactions;
-pub mod tx_cache;
 pub mod wallets;
 
 // Re-exports for convenience.
@@ -112,10 +110,6 @@ impl Storage {
 
     pub fn wallets(&self) -> wallets::Wallets<'_> {
         wallets::Wallets::new(self)
-    }
-
-    pub fn transactions(&self) -> transactions::Transactions<'_> {
-        transactions::Transactions::new(self)
     }
 
     pub fn audit(&self) -> audit::AuditLog<'_> {
