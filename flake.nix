@@ -176,8 +176,6 @@
             bacon
             just
             sccache
-            nodejs_24
-            pnpm_10
             azurite
             mkcert
             actionlint

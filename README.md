@@ -17,7 +17,7 @@ You need [Nix](https://nixos.org) with flakes, and Docker for the image builds.
 
 ```bash
 nix develop     # pinned Rust, cargo-nextest, cargo-audit, bacon, just, sccache,
-                # Node 24, pnpm 10, Azurite, mkcert, actionlint
+                # Azurite, mkcert, actionlint
 just            # list the recipes
 ```
 
@@ -27,7 +27,7 @@ just            # list the recipes
 | `just cert` | Create a locally trusted mkcert certificate in `dev/certs/`; `just dev` then serves HTTPS |
 | `just test` | Run the tests with cargo-nextest, in the release and dev configurations |
 | `just check` | Run every gate: rustfmt, clippy (`-D warnings`, with and without all features), the tests, the banned-crate check and `cargo audit` |
-| `just spa` | Run the dashboard dev server from `../iob-pilot` (override with `IOB_PILOT_DIR`) |
+| `just spa` | Run the dashboard dev server from `../iob-pilot` (override with `IOB_PILOT_DIR`), using the host's Node and pnpm |
 | `just image` | Build the canonical x86_64-linux image with Nix and load it into Docker |
 | `just image-dev` | Build the aarch64-linux dev image and load it into Docker |
 
