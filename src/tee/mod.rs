@@ -247,6 +247,11 @@ impl WorkerKeys {
             .get(&name)
             .expect("release_all holds every key name")
     }
+
+    /// The names of the keys held, for health reporting.
+    pub fn names(&self) -> impl Iterator<Item = KeyName> + '_ {
+        self.keys.keys().copied()
+    }
 }
 
 const RELEASE_ATTEMPTS: u32 = 10;
@@ -298,6 +303,25 @@ pub(crate) mod tests {
         bytes[31] = seed;
         bytes[0] = 0x42;
         EcKey::new(SecretKey::from_slice(&bytes).expect("valid scalar"))
+    }
+
+    /// Keys for tests, from fixed scalars.
+    pub(crate) fn test_keys() -> WorkerKeys {
+        let keys = KeyName::ALL
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                let current = fixed_key(i as u8 + 1);
+                (
+                    *name,
+                    ReleasedKey {
+                        current,
+                        previous: None,
+                    },
+                )
+            })
+            .collect();
+        WorkerKeys { keys }
     }
 
     fn private_jwk(key: &EcKey) -> Value {

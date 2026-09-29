@@ -16,7 +16,8 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use store::{
-    Continuation, ETag, Entity, Filter, IndexStore, ObjectStore, Page, Prop, RkRange, Table,
+    Container, Continuation, ETag, Entity, Filter, IndexStore, ObjectStore, Page, Prop, PutOutcome,
+    RkRange, Table,
 };
 
 pub mod audit;
@@ -123,6 +124,27 @@ impl Storage {
 
     pub fn worker_id(&self) -> &str {
         &self.worker_id
+    }
+
+    /// The readiness canary: a read and a conditional write of this
+    /// worker's `leases/canary/{worker_id}` blob.
+    pub async fn canary(&self) -> Result<(), StoreError> {
+        let path = format!("canary/{}", self.worker_id);
+        let now = bytes::Bytes::from(chrono::Utc::now().to_rfc3339());
+        match self.objects.get(Container::Leases, &path).await? {
+            None => match self
+                .objects
+                .put_if_absent(Container::Leases, &path, now)
+                .await?
+            {
+                PutOutcome::Created(_) | PutOutcome::AlreadyExists => Ok(()),
+            },
+            Some(current) => self
+                .objects
+                .put_if_match(Container::Leases, &path, now, &current.etag)
+                .await
+                .map(|_| ()),
+        }
     }
 
     pub(crate) fn objects(&self) -> &dyn ObjectStore {
@@ -333,6 +355,26 @@ pub(crate) mod tests {
         let mut forged = cursor.clone();
         forged.replace_range(..2, "ey");
         assert!(a.open_cursor("tx:w1", &format!("{forged}x")).is_err());
+    }
+
+    #[tokio::test]
+    async fn the_canary_reads_and_conditionally_rewrites_its_blob() {
+        let s = memory_storage();
+        s.canary().await.unwrap();
+        let first = s
+            .objects()
+            .get(Container::Leases, "canary/worker-a")
+            .await
+            .unwrap()
+            .unwrap();
+        s.canary().await.unwrap();
+        let second = s
+            .objects()
+            .get(Container::Leases, "canary/worker-a")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(first.etag, second.etag);
     }
 
     #[test]

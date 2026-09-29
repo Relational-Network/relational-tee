@@ -31,6 +31,7 @@ mod request_id;
 mod state;
 mod storage;
 mod tee;
+mod tls;
 
 use axum::{
     extract::DefaultBodyLimit,
@@ -54,7 +55,10 @@ use config::{
 };
 
 use handlers::{admin_status, get_public_key, AdminStatusResponse};
-use health::{health, liveness, readiness, HealthChecks, HealthResponse, ReadyResponse};
+use health::{
+    health, liveness, readiness, CanaryDetails, Certificate, CertificateDetails, HealthDetails,
+    HealthResponse, ReadinessResponse, RpcDetails,
+};
 use state::AppState;
 use tee::{AttestationProvider, KeyName, KeyProvider, WorkerKeys};
 
@@ -135,8 +139,11 @@ Protected endpoints require a JWT issued by the Attestation Verification Service
     ),
     components(schemas(
         HealthResponse,
-        ReadyResponse,
-        HealthChecks,
+        ReadinessResponse,
+        HealthDetails,
+        CertificateDetails,
+        CanaryDetails,
+        RpcDetails,
         AdminStatusResponse,
         error::ErrorBody,
         attestation::AttestationResponse,
@@ -457,10 +464,23 @@ async fn main() {
         std::time::Duration::from_secs(config::TX_CACHE_TTL_SECS),
     ));
 
+    // What readiness reports, kept current in the background.
+    let certificate = match &server_config.transport {
+        Transport::Tls { cert_path, .. } => Certificate::File {
+            not_after: std::fs::read(cert_path)
+                .ok()
+                .and_then(|pem| tls::leaf_not_after(&pem)),
+        },
+        #[cfg(feature = "dev")]
+        Transport::PlainHttp => Certificate::PlainHttp,
+    };
+    let health = Arc::new(health::Health::new(&keys, certificate));
+
     // Create shared application state.
     let state = AppState {
         keys: Arc::new(keys),
         attestation,
+        health,
         audience: AVS_AUDIENCE.to_string(),
         jwks_cache: Arc::new(tokio::sync::RwLock::new(None)),
         storage: Arc::new(storage),
@@ -482,18 +502,16 @@ async fn main() {
         info!("Transaction indexer disabled; using on-demand API sync");
     }
 
+    state.health.spawn_canary(state.storage.clone());
+    state.health.spawn_rpc_check(state.solana_client.clone());
+    let health = state.health.clone();
     let app = router(state);
 
     let addr = server_config.addr;
 
-    // Graceful shutdown: drain in-flight requests on SIGTERM/SIGINT.
+    // Drain on SIGTERM or SIGINT, then finish in-flight requests.
     let handle = axum_server::Handle::new();
-    let shutdown_handle = handle.clone();
-    tokio::spawn(async move {
-        shutdown_signal().await;
-        info!("Shutdown signal received, draining connections (10s)...");
-        shutdown_handle.graceful_shutdown(Some(std::time::Duration::from_secs(10)));
-    });
+    health::spawn_drain(health, handle.clone());
 
     match server_config.transport {
         Transport::Tls {
@@ -590,27 +608,69 @@ fn router(state: AppState) -> Router {
         .layer(axum::middleware::from_fn(request_id::request_context))
 }
 
-/// Wait for SIGINT (Ctrl-C) or SIGTERM for clean shutdown.
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        tokio::signal::ctrl_c()
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::{to_bytes, Body};
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    async fn get(app: &Router, path: &str) -> (StatusCode, serde_json::Value) {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
             .await
-            .expect("failed to install SIGINT handler");
-    };
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        (status, serde_json::from_slice(&body).unwrap_or_default())
+    }
 
-    #[cfg(unix)]
-    let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to install SIGTERM handler")
-            .recv()
-            .await;
-    };
+    #[tokio::test]
+    async fn readiness_follows_the_canary_and_the_drain_not_the_rpc() {
+        let state = AppState::for_tests();
+        let health = state.health.clone();
+        let storage = state.storage.clone();
+        let app = router(state);
 
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
+        assert_eq!(get(&app, "/health/live").await.0, StatusCode::OK);
+        let (status, body) = get(&app, "/health/ready").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["storage_canary"], false);
 
-    tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
+        // The Solana RPC here is unreachable; readiness doesn't care.
+        health.record_canary(storage.canary().await.map_err(|e| e.to_string()));
+        let (status, body) = get(&app, "/health/ready").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let (status, details) = get(&app, "/health").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(details["status"], "ready");
+        assert_eq!(details["keys_held"].as_array().unwrap().len(), 4);
+        assert_eq!(details["worker_id"], "worker-a");
+
+        health.start_draining();
+        assert_eq!(
+            get(&app, "/health/ready").await.0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(get(&app, "/health").await.1["status"], "draining");
+    }
+
+    #[tokio::test]
+    async fn public_endpoints_answer_and_protected_ones_use_the_error_body() {
+        let app = router(AppState::for_tests());
+        let (status, body) = get(&app, "/v1/attestation").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "no token yet");
+        assert_eq!(body["code"], "attestation_unavailable");
+
+        let (status, body) = get(&app, "/v1/attestation/public-key").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["crv"], "P-256");
+
+        let (status, body) = get(&app, "/v1/wallets").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["code"], "unauthorized");
+        assert!(uuid::Uuid::parse_str(body["request_id"].as_str().unwrap()).is_ok());
     }
 }

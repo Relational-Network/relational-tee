@@ -22,6 +22,7 @@ type Rows = BTreeMap<(String, String), (BTreeMap<String, Prop>, ETag)>;
 
 struct Blob {
     body: Vec<u8>,
+    etag: ETag,
     immutable_until: Option<DateTime<Utc>>,
 }
 
@@ -99,6 +100,7 @@ impl ObjectStore for MemoryStore {
             .get(&(c, path.to_string()))
             .map(|blob| Object {
                 body: Bytes::copy_from_slice(&blob.body),
+                etag: blob.etag.clone(),
             });
         Box::pin(async move { Ok(found) })
     }
@@ -119,6 +121,7 @@ impl ObjectStore for MemoryStore {
                 key,
                 Blob {
                     body: body.to_vec(),
+                    etag: etag.clone(),
                     immutable_until: None,
                 },
             );
@@ -133,16 +136,43 @@ impl ObjectStore for MemoryStore {
         path: &'a str,
         block: Bytes,
     ) -> BoxFuture<'a, Result<(), StoreError>> {
-        self.lock()
+        let mut inner = self.lock();
+        let etag = inner.etag();
+        let blob = inner
             .blobs
             .entry((c, path.to_string()))
             .or_insert_with(|| Blob {
                 body: Vec::new(),
+                etag: etag.clone(),
                 immutable_until: None,
-            })
-            .body
-            .extend_from_slice(&block);
+            });
+        blob.body.extend_from_slice(&block);
+        blob.etag = etag;
         Box::pin(async move { Ok(()) })
+    }
+
+    fn put_if_match<'a>(
+        &'a self,
+        c: Container,
+        path: &'a str,
+        body: Bytes,
+        etag: &'a ETag,
+    ) -> BoxFuture<'a, Result<ETag, StoreError>> {
+        let mut inner = self.lock();
+        let fresh = inner.etag();
+        let result = match inner.blobs.get_mut(&(c, path.to_string())) {
+            None => Err(StoreError::NotFound),
+            Some(blob) if &blob.etag != etag => Err(StoreError::PreconditionFailed),
+            Some(blob) if blob.immutable_until.is_some_and(|until| until > Utc::now()) => {
+                Err(StoreError::Conflict)
+            }
+            Some(blob) => {
+                blob.body = body.to_vec();
+                blob.etag = fresh.clone();
+                Ok(fresh)
+            }
+        };
+        Box::pin(async move { result })
     }
 
     fn delete<'a>(&'a self, c: Container, path: &'a str) -> BoxFuture<'a, Result<(), StoreError>> {

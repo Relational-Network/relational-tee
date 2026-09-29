@@ -488,9 +488,13 @@ impl ObjectStore for AzureStore {
                 })
                 .await?;
             match response.status() {
-                StatusCode::OK => Ok(Some(Object {
-                    body: response.into_body(),
-                })),
+                StatusCode::OK => {
+                    let etag = etag_of(&response)?;
+                    Ok(Some(Object {
+                        body: response.into_body(),
+                        etag,
+                    }))
+                }
                 StatusCode::NOT_FOUND => Ok(None),
                 _ => Err(unexpected("get blob", &response)),
             }
@@ -523,6 +527,38 @@ impl ObjectStore for AzureStore {
                 StatusCode::CONFLICT | StatusCode::PRECONDITION_FAILED => {
                     Ok(PutOutcome::AlreadyExists)
                 }
+                _ => Err(unexpected("put blob", &response)),
+            }
+        })
+    }
+
+    fn put_if_match<'a>(
+        &'a self,
+        c: Container,
+        path: &'a str,
+        body: Bytes,
+        etag: &'a ETag,
+    ) -> BoxFuture<'a, Result<ETag, StoreError>> {
+        Box::pin(async move {
+            let response = self
+                .send(Req {
+                    service: Service::Blob,
+                    method: Method::PUT,
+                    path: self.blob_path(c, path),
+                    query: vec![],
+                    headers: vec![
+                        ("content-type", "application/octet-stream".into()),
+                        ("if-match", etag.0.clone()),
+                        ("x-ms-blob-type", "BlockBlob".into()),
+                    ],
+                    body,
+                })
+                .await?;
+            match response.status() {
+                StatusCode::CREATED => etag_of(&response),
+                StatusCode::PRECONDITION_FAILED => Err(StoreError::PreconditionFailed),
+                StatusCode::NOT_FOUND => Err(StoreError::NotFound),
+                StatusCode::CONFLICT => Err(StoreError::Conflict),
                 _ => Err(unexpected("put blob", &response)),
             }
         })

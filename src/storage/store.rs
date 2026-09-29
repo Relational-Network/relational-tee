@@ -106,10 +106,11 @@ impl Table {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ETag(pub String);
 
-/// An object's bytes.
+/// An object's bytes and version.
 #[derive(Clone, Debug)]
 pub struct Object {
     pub body: Bytes,
+    pub etag: ETag,
 }
 
 /// The outcome of a create-only write.
@@ -314,6 +315,15 @@ pub trait ObjectStore: Send + Sync {
         path: &'a str,
         body: Bytes,
     ) -> BoxFuture<'a, Result<PutOutcome, StoreError>>;
+
+    /// Replace the object if its ETag still matches.
+    fn put_if_match<'a>(
+        &'a self,
+        c: Container,
+        path: &'a str,
+        body: Bytes,
+        etag: &'a ETag,
+    ) -> BoxFuture<'a, Result<ETag, StoreError>>;
 
     /// Append a block to an append blob, creating the blob if it's absent.
     fn append<'a>(

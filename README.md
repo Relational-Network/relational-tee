@@ -108,7 +108,7 @@ CI (`.github/workflows/ci.yml`) runs `just check` in the dev shell, `nix flake c
 
 ## Endpoints
 
-- **Health:** `GET /health`, `/health/live`, `/health/ready`.
+- **Health:** `GET /health/live` answers 200 while the process runs. `GET /health/ready` answers 200 only when the worker holds its four keys, has a valid certificate (or serves plain HTTP in a dev build), its storage canary (a read and a conditional write of `leases/canary/{worker_id}`, every 20 seconds) succeeded within 60 seconds, and it isn't draining. It reads cached state only and never depends on Solana RPC. `GET /health` returns details for operators: keys held, certificate expiry, canary age, key cache age, Solana RPC status (checked every 30 seconds), version and host data. On SIGTERM the worker fails readiness at once, keeps serving for 10 seconds so the load balancer notices, then stops accepting connections and gives in-flight requests up to 40 seconds; Ctrl-C skips the 10 seconds, and a second Ctrl-C exits at once.
 - **Attestation:** `GET /v1/attestation` returns `{ maa_token, transport_jwk, kid }`: an MAA token whose `x-ms-runtime.keys[0]` is the transport public key, and the key's RFC 7638 thumbprint. The worker requests the token at startup, refreshes it at 80% of its lifetime and serves it from memory; it answers 503 until the first token arrives. `GET /v1/attestation/public-key` still returns the bare transport public key, which the dashboard seals uploads to.
 - **Users:** `GET /v1/users/me`.
 - **Wallets:** `GET` and `POST /v1/wallets`; `GET` and `DELETE /v1/wallets/{id}`; `GET …/balance`; `POST …/estimate` and `…/send`; `GET …/transactions` and `…/transactions/{signature}`.

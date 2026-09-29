@@ -8,6 +8,7 @@ use std::sync::Arc;
 use crate::attestation::Attestation;
 use crate::auth::JwksCache;
 use crate::blockchain::SolanaClient;
+use crate::health::Health;
 use crate::storage::tx_cache::TxCache;
 use crate::storage::Storage;
 use crate::tee::WorkerKeys;
@@ -19,6 +20,8 @@ pub struct AppState {
     pub keys: Arc<WorkerKeys>,
     /// The cached attestation token for the transport key.
     pub attestation: Arc<Attestation>,
+    /// Readiness state, kept current in the background.
+    pub health: Arc<Health>,
 
     // ── Auth (existing) ─────────────────────────────────────────
     /// Expected `aud` claim.
@@ -35,4 +38,35 @@ pub struct AppState {
     pub solana_client: Arc<SolanaClient>,
     /// LRU cache for first-page tx queries.
     pub tx_cache: Arc<TxCache>,
+}
+
+#[cfg(test)]
+impl AppState {
+    /// A worker with test keys, in-memory storage, and a Solana client that
+    /// nothing answers.
+    pub fn for_tests() -> Self {
+        use crate::health::Certificate;
+        use crate::tee::KeyName;
+
+        let keys = Arc::new(crate::tee::tests::test_keys());
+        let attestation = Arc::new(Attestation::new(&keys.get(KeyName::Transport).current));
+        let certificate = Certificate::File {
+            not_after: Some(chrono::Utc::now() + chrono::Duration::days(30)),
+        };
+        let health = Arc::new(Health::new(&keys, certificate));
+        let unreachable = "http://127.0.0.1:9";
+        Self {
+            keys,
+            attestation,
+            health,
+            audience: crate::config::AVS_AUDIENCE.to_string(),
+            jwks_cache: Arc::new(tokio::sync::RwLock::new(None)),
+            storage: Arc::new(crate::storage::tests::memory_storage()),
+            solana_client: Arc::new(SolanaClient::new(
+                unreachable,
+                crate::blockchain::types::devnet_config(unreachable),
+            )),
+            tx_cache: Arc::new(TxCache::new(8, std::time::Duration::from_secs(30))),
+        }
+    }
 }
