@@ -133,14 +133,6 @@ pub struct CreateMaltaPoolRequest {
     pub schema: InlineSchemaRequest,
 }
 
-/// IOB ERP pool create request. No schema; `append` DRT not allowed.
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct CreateIobErpPoolRequest {
-    pub wallet_id: String,
-    pub pool_name: String,
-    pub drts: Vec<DrtRequest>,
-}
-
 /// Atomic create-pool response.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct CreatePoolResponse {

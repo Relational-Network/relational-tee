@@ -108,7 +108,6 @@ Protected endpoints require a JWT issued by the Attestation Verification Service
         api::admin::activate_wallet,
         // DRT Pool API (new contract)
         api::pools::create_malta_pool,
-        api::pools::create_iob_erp_pool,
         api::pools::get_pool,
         api::pools::get_drt,
         // Credential / Pool discovery API
@@ -164,7 +163,6 @@ Protected endpoints require a JWT issued by the Attestation Verification Service
         blockchain::drt::types::SchemaFieldRequest,
         blockchain::drt::types::InlineSchemaRequest,
         blockchain::drt::types::CreateMaltaPoolRequest,
-        blockchain::drt::types::CreateIobErpPoolRequest,
         blockchain::drt::types::CreatePoolResponse,
         blockchain::drt::types::DrtConfigResponse,
         blockchain::drt::types::PoolInfoResponse,

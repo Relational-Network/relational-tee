@@ -4,7 +4,6 @@
 //! DRT pool API handlers (new `digital_rights_tokens` contract).
 //!
 //! - `POST /v1/drt/pools/malta`        — atomic create (CSV-driven pool + schema)
-//! - `POST /v1/drt/pools/iob-erp`      — atomic create (ERP pool, no schema)
 //! - `GET  /v1/drt/pools/{pool_pda}`   — pool info (chain + enclave metadata)
 
 use axum::{
@@ -227,7 +226,7 @@ fn parse_schema(req: &InlineSchemaRequest) -> Result<(String, Vec<FieldSchema>),
 }
 
 // ============================================================================
-// Core create-pool logic shared by both endpoints.
+// Core create-pool logic.
 // ============================================================================
 
 struct CreatedPool {
@@ -370,7 +369,7 @@ pub async fn create_malta_pool(
     Json(payload): Json<CreateMaltaPoolRequest>,
 ) -> Result<(axum::http::StatusCode, Json<CreatePoolResponse>), ApiError> {
     validate_pool_name(&payload.pool_name)?;
-    let resolved = validate_drt_requests(&payload.drts, /* allow_append */ true)?;
+    let resolved = validate_drt_requests(&payload.drts)?;
     if !resolved.iter().any(|d| d.name == APPEND_DRT_NAME) {
         return Err(ApiError::bad_request(
             "MALTA pools must include the 'append' DRT",
@@ -453,104 +452,6 @@ pub async fn create_malta_pool(
 }
 
 // ============================================================================
-// POST /v1/drt/pools/iob-erp
-// ============================================================================
-
-/// Create an IOB ERP pool (Jitterbit-driven, no schema, no `append`).
-#[utoipa::path(
-    post,
-    path = "/v1/drt/pools/iob-erp",
-    tag = "DRT Pools",
-    summary = "Create IOB ERP pool",
-    description = "Atomically: create_pool + register_drt × N + seal_pool. Append DRT is rejected — IOB ERP pools are populated by Jitterbit, not via the dashboard upload path.",
-    security(("bearer_auth" = [])),
-    request_body = CreateIobErpPoolRequest,
-    responses(
-        (status = 201, description = "Pool created", body = CreatePoolResponse),
-        (status = 400, description = "Validation error"),
-        (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden"),
-        (status = 503, description = "RPC unavailable"),
-    )
-)]
-pub async fn create_iob_erp_pool(
-    AdminToken(token): AdminToken,
-    State(state): State<AppState>,
-    Json(payload): Json<CreateIobErpPoolRequest>,
-) -> Result<(axum::http::StatusCode, Json<CreatePoolResponse>), ApiError> {
-    validate_pool_name(&payload.pool_name)?;
-    let resolved = validate_drt_requests(&payload.drts, /* allow_append */ false)?;
-
-    let repo = WalletRepository::new(&state.storage);
-    let (wallet, keypair) = load_wallet_keypair(&repo, &payload.wallet_id, &token.sub)?;
-
-    let created = create_pool_atomic(&state, &keypair, &resolved).await?;
-
-    let pool_pda_str = created.pool_pda.to_string();
-    let pool_uuid_hex = hex::encode(created.pool_uuid);
-    let final_sig = created.signatures.last().cloned().unwrap_or_default();
-
-    let meta = persist_pool_metadata(
-        &state,
-        &pool_pda_str,
-        &payload.pool_name,
-        PoolKind::IobErp,
-        &pool_uuid_hex,
-        created.drts.clone(),
-        &wallet.wallet_id,
-        &wallet.public_address,
-        "",
-        crate::data_validation::ValidationMode::None,
-    )?;
-
-    info!(
-        signature = %final_sig,
-        pool = %pool_pda_str,
-        owner = %wallet.public_address,
-        drts = meta.drts.len(),
-        "IOB ERP pool created"
-    );
-
-    let evt = crate::storage::audit::AuditEvent::new(AuditEventType::PoolCreated)
-        .with_user(&token.sub)
-        .with_resource("drt_pool", &pool_pda_str)
-        .with_pool_pda(&pool_pda_str)
-        .with_details(serde_json::json!({
-            "kind": "iob_erp",
-            "pool_name": payload.pool_name,
-            "pool_uuid": pool_uuid_hex,
-            "tx_signatures": created.signatures,
-            "drt_count": meta.drts.len(),
-            "chain": chain_section(&created.signatures, &created.events, pool_labels(&meta, None)),
-        }));
-    crate::storage::audit::AuditRepository::new(&state.storage)
-        .with_tx_db(&state.tx_db)
-        .log(&evt)
-        .await;
-
-    Ok((
-        axum::http::StatusCode::CREATED,
-        Json(CreatePoolResponse {
-            signature: final_sig.clone(),
-            signatures: created.signatures,
-            pool_pda: pool_pda_str,
-            pool_uuid: pool_uuid_hex,
-            mints: created
-                .drts
-                .iter()
-                .map(|(n, m)| (n.clone(), m.mint.clone()))
-                .collect(),
-            right_ids: created
-                .drts
-                .iter()
-                .map(|(n, m)| (n.clone(), m.right_id_hex.clone()))
-                .collect(),
-            explorer_url: explorer_url(&state, &final_sig),
-        }),
-    ))
-}
-
-// ============================================================================
 // GET /v1/drt/pools/{pool_pda}
 // ============================================================================
 
@@ -601,7 +502,6 @@ pub async fn get_pool(
                 m.pool_name.clone(),
                 match m.kind {
                     PoolKind::Malta => "malta",
-                    PoolKind::IobErp => "iob_erp",
                 }
                 .to_string(),
                 drts,

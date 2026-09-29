@@ -80,12 +80,8 @@ pub fn parse_code_hash(hex: &str) -> Result<[u8; 32], ApiError> {
     Ok(out)
 }
 
-/// Validate + resolve a list of DRT requests. `allow_append=false` rejects
-/// `append` outright (IOB ERP pools).
-pub fn validate_drt_requests(
-    drts: &[DrtRequest],
-    allow_append: bool,
-) -> Result<Vec<ResolvedDrt>, ApiError> {
+/// Validate + resolve a list of DRT requests.
+pub fn validate_drt_requests(drts: &[DrtRequest]) -> Result<Vec<ResolvedDrt>, ApiError> {
     if drts.is_empty() {
         return Err(ApiError::bad_request("at least one DRT is required"));
     }
@@ -102,11 +98,6 @@ pub fn validate_drt_requests(
         validate_drt_name(&d.name)?;
         if !seen.insert(d.name.clone()) {
             return Err(ApiError::bad_request(format!("duplicate DRT '{}'", d.name)));
-        }
-        if !allow_append && d.name == APPEND_DRT_NAME {
-            return Err(ApiError::bad_request(
-                "the 'append' DRT is not allowed on IOB ERP pools",
-            ));
         }
         if d.supply == 0 {
             return Err(ApiError::bad_request(format!(

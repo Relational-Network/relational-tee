@@ -631,14 +631,6 @@ pub async fn initialize_pool(
         ));
     }
 
-    // IOB ERP pools are populated by Jitterbit — uploads via the dashboard
-    // are intentionally rejected.
-    if meta.kind == PoolKind::IobErp {
-        return Err(ApiError::conflict(
-            "IOB ERP pools cannot be initialised via dashboard upload",
-        ));
-    }
-
     // Validate CSV against the pool's schema.
     let summary = validate_payload(
         state.storage.paths(),
@@ -771,16 +763,11 @@ pub async fn issue_credentials(
     let pool_pda = Pubkey::from_str(&pool_pda_str)
         .map_err(|_| ApiError::bad_request("invalid pool PDA address"))?;
 
-    // Load pool metadata — must be in Ready state, MALTA kind.
+    // Load pool metadata — must be in Ready state.
     let meta = load_pool_meta(&state, &pool_pda_str)?;
     if meta.state != PoolState::Ready {
         return Err(ApiError::bad_request(
             "pool not initialized — call /initialize first",
-        ));
-    }
-    if meta.kind == PoolKind::IobErp {
-        return Err(ApiError::conflict(
-            "IOB ERP pools do not accept credential issuance",
         ));
     }
 
@@ -1560,7 +1547,6 @@ pub async fn list_all_pools(
 
         let kind_str = match meta.kind {
             PoolKind::Malta => "malta",
-            PoolKind::IobErp => "iob_erp",
         }
         .to_string();
         entries.push(MarketplacePoolEntry {

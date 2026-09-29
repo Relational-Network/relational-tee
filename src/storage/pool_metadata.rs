@@ -16,8 +16,6 @@ pub enum PoolKind {
     /// CSV-driven pool. Admin uploads CSVs; schema mandatory, headers-only validation.
     #[default]
     Malta,
-    /// ERP-driven pool. Data arrives via Jitterbit; no `append` DRT.
-    IobErp,
 }
 
 /// Pool lifecycle state.
@@ -67,7 +65,7 @@ pub struct PoolMetadata {
     /// Solana public key of the pool owner (base58).
     #[serde(default)]
     pub owner_pubkey: Option<String>,
-    /// Schema id label (MALTA only — empty string for IOB ERP).
+    /// Schema id label.
     pub schema_id: String,
     /// CSV validation strictness.
     #[serde(default)]

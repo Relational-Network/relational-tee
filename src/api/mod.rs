@@ -151,7 +151,6 @@ pub fn drt_router() -> Router<AppState> {
     Router::new()
         // ── Atomic create (new contract) ─────────────────────────
         .route("/v1/drt/pools/malta", post(pools::create_malta_pool))
-        .route("/v1/drt/pools/iob-erp", post(pools::create_iob_erp_pool))
         // ── Pool info ────────────────────────────────────────────
         .route("/v1/drt/pools/{pool_pda}", get(pools::get_pool))
         // ── On-chain DRT inspection ──────────────────────────────
