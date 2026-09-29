@@ -9,12 +9,20 @@
 //! when the key's release policy doesn't match. The sidecar attests, calls
 //! Key Vault with the group's managed identity, and unwraps the key with its
 //! own RSA transfer key, so this crate needs no RSA code.
+//!
+//! `POST /attest/maa` takes `{ maa_endpoint, runtime_data }`, where
+//! `runtime_data` is standard base64 of a JSON document, and returns
+//! `{ "token" }`: an MAA token whose `x-ms-runtime` claim is that document.
 
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use zeroize::Zeroizing;
 
-use super::{BoxFuture, EcKey, KeyError, KeyName, KeyProvider, ReleasedKey};
+use super::{
+    AttestError, AttestationProvider, BoxFuture, EcKey, KeyError, KeyName, KeyProvider, ReleasedKey,
+};
 use crate::http_client::HttpClient;
 
 /// How to reach the sidecar and what to ask it for.
@@ -127,6 +135,46 @@ impl KeyProvider for SkrSidecar {
                 current: parse_release_response(&bytes)?,
                 previous: None,
             })
+        })
+    }
+}
+
+#[derive(Deserialize)]
+struct TokenBody {
+    token: String,
+}
+
+impl AttestationProvider for SkrSidecar {
+    fn attest<'a>(&'a self, runtime_data: &'a Value) -> BoxFuture<'a, Result<String, AttestError>> {
+        Box::pin(async move {
+            let body = json!({
+                "maa_endpoint": self.config.maa_endpoint,
+                "runtime_data": STANDARD.encode(runtime_data.to_string()),
+            });
+            let response = self
+                .http
+                .post_json(&self.url("/attest/maa"), &body)
+                .await
+                .map_err(|e| AttestError(format!("SKR sidecar unreachable: {e}")))?;
+            let status = response.status();
+            let text = response.into_text().unwrap_or_default();
+            if !status.is_success() {
+                return Err(AttestError(format!(
+                    "SKR sidecar returned {status}: {}",
+                    error_message(text.as_bytes())
+                )));
+            }
+            let parsed: TokenBody = serde_json::Deserializer::from_str(&text)
+                .into_iter()
+                .next()
+                .and_then(Result::ok)
+                .ok_or_else(|| AttestError("attestation response has no token".into()))?;
+            if parsed.token.is_empty() {
+                return Err(AttestError(
+                    "attestation response has an empty token".into(),
+                ));
+            }
+            Ok(parsed.token)
         })
     }
 }

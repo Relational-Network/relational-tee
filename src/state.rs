@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use crate::attestation::Attestation;
 use crate::auth::JwksCache;
 use crate::blockchain::SolanaClient;
 use crate::storage::tx_cache::TxCache;
@@ -17,6 +18,8 @@ use crate::tee::WorkerKeys;
 pub struct AppState {
     /// The worker's released keys.
     pub keys: Arc<WorkerKeys>,
+    /// The cached attestation token for the transport key.
+    pub attestation: Arc<Attestation>,
 
     // ── Auth (existing) ─────────────────────────────────────────
     /// Expected `aud` claim.

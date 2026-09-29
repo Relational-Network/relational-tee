@@ -33,6 +33,9 @@ pub const SIGNING_KEY_FILE: &str = "maa-signing-key.pem";
 /// container group's CCE policy.
 pub const DEV_HOST_DATA: &str = "dededededededededededededededededededededededededededededededede";
 
+/// Default issuer: the fake SKR sidecar's default address.
+pub const DEFAULT_ISSUER: &str = "http://localhost:9000";
+
 /// MAA tokens are valid for 8 hours.
 pub const DEFAULT_TOKEN_LIFETIME: Duration = Duration::from_secs(8 * 3600);
 

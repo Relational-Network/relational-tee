@@ -16,6 +16,7 @@
 //! ```
 
 mod api;
+mod attestation;
 mod auth;
 mod blockchain;
 mod config;
@@ -53,7 +54,7 @@ use config::{
 use handlers::{admin_status, get_public_key, AdminStatusResponse};
 use health::{health, liveness, readiness, HealthChecks, HealthResponse, ReadyResponse};
 use state::AppState;
-use tee::{KeyProvider, WorkerKeys};
+use tee::{AttestationProvider, KeyName, KeyProvider, WorkerKeys};
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -94,6 +95,7 @@ Protected endpoints require a JWT issued by the Attestation Verification Service
         health::health,
         health::liveness,
         health::readiness,
+        attestation::get_attestation,
         handlers::get_public_key,
         handlers::admin_status,
         // Wallet API
@@ -134,6 +136,7 @@ Protected endpoints require a JWT issued by the Attestation Verification Service
         ReadyResponse,
         HealthChecks,
         AdminStatusResponse,
+        attestation::AttestationResponse,
         data_validation::ValidationError,
         data_validation::ValidationMode,
         crypto::Jwk,
@@ -288,18 +291,21 @@ async fn run_dev_command(args: &[String]) -> Option<i32> {
     }
 }
 
-/// Build the configured key provider.
-fn key_provider(config: &KeyProviderConfig) -> Box<dyn KeyProvider> {
+/// Build the configured key and attestation providers; one implementation
+/// serves both.
+fn providers(config: &KeyProviderConfig) -> (Arc<dyn KeyProvider>, Arc<dyn AttestationProvider>) {
     match config {
         KeyProviderConfig::Skr(skr) => {
             info!(endpoint = %skr.endpoint, vault = %skr.akv_endpoint, maa = %skr.maa_endpoint,
-                "Releasing keys through the SKR sidecar");
-            Box::new(tee::skr::SkrSidecar::new(skr.clone()))
+                "Releasing keys and attesting through the SKR sidecar");
+            let sidecar = Arc::new(tee::skr::SkrSidecar::new(skr.clone()));
+            (sidecar.clone(), sidecar)
         }
         #[cfg(feature = "dev")]
         KeyProviderConfig::Local { dir } => {
             warn!(dir = %dir.display(), "KEY_PROVIDER=local: using dev keys (dev builds only)");
-            Box::new(tee::local::LocalDev::new(dir.clone()))
+            let local = Arc::new(tee::local::LocalDev::new(dir.clone()));
+            (local.clone(), local)
         }
     }
 }
@@ -334,12 +340,19 @@ async fn main() {
 
     // Release the four keys before anything else; without them the worker
     // can't serve. Exiting lets the platform restart it.
-    let keys = WorkerKeys::release_all(key_provider(&server_config.keys).as_ref())
+    let (key_provider, attestation_provider) = providers(&server_config.keys);
+    let keys = WorkerKeys::release_all(key_provider.as_ref())
         .await
         .unwrap_or_else(|e| {
             tracing::error!(error = %e, "Key release failed");
             std::process::exit(1);
         });
+
+    // Attest the transport key for clients, and keep the token fresh.
+    let attestation = Arc::new(attestation::Attestation::new(
+        &keys.get(KeyName::Transport).current,
+    ));
+    attestation.spawn_refresher(attestation_provider);
 
     // Initialize local storage.
     let data_dir = server_config.data_dir.as_path();
@@ -425,6 +438,7 @@ async fn main() {
     // Create shared application state.
     let state = AppState {
         keys: Arc::new(keys),
+        attestation,
         audience: AVS_AUDIENCE.to_string(),
         jwks_cache: Arc::new(tokio::sync::RwLock::new(None)),
         storage: Arc::new(encrypted_storage),
@@ -481,6 +495,7 @@ async fn main() {
         .route("/health/live", get(liveness))
         .route("/health/ready", get(readiness))
         // v1 API endpoints.
+        .route("/v1/attestation", get(attestation::get_attestation))
         .route("/v1/attestation/public-key", get(get_public_key))
         .route("/v1/admin/status", get(admin_status))
         // Wallet service routes.

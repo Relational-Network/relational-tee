@@ -3,11 +3,12 @@
 
 //! Key release and attestation: the only code that depends on the TEE.
 //!
-//! Workers obtain their keys through a [`KeyProvider`]. In production that is
-//! the SKR sidecar in the same confidential container group
+//! Workers obtain their keys through a [`KeyProvider`] and attestation tokens
+//! for clients through an [`AttestationProvider`]. In production both are the
+//! SKR sidecar in the same confidential container group
 //! ([`skr::SkrSidecar`]), which releases a key only if the group's attested
 //! policy matches the key's release policy. Dev builds add
-//! [`local::LocalDev`], which reads dev keys from files.
+//! [`local::LocalDev`], which reads dev keys from files and signs dev tokens.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -174,7 +175,6 @@ impl EcKey {
     }
 
     /// The public key as a JWK whose `kid` is its thumbprint.
-    #[cfg(any(test, feature = "dev"))]
     pub fn public_jwk(&self) -> Value {
         let (x, y) = self.public_coordinates();
         serde_json::json!({ "kty": "EC", "crv": "P-256", "x": x, "y": y, "kid": self.thumbprint() })
@@ -198,6 +198,24 @@ impl ReleasedKey {
 pub trait KeyProvider: Send + Sync {
     /// Release the current version of a named key; rotating keys also return the previous version.
     fn release(&self, key: KeyName) -> BoxFuture<'_, Result<ReleasedKey, KeyError>>;
+}
+
+/// Why an attestation token couldn't be obtained.
+#[derive(Debug)]
+pub struct AttestError(pub String);
+
+impl fmt::Display for AttestError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for AttestError {}
+
+/// Obtains attestation tokens that clients can verify.
+pub trait AttestationProvider: Send + Sync {
+    /// Return an MAA token whose `x-ms-runtime` claim carries `runtime_data`.
+    fn attest<'a>(&'a self, runtime_data: &'a Value) -> BoxFuture<'a, Result<String, AttestError>>;
 }
 
 /// The four keys, released at startup and held in memory for the process

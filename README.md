@@ -84,7 +84,7 @@ CI (`.github/workflows/ci.yml`) runs `just check` in the dev shell, `nix flake c
 ## Endpoints
 
 - **Health:** `GET /health`, `/health/live`, `/health/ready`.
-- **Attestation:** `GET /v1/attestation/public-key` returns the public half of `transport-key`, which the dashboard seals uploads to.
+- **Attestation:** `GET /v1/attestation` returns `{ maa_token, transport_jwk, kid }`: an MAA token whose `x-ms-runtime.keys[0]` is the transport public key, and the key's RFC 7638 thumbprint. The worker requests the token at startup, refreshes it at 80% of its lifetime and serves it from memory; it answers 503 until the first token arrives. `GET /v1/attestation/public-key` still returns the bare transport public key, which the dashboard seals uploads to.
 - **Users:** `GET /v1/users/me`.
 - **Wallets:** `GET` and `POST /v1/wallets`; `GET` and `DELETE /v1/wallets/{id}`; `GET …/balance`; `POST …/estimate` and `…/send`; `GET …/transactions` and `…/transactions/{signature}`.
 - **Pools:** `POST /v1/drt/pools/malta`; `GET /v1/drt/pools/list`, `/v1/drt/pools/{pda}`, `…/drt/{name}` and `/v1/drt/pools/by-wallet/{wallet_id}`; `POST` and `GET …/schema`; `POST …/initialize`, `…/issue` and `…/revoke`; `GET …/revocations`, `…/audit`, `…/summary` and `…/issuance-log`.
