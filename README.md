@@ -1,361 +1,78 @@
-# Relational-TEE
+# relational-tee
 
-> Imported from `relational-sdk` and being migrated from Gramine SGX to Azure Confidential Containers. Until the migration lands, the rest of this README describes the SGX server as imported.
+The worker behind IOB MicRes: an Axum server that runs Use Case 1 credential pools on Solana (create a Malta pool, upload its schema, initialise it, issue and revoke credentials, read the issuance log and audit trail) and custodial Solana wallets (create, balance, fee estimate, send, history, admin suspend and activate).
 
-SGX enclave server with RA-TLS, JWT validation, and role-based access control (RBAC).
+> **Migration in progress.** This repo was imported from `relational-sdk`, a Gramine SGX enclave, and is being moved to Azure Confidential Containers (AMD SEV-SNP). Gramine, RA-TLS, the SGX build and the old SSH deployment are gone, and the server now builds and runs natively. Still to come: key release and attestation on Azure, Azure Blob and Table storage with encryption at rest, idempotent mutations, Entra ID sign-in, and in-app edge controls. Until then, parts of the server are interim, as described below.
 
-## Features
+## What works today, and what's interim
 
-- **RA-TLS (DCAP)**: TLS certificates bound to SGX attestation
-- **JWT Validation**: Validates AVS-issued tokens with JWKS caching
-- **RBAC**: Role-based access control (admin, user, analyst, read_only)
-- **WebCrypto Ready**: Exposes P-256 public key for browser-side encryption
-- **Custodial Wallets**: Create/manage Solana wallets (1 per user, enforced via redb index)
-- **DRT Pools**: Create, buy, redeem, and close Data Rights Token pools on-chain
-- **Credential Issuance**: Upload schemas, issue/revoke credentials, full issuance log
-- **Audit Trail**: HMAC-signed JSONL events + redb-indexed dual-write for O(k) queries
-- **Embedded Database**: 13 redb tables for wallets, pools, issuance, revocations, and audit
-- **Pagination**: All list endpoints support `limit`/`offset` query parameters
-- **Swagger UI**: Auto-generated OpenAPI docs at `/docs`
+- **Transport.** Dev builds serve plain HTTP on `127.0.0.1:8443`, or HTTPS with a local mkcert certificate. Release builds have no plain HTTP path: they read a PEM certificate and key from `TLS_CERT_PATH` and `TLS_KEY_PATH`, and refuse to start without them.
+- **Storage.** State lives under `DATA_DIR` as JSON files plus a redb database, **unencrypted on disk**. Use synthetic data only; the server warns about this at startup.
+- **Auth.** Protected endpoints still validate ES256 tokens from the Attestation Verification Service (AVS). The AVS only issues tokens to an SGX enclave it has attested, so authenticated endpoints can't be exercised locally until Entra ID validation replaces it. Public endpoints (`/health*`, `/v1/attestation/public-key`, `/docs`) work.
+- **Solana.** The public devnet RPC by default. It is rate-limited and has no SLA, and the server warns about it at startup.
 
----
+## Develop locally
 
-## Build
-
-### Requirements
-
-⚠️ **IMPORTANT:** `aws-lc-rs` requires **clang** on Ubuntu 20.04. GCC 9.4 has a memcmp bug
-that aws-lc-rs refuses to compile against. The Docker build already uses clang.
+You need [Nix](https://nixos.org) with flakes, and Docker for the image builds.
 
 ```bash
-sudo apt-get install -y clang
+nix develop     # pinned Rust, cargo-nextest, cargo-audit, bacon, just, sccache,
+                # Node 24, pnpm 10, Azurite, mkcert, actionlint
+just            # list the recipes
 ```
 
-### Native (requires SGX hardware + Gramine)
+| Recipe | What it does |
+|---|---|
+| `just dev` | Run the dev build natively on `127.0.0.1:8443`, with Swagger UI at `/docs` |
+| `just cert` | Create a locally trusted mkcert certificate in `dev/certs/`; `just dev` then serves HTTPS |
+| `just test` | Run the tests with cargo-nextest, in the release and dev configurations |
+| `just check` | Run every gate: rustfmt, clippy (`-D warnings`, with and without all features), the tests, the banned-crate check and `cargo audit` |
+| `just spa` | Run the dashboard dev server from `../iob-pilot` (override with `IOB_PILOT_DIR`) |
+| `just image` | Build the canonical x86_64-linux image with Nix and load it into Docker |
+| `just image-dev` | Build the aarch64-linux dev image and load it into Docker |
 
-```bash
-# Debug build (allows GDB, memory inspection — dev only)
-CC=clang CXX=clang++ make RA_TYPE=dcap SGX_DEBUG=1
-gramine-sgx relational-sdk
+`just image` and `just image-dev` run Nix in a `nixos/nix` container with a cached `/nix` volume, so a Mac needs no separate Linux builder. On Apple Silicon the x86_64 image runs under emulation.
 
-# Production build
-CC=clang CXX=clang++ make RA_TYPE=dcap SGX_DEBUG=0
-gramine-sgx relational-sdk
-```
+Not there yet: a container stack with several replicas and local fakes for storage and key release, a fault-injection suite for the idempotency work, and a debug-mode sandbox on Azure.
 
-### Docker (no SGX hardware needed to build)
+### Configuration
 
-The image is pre-signed at build time — no signing key is needed at runtime.
+| Variable | Dev default | Release default | Purpose |
+|---|---|---|---|
+| `BIND_ADDR` | `127.0.0.1` | `0.0.0.0` | Listening IP address |
+| `PORT` | `8443` | `8443` | Listening port |
+| `DATA_DIR` | `data` | `/data` | Local storage directory |
+| `TLS_CERT_PATH`, `TLS_KEY_PATH` | unset: plain HTTP | required | PEM certificate chain and private key |
+| `SOLANA_RPC_URL` | `https://api.devnet.solana.com` | same | Solana RPC endpoint |
+| `SOLANA_NETWORK` | `devnet` | same | `devnet` or `mainnet`, for explorer links |
+| `AVS_JWKS_URL` | `http://127.0.0.1:9100/.well-known/jwks.json` | same | AVS signing keys |
+| `RUST_LOG` | `info` | `info` | Log filter |
 
-```bash
-# Build (signs enclave at build time via BuildKit secret)
-make docker-build
-# or with a custom key:
-make docker-build SGX_SIGNING_KEY=/path/to/enclave-key.pem
+Dev builds are the ones with the `dev` Cargo feature (`just dev`, or `cargo run --features dev`).
 
-# Run (requires SGX hardware)
-make docker-run
+## Build and release
 
-# Stop
-make docker-stop
-```
+`flake.nix` pins nixpkgs and builds with crane, taking the toolchain from `rust-toolchain.toml`:
 
-Manual Docker run:
+- `packages.x86_64-linux.server`: the release binary, statically linked against musl, with mimalloc as its allocator. `SOURCE_DATE_EPOCH` comes from the commit, and build paths are remapped out of the binary.
+- `packages.x86_64-linux.image`: an OCI image containing only the binary, a pinned CA bundle and an `/etc/passwd` entry for the non-root user 65532. It has no shell, package manager or Nix. The entrypoint is `/bin/relational-tee`, on port 8443.
+- `packages.aarch64-linux.image-dev`: the same image with the `dev` feature, for local container stacks on Apple Silicon.
+- `checks`: rustfmt, clippy and nextest, run by `nix flake check`.
 
-```bash
-docker run --rm -d \
-  --name relational-sdk-sgx \
-  --network host \
-  --device /dev/sgx/enclave \
-  --device /dev/sgx/provision \
-  -e AVS_JWKS_URL=http://127.0.0.1:9100/.well-known/jwks.json \
-  -e SECRET_PROVISION_SERVERS=127.0.0.1:4433 \
-  relationalnetwork/relational-sdk:focal
-```
-
----
-
-## Local Development (Full Stack)
-
-Requires SGX hardware (Azure DCsv3 or bare-metal) and AVS running.
-
-### Quick Start (3 terminals)
-
-**Terminal 1 — AVS:**
-```bash
-cd ../attestation-verification-service
-AVS_SIGNING_KEY_PATH="$(pwd)/secrets/avs-signing-key.pem" \
-AVS_ALLOW_DEBUG_ENCLAVE=1 \
-AVS_ALLOW_OUTDATED_TCB=1 \
-RUST_LOG=info \
-./target/release/attestation-verification-service
-```
-
-**Terminal 2 — Enclave:**
-```bash
-CC=clang CXX=clang++ make RA_TYPE=dcap SGX_DEBUG=1
-gramine-sgx relational-sdk
-```
-
-**Terminal 3 — Test:**
-```bash
-curl -s http://127.0.0.1:9100/health
-curl -sk https://127.0.0.1:8080/health
-curl -sk https://127.0.0.1:8080/v1/attestation/public-key | jq
-```
-
-### Environment Variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `AVS_JWKS_URL` | `http://127.0.0.1:9100/.well-known/jwks.json` | AVS JWKS endpoint |
-| `SECRET_PROVISION_SERVERS` | — | Secret provisioning server (e.g. `127.0.0.1:4433`) |
-| `RUST_LOG` | `info` | Log level |
-
----
-
-## Enclave Measurements & Reproducibility
-
-The MRENCLAVE hash uniquely identifies the enclave binary and trusted files. [`measurements.toml`](measurements.toml)
-is the committed source of truth and pins the full build contract (base image SHA, Ubuntu snapshot,
-Gramine and Rust versions, SIGSTRUCT date, and the expected `[enclave]` block).
-
-```bash
-# Print [enclave] block from a locally built image (in measurements.toml layout)
-make docker-sigstruct
-
-# Rebuild --no-cache and verify mr_enclave matches measurements.toml
-make verify-mrenclave
-```
-
-**When MRENCLAVE changes** (code, Gramine/SGX packages, Rust toolchain, or trusted files change):
-1. Run `make docker-build && make docker-sigstruct` — prints the new `[enclave]` block
-2. Paste the new block into `measurements.toml`
-3. Commit code change + `measurements.toml` together in the same PR
-
-CI fails if the built `mr_enclave` differs from `measurements.toml`, preventing silent changes.
-The signing key is consumed at build time only and is never present in any image layer or on the staging VM.
-
-| Factor | MRENCLAVE | MRSIGNER |
-|--------|:---------:|:--------:|
-| Source code | ✅ | ❌ |
-| Gramine / SGX package versions | ✅ | ❌ |
-| Rust toolchain | ✅ | ❌ |
-| `SGX_DEBUG` | ✅ | ❌ |
-| Signing key | ❌ | ✅ |
-
----
-
-## Deployment
-
-### CI/CD Overview
-
-- **CI** (`ci.yml`): Lint, test, build + sign Docker image, push to GHCR, verify MRENCLAVE matches `measurements.toml`, fail on `debug_enclave != False`, print deploy-by-digest reference to the run summary
-- **CD** (`cd-staging.yml`): Pull pre-built image from GHCR, deploy to staging VM
-
-The staging VM does **not** build or sign — it only runs the pre-built image from GHCR.
-
-**Image tags:**
-- `sha-<commit>` — every push (canonical, used by CD)
-- `staging-latest` — latest `staging` branch push
-- `latest` — latest `main` branch push
-
-### Staging Deployment
-
-**Live URL:** https://iob-staging.duckdns.org
-**VM:** Azure DCsv3 (`iob-staging` in resource group `iob`)
-
-```bash
-# Push to staging branch — triggers CI (build + sign) then CD (pull + deploy)
-git checkout staging
-git merge main
-git push origin staging
-```
-
-### Systemd Service
-
-```bash
-sudo systemctl start enclave
-sudo systemctl status enclave
-sudo journalctl -u enclave -f
-```
-
-### Required GitHub Secrets
-
-| Secret | Description |
-|--------|-------------|
-| `STAGING_HOST` | Staging VM IP |
-| `STAGING_USER` | SSH user |
-| `STAGING_SSH_KEY` | SSH private key for staging VM |
-| `GHCR_TOKEN` | PAT with `read:packages`, `write:packages` |
-| `ENCLAVE_SIGNING_KEY` | PEM content of enclave signing key (`cat enclave-key.pem`) |
-
-### Signing Key Setup (one-time)
-
-The enclave is signed at CI build time via `--mount=type=secret`. The key is never stored
-in any Docker layer or on the staging VM.
-
-```bash
-# Generate signing key
-openssl genrsa -out ~/.config/gramine/enclave-key.pem -3 3072
-
-# Add to GitHub secret ENCLAVE_SIGNING_KEY
-cat ~/.config/gramine/enclave-key.pem
-```
-
----
+CI (`.github/workflows/ci.yml`) runs `just check` in the dev shell, `nix flake check`, and the x86_64 image build on every pull request and push to `main`. It fails if the `rsa` crate (RUSTSEC-2023-0071) or OpenSSL enters the dependency graph. Nothing is pushed or deployed yet.
 
 ## Endpoints
 
-Health endpoints are unversioned; all others use `/v1/` prefix.
+- **Health:** `GET /health`, `/health/live`, `/health/ready`.
+- **Attestation:** `GET /v1/attestation/public-key` returns the per-process P-256 key that the dashboard seals uploads to.
+- **Users:** `GET /v1/users/me`.
+- **Wallets:** `GET` and `POST /v1/wallets`; `GET` and `DELETE /v1/wallets/{id}`; `GET …/balance`; `POST …/estimate` and `…/send`; `GET …/transactions` and `…/transactions/{signature}`.
+- **Pools:** `POST /v1/drt/pools/malta`; `GET /v1/drt/pools/list`, `/v1/drt/pools/{pda}`, `…/drt/{name}` and `/v1/drt/pools/by-wallet/{wallet_id}`; `POST` and `GET …/schema`; `POST …/initialize`, `…/issue` and `…/revoke`; `GET …/revocations`, `…/audit`, `…/summary` and `…/issuance-log`.
+- **Admin:** `GET /v1/admin/status`, `/v1/admin/wallet-stats`, `/v1/admin/wallets` and `/v1/admin/audit/events`; `POST /v1/admin/wallets/{id}/suspend` and `…/activate`; `POST /v1/admin/log-role-change`.
+- **Docs:** `GET /api-doc/openapi.json`; Swagger UI at `/docs` in builds with the `swagger-ui` feature.
 
-### Health
-- `GET /health` — readiness summary (200 or 503)
-- `GET /health/live` — liveness
-- `GET /health/ready` — readiness
-
-### Attestation
-- `GET /v1/attestation/public-key` — enclave public key (JWK)
-
-### Data
-- `POST /v1/data/query` — analyst-only; runs a verified DRT (WASM) script against the granted pool's dataset
-
-### User & Wallet
-- `GET  /v1/users/me` — current user identity
-- `POST /v1/wallets` — create wallet (one per user)
-- `GET  /v1/wallets` — list caller's wallets
-- `GET  /v1/wallets/{id}` — get wallet
-- `DELETE /v1/wallets/{id}` — soft-delete wallet
-
-### Balance & Transactions
-- `GET  /v1/wallets/{id}/balance` — SPL token + SOL balance
-- `POST /v1/wallets/{id}/estimate` — estimate transaction fee
-- `POST /v1/wallets/{id}/send` — send SOL/SPL
-- `GET  /v1/wallets/{id}/transactions` — list transactions
-- `GET  /v1/wallets/{id}/transactions/{sig}` — transaction status
-
-### DRT Pools (digital_rights_tokens program)
-- `POST /v1/drt/pools/malta` — create Malta (CSV-driven) pool
-- `POST /v1/drt/pools/iob-erp` — create IOB ERP (Jitterbit-driven) pool
-- `GET  /v1/drt/pools/{pda}` — pool info
-- `GET  /v1/drt/pools/{pda}/drt/{name}` — on-chain DRT inspection
-- `GET  /v1/drt/events/{sig}` — decoded transaction events
-
-### DRT Grants (pool owner ↔ analyst)
-- `POST /v1/drt/pools/{pda}/grant` — burn 1 admin DRT, write Grant PDA for analyst
-- `POST /v1/drt/pools/{pda}/revoke-grant` — close Grant PDA
-- `GET  /v1/drt/pools/{pda}/grant/{analyst_id}/{drt_name}` — live on-chain grant status
-- `GET  /v1/drt/pools/{pda}/grants` — local mirror (pool owner only): active + revoked
-- `GET  /v1/drt/me/grants` — caller's grants grouped by pool
-
-### Credentials (pool owner)
-- `POST /v1/drt/pools/{pda}/schema` — upload pool schema
-- `GET  /v1/drt/pools/{pda}/schema` — fetch pool schema
-- `POST /v1/drt/pools/{pda}/initialize` — seed initial dataset
-- `POST /v1/drt/pools/{pda}/issue` — issue credentials (redeems an append DRT)
-- `POST /v1/drt/pools/{pda}/revoke` — revoke credentials
-- `GET  /v1/drt/pools/{pda}/revocations` — list revocations (paginated)
-- `GET  /v1/drt/pools/{pda}/audit` — pool-scoped audit log (paginated, filterable)
-- `GET  /v1/drt/pools/{pda}/summary` — pool metadata + on-chain state
-- `GET  /v1/drt/pools/{pda}/issuance-log` — issuance records (paginated)
-- `GET  /v1/drt/pools/by-wallet/{id}` — pools by wallet (paginated)
-- `GET  /v1/drt/pools/list` — all pools (marketplace discovery)
-
-### Admin
-- `GET  /v1/admin/status` — admin role check + uptime
-- `GET  /v1/admin/wallet-stats` — aggregate wallet stats
-- `GET  /v1/admin/wallets` — list all wallets (paginated)
-- `GET  /v1/admin/audit/events` — query audit log by date (paginated)
-- `POST /v1/admin/wallets/{id}/suspend` — suspend wallet
-- `POST /v1/admin/wallets/{id}/activate` — reactivate wallet
-- `POST /v1/admin/log-role-change` — record a role change in the audit trail
-
-### Docs
-- `GET /docs` — Swagger UI (built with `--features swagger-ui`)
-- `GET /api-doc/openapi.json` — OpenAPI spec
-
----
-
-## JWT Authentication
-
-1. Client calls AVS `POST /v1/attest` with enclave URL → receives signed JWT
-2. Client sends JWT in `Authorization: Bearer <token>`
-3. Enclave validates JWT against AVS JWKS
-
-**Required claims:** `iss`, `sub`, `aud` (`relational-sdk`), `exp`, `role` (`admin`/`user`/`analyst`/`read_only`), `enclave_public_key` (JWK — mandatory, must match the live enclave key)
-
-**Role hierarchy:** `admin` ⊃ `user` ⊃ `analyst` ⊃ `read_only`
-
-`sub` and `role` are derived by AVS from the verified Clerk session — the dashboard does not pass them in the `/v1/attest` body.
-
-```bash
-TOKEN=$(curl -s -X POST http://127.0.0.1:9100/v1/attest \
-  -H 'Content-Type: application/json' \
-  -H "Authorization: Bearer $CLERK_TOKEN" \
-  -d '{"enclave_url":"https://127.0.0.1:8080"}' \
-  | jq -r '.token')
-
-curl -sk https://127.0.0.1:8080/v1/users/me     -H "Authorization: Bearer $TOKEN"
-curl -sk https://127.0.0.1:8080/v1/admin/status -H "Authorization: Bearer $TOKEN"
-```
-
----
-
-## Testing Attestation
-
-A C-based RA-TLS client in `attestation-client/` verifies the SGX quote in the TLS certificate.
-
-```bash
-make test-attest        # basic attestation test
-make test-attest-all    # includes negative tests (wrong MRENCLAVE/MRSIGNER)
-make show-measurements  # print current enclave measurements from .sig
-```
-
-See [`attestation-client/README.md`](attestation-client/README.md) for details.
-
----
-
-## Configuration
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `AVS_JWKS_URL` | `http://127.0.0.1:9100/.well-known/jwks.json` | AVS JWKS endpoint |
-| `SECRET_PROVISION_SERVERS` | — | Secret provisioning server |
-| `RUST_LOG` | `info` | Log level |
-| `TLS_CERT_PATH` | `/tmp/ra-tls.crt.pem` | RA-TLS certificate |
-| `TLS_KEY_PATH` | `/tmp/ra-tls.key.pem` | RA-TLS private key |
-| `DATA_DIR` | — | If set, readiness checks this directory exists |
-
-## Module Structure
-
-| Module | Description |
-|--------|-------------|
-| `main.rs` | Entry point, router setup, CORS, security headers, OpenAPI |
-| `config.rs` | Configuration constants, env var helpers (CORS, Solana, storage) |
-| `auth.rs` | JWT validation, JWKS caching (10s timeout), RBAC extractors |
-| `crypto.rs` | Enclave keypair, JWK/JWKS types |
-| `data_validation.rs` | CSV schema validation |
-| `error.rs` | Unified ApiError type |
-| `handlers.rs` | Core HTTP handlers (public key, admin, data stubs) |
-| `health.rs` | /health, /health/live, /health/ready |
-| `state.rs` | AppState (JWKS cache, storage, Solana client, tx DB) |
-| `tls.rs` | RA-TLS PEM loading + normalization |
-| `indexer/` | Background Solana transaction poller with sync cooldown |
-| `api/mod.rs` | Router assembly, shared pagination, wallet lookup helpers |
-| `api/admin.rs` | Wallet stats, list all (paginated), audit query, suspend/activate |
-| `api/balance.rs` | SPL token + native SOL balance |
-| `api/credentials.rs` | Credential issuance, revocation, pool discovery (paginated) |
-| `api/pools.rs` | DRT pool CRUD: create/get/buy/redeem/close |
-| `api/transactions.rs` | Estimate fee, send, list, status |
-| `api/users.rs` | GET /v1/me — user identity |
-| `api/wallets.rs` | Create/list/get/delete wallet (1-wallet-per-user enforced) |
-| `blockchain/` | SolanaClient, signing, SPL token ops, DRT contract |
-| `storage/audit.rs` | Audit event log with HMAC integrity + redb dual-write |
-| `storage/pool_metadata.rs` | PoolMetadata struct + PoolState lifecycle enum |
-| `storage/tx_database.rs` | redb-backed durable store (13 tables: wallets, pools, audit, etc.) |
-| `storage/tx_cache.rs` | LRU cache (128 entries, 30s TTL) |
-| `storage/repository/` | Typed read/write for wallets, transactions |
+Analyst grants, DRT script execution and the data query were removed from this server and will be rebuilt on the new stack. `drt-examples/` keeps an example DRT script for that work.
 
 ## License
 
-AGPL-3.0-or-later — see LICENSE.
+AGPL-3.0-or-later. See [LICENSE](LICENSE).
