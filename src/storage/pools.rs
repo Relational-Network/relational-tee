@@ -19,13 +19,12 @@ use serde::{Deserialize, Serialize};
 use super::store::{
     Continuation, ETag, Entity, InsertOutcome, Page, Prop, RkRange, StoreError, Table,
 };
-use super::wallets::cas_backoff;
+use super::wallets::{cas_backoff, CAS_ATTEMPTS};
 use super::Storage;
 use crate::data_validation::{FieldSchema, ValidationMode};
 
 const POOL_PK: &str = "pool";
 const PAYLOAD_VERSION: u32 = 1;
-const CAS_ATTEMPTS: u32 = 3;
 
 /// Operational shape of the pool.
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

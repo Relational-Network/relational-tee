@@ -33,8 +33,9 @@ const WALLET_PK: &str = "wallet";
 const OWNER_RK: &str = "wallet";
 const ADDRESS_PK: &str = "addr";
 const PAYLOAD_VERSION: u32 = 1;
-/// Compare-and-swap attempts before a write gives up with a conflict.
-const CAS_ATTEMPTS: u32 = 3;
+/// Compare-and-swap attempts (the first try and three retries) before a write
+/// gives up with a conflict.
+pub(crate) const CAS_ATTEMPTS: u32 = 4;
 
 /// Wallet lifecycle status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
