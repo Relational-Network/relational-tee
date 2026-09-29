@@ -398,7 +398,6 @@ pub struct TransactionDetail {
 #[derive(Debug)]
 pub struct TransactionMeta {
     pub fee: u64,
-    pub log_messages: Vec<String>,
     pub err: Option<Value>,
     /// Pre-transaction balances (in lamports) for each account in account_keys order.
     pub pre_balances: Vec<u64>,
@@ -483,14 +482,6 @@ fn parse_tx_meta(v: &Value) -> Option<TransactionMeta> {
         pre_token_balances: parse_token_balances(&v["preTokenBalances"]),
         post_token_balances: parse_token_balances(&v["postTokenBalances"]),
         fee: v["fee"].as_u64().unwrap_or(0),
-        log_messages: v["logMessages"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|s| s.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default(),
         err: if v["err"].is_null() {
             None
         } else {

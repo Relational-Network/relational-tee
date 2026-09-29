@@ -19,7 +19,7 @@ swagger-ui = ["dep:utoipa-swagger-ui"]
 
 [dependencies]
 # ── Web framework ──────────────────────────────────────────────────
-axum = { version = "0.8.8", default-features =  false, features = ["multipart", "query", "json"] }
+axum = { version = "0.8.8", default-features =  false, features = ["multipart", "query", "json", "matched-path"] }
 axum-server = { version = "0.8.0", default-features = false, features = ["tls-rustls-no-provider"] }
 tower-http = { version = "0.6", default-features = false, features = ["set-header", "trace"] }
 tokio = { version = "1.49.0", default-features = false, features = ["macros", "rt-multi-thread", "signal"] }

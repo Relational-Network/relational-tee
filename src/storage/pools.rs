@@ -196,7 +196,7 @@ impl<'a> Pools<'a> {
     /// Every pool.
     pub async fn all(&self) -> Result<Vec<PoolMetadata>, StoreError> {
         self.s
-            .query_all(Table::Pools, POOL_PK, RkRange::all(), None)
+            .query_all(Table::Pools, POOL_PK, RkRange::all())
             .await?
             .iter()
             .map(|e| self.s.open_row(Table::Pools, PAYLOAD_VERSION, e))
@@ -216,7 +216,6 @@ impl<'a> Pools<'a> {
                 Table::Pools,
                 &owner_pk(wallet_id),
                 RkRange::all(),
-                None,
                 limit,
                 page,
             )

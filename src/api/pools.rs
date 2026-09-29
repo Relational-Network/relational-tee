@@ -17,10 +17,10 @@ use std::collections::BTreeMap;
 use std::str::FromStr;
 use tracing::info;
 
+use crate::audit;
 use crate::auth::AdminToken;
 use crate::blockchain::drt::{
     accounts::{fetch_drt_config, fetch_pool},
-    events::{parse_events_from_signature_with_commitment, DrtEvent},
     instructions::{
         build_compute_budget_ix, build_create_pool, build_register_drt, build_seal_pool,
     },
@@ -32,7 +32,6 @@ use crate::blockchain::signing::keypair_from_bytes_verified;
 use crate::data_validation::FieldSchema;
 use crate::error::ApiError;
 use crate::state::AppState;
-use crate::storage::audit::AuditEventType;
 use crate::storage::pools::{DrtMetadata, PoolKind, PoolMetadata, PoolState};
 use crate::storage::wallets::WalletMetadata;
 
@@ -66,13 +65,14 @@ impl From<SendFailure> for ApiError {
     }
 }
 
-/// Sign + send + parse events. `commitment` is `"confirmed"` or `"finalized"`.
-pub(crate) async fn sign_send_and_parse(
+/// Sign, send and confirm a transaction; `commitment` is `"confirmed"` or
+/// `"finalized"`. Returns its signature.
+pub(crate) async fn sign_and_send(
     state: &AppState,
     keypair: &Keypair,
     instructions: Vec<solana_instruction::Instruction>,
     commitment: &str,
-) -> Result<(String, Vec<DrtEvent>), SendFailure> {
+) -> Result<String, SendFailure> {
     let not_sent = |error| SendFailure { error, sent: None };
     let rpc = state.solana_client.rpc();
     let recent_blockhash = rpc.get_latest_blockhash().await.map_err(|e| {
@@ -98,10 +98,7 @@ pub(crate) async fn sign_send_and_parse(
             sent: Some(sig_str),
         });
     }
-    let events = parse_events_from_signature_with_commitment(rpc, &sig_str, commitment)
-        .await
-        .unwrap_or_default();
-    Ok((sig_str, events))
+    Ok(sig_str)
 }
 
 /// Compare a wallet's Solana public address against `pool.owner`.
@@ -128,65 +125,6 @@ pub(crate) async fn load_pool_meta(
 
 pub(crate) fn explorer_url(state: &AppState, sig: &str) -> String {
     state.solana_client.network().explorer_tx_url(sig)
-}
-
-/// Build the on-chain provenance block embedded in every audit `details` JSON.
-///
-/// `chain.events` is the unmodified Anchor decode — what an auditor would get
-/// by replaying the signature against chain state. `chain.labels` is an
-/// **off-chain** convenience map (pool name, DRT name lookups by right_id /
-/// mint / drt_config PDA, the owner's wallet) so the dashboard can render
-/// human-meaningful aliases without polluting the on-chain section. Auditors
-/// ignore `labels` and verify against `events`.
-pub(crate) fn chain_section(
-    signatures: &[String],
-    events: &[DrtEvent],
-    labels: serde_json::Value,
-) -> serde_json::Value {
-    let decoded: Vec<_> = events.iter().map(DrtEvent::to_response).collect();
-    serde_json::json!({
-        "program_id": crate::config::DRT_PROGRAM_ID_STR,
-        "tx_signatures": signatures,
-        "events": decoded,
-        "labels": labels,
-    })
-}
-
-/// Build an id→human-name map for a pool — DRT names keyed by right_id (hex),
-/// mint pubkey, and drt_config PDA. Use [`chain_section`] with the result.
-///
-/// `extra` lets callers inject additional id→label pairs (e.g. commitment hash
-/// → record_id for credential issuance / revocation events) before merging.
-pub(crate) fn pool_labels(
-    meta: &PoolMetadata,
-    extra: Option<serde_json::Map<String, serde_json::Value>>,
-) -> serde_json::Value {
-    let mut id_to_name: serde_json::Map<String, serde_json::Value> = extra.unwrap_or_default();
-    let pool_pk = Pubkey::from_str(&meta.pool_pda).ok();
-    for (name, drt) in &meta.drts {
-        let nm = serde_json::Value::String(name.clone());
-        id_to_name.insert(drt.right_id_hex.clone(), nm.clone());
-        id_to_name.insert(drt.mint.clone(), nm.clone());
-        if let (Some(pk), Ok(rid_bytes)) = (pool_pk, hex::decode(&drt.right_id_hex)) {
-            if let Ok(rid) = <[u8; 16]>::try_from(rid_bytes.as_slice()) {
-                let (config, _) = derive_drt_config_pda(&pk, &rid);
-                id_to_name.insert(config.to_string(), nm);
-            }
-        }
-    }
-    if let Some(owner) = meta.owner_pubkey.as_ref() {
-        id_to_name
-            .entry(owner.clone())
-            .or_insert_with(|| serde_json::Value::String("pool owner".to_string()));
-    }
-    id_to_name
-        .entry(meta.pool_pda.clone())
-        .or_insert_with(|| serde_json::Value::String(meta.pool_name.clone()));
-    serde_json::json!({
-        "pool_name": meta.pool_name,
-        "owner_wallet": meta.owner_pubkey,
-        "id_to_name": id_to_name,
-    })
 }
 
 fn new_uuid_bytes() -> [u8; 16] {
@@ -249,7 +187,6 @@ struct CreatedPool {
     pool_uuid: [u8; 16],
     signatures: Vec<String>,
     drts: BTreeMap<String, DrtMetadata>,
-    events: Vec<DrtEvent>,
 }
 
 async fn create_pool_atomic(
@@ -299,14 +236,13 @@ async fn create_pool_atomic(
     }
     ixs.push(build_seal_pool(&owner_pk, &pool_pda));
 
-    let (sig, events) = sign_send_and_parse(state, owner_keypair, ixs, "confirmed").await?;
+    let sig = sign_and_send(state, owner_keypair, ixs, "confirmed").await?;
 
     Ok(CreatedPool {
         pool_pda,
         pool_uuid,
         signatures: vec![sig],
         drts: drt_records,
-        events,
     })
 }
 
@@ -411,21 +347,8 @@ pub async fn create_malta_pool(
         schema = %schema_id,
         "MALTA pool created"
     );
-
-    let evt = crate::storage::audit::AuditEvent::new(AuditEventType::PoolCreated)
-        .with_user(&token.sub)
-        .with_resource("drt_pool", &pool_pda_str)
-        .with_pool_pda(&pool_pda_str)
-        .with_details(serde_json::json!({
-            "kind": "malta",
-            "pool_name": payload.pool_name,
-            "pool_uuid": pool_uuid_hex,
-            "tx_signatures": created.signatures,
-            "schema_id": schema_id,
-            "drt_count": meta.drts.len(),
-            "chain": chain_section(&created.signatures, &created.events, pool_labels(&meta, None)),
-        }));
-    state.storage.audit().log(evt).await;
+    audit::pool(&pool_pda_str);
+    audit::signature(&final_sig);
 
     Ok((
         axum::http::StatusCode::CREATED,

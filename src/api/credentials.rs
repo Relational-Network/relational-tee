@@ -7,7 +7,6 @@
 //! - `POST /v1/drt/pools/{pool_pda}/issue`      — issue credentials (append-DRT gated)
 //! - `POST /v1/drt/pools/{pool_pda}/revoke`     — revoke credential(s)
 //! - `GET  /v1/drt/pools/{pool_pda}/revocations` — list revocations
-//! - `GET  /v1/drt/pools/{pool_pda}/audit`      — pool-scoped audit log
 //! - `GET  /v1/drt/pools/{pool_pda}/summary`    — pool metadata + on-chain state
 //! - `GET  /v1/drt/pools/by-wallet/{wallet_id}` — list pools owned by wallet
 //! - `GET  /v1/drt/pools/list`                  — list all pools (marketplace discovery)
@@ -28,6 +27,7 @@ use tracing::{info, warn};
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
+use crate::audit;
 use crate::auth::AdminToken;
 use crate::blockchain::drt::{
     accounts::fetch_pool,
@@ -38,16 +38,13 @@ use crate::blockchain::drt::{
 use crate::error::ApiError;
 use crate::handlers::{parse_csv_payload, validate_payload};
 use crate::state::AppState;
-use crate::storage::audit::{AuditEvent, AuditEventType, AuditEventView, AuditFilter};
-use crate::storage::pools::{Change, PoolKind, PoolMetadata, PoolState};
+use crate::storage::pools::{Change, PoolKind, PoolState};
 use crate::storage::records::{RecordMeta, RecordStatus, StageOutcome};
 use crate::storage::store::Continuation;
 use crate::tee::KeyName;
 use sha2::{Digest, Sha256};
 
-use super::pools::{
-    load_pool_meta, load_wallet_keypair, sign_send_and_parse, verify_pool_ownership,
-};
+use super::pools::{load_pool_meta, load_wallet_keypair, sign_and_send, verify_pool_ownership};
 use super::CursorQuery;
 
 /// A staged initialisation younger than this is assumed to be in progress.
@@ -123,46 +120,8 @@ pub struct RevocationsResponse {
     pub next_cursor: Option<String>,
 }
 
-/// Pool-scoped audit query parameters.
-#[derive(Debug, Deserialize, IntoParams)]
-pub struct PoolAuditQuery {
-    /// Maximum number of events to return (default 50, max 200).
-    #[serde(default = "default_limit")]
-    pub limit: usize,
-    /// `next_cursor` from the previous page, with the same filters.
-    #[serde(default)]
-    pub cursor: Option<String>,
-    /// Filter to events of this type (snake_case, e.g. `credential_issued`).
-    /// Repeatable via comma-separated values (e.g. `pool_created,credential_issued`).
-    #[serde(default)]
-    pub event_type: Option<String>,
-    /// Filter to events with `user_id` equal to this (exact match).
-    #[serde(default)]
-    pub actor: Option<String>,
-    /// Filter to `success=true` (`ok`) or `success=false` (`failed`).
-    /// Anything else (empty / missing) returns both.
-    #[serde(default)]
-    pub status: Option<String>,
-    /// Inclusive RFC-3339 lower bound on `timestamp`.
-    #[serde(default)]
-    pub from: Option<String>,
-    /// Inclusive RFC-3339 upper bound on `timestamp`.
-    #[serde(default)]
-    pub to: Option<String>,
-}
-
 fn default_limit() -> usize {
     50
-}
-
-/// One page of a pool's audit events, newest first.
-#[derive(Debug, Serialize, ToSchema)]
-pub struct PoolAuditResponse {
-    pub pool_pda: String,
-    pub events: Vec<AuditEventView>,
-    /// Present when there's another page; pass it as `cursor`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub next_cursor: Option<String>,
 }
 
 /// Pool summary response (enclave metadata + on-chain state).
@@ -185,8 +144,6 @@ pub struct PoolSummaryResponse {
     pub last_issue_at: Option<String>,
     /// On-chain DRT configuration.
     pub drts: Vec<DrtConfigResponseCompact>,
-    /// Recent audit events (last 10).
-    pub recent_events: Vec<AuditEventView>,
 }
 
 /// Compact DRT config for the summary endpoint.
@@ -490,17 +447,6 @@ pub async fn upload_schema(
         "Schema uploaded and persisted"
     );
 
-    let audit_event = AuditEvent::new(AuditEventType::SchemaUploaded)
-        .with_user(&token.sub)
-        .with_resource("schema", &payload.schema_id)
-        .with_pool_pda(&pool_pda_str)
-        .with_details(serde_json::json!({
-            "pool_pda": pool_pda_str,
-            "schema_id": payload.schema_id,
-            "field_count": field_count,
-        }));
-    state.storage.audit().log(audit_event).await;
-
     Ok(Json(UploadSchemaResponse {
         schema_id: payload.schema_id,
         field_count,
@@ -646,7 +592,6 @@ pub async fn initialize_pool(
 
     // Move the pool to ready.
     let now = Utc::now();
-    let mut transitioned = false;
     state
         .storage
         .pools()
@@ -656,7 +601,6 @@ pub async fn initialize_pool(
             }
             m.state = PoolState::Ready;
             m.initialized_at = Some(now);
-            transitioned = true;
             Ok(Change::Changed)
         })
         .await?
@@ -669,21 +613,7 @@ pub async fn initialize_pool(
             "an earlier request already stored a different initial dataset for this pool",
         ));
     }
-
-    if transitioned {
-        let audit_event = AuditEvent::new(AuditEventType::DatasetInitialized)
-            .with_user(&token.sub)
-            .with_resource("drt_pool", &pool_pda_str)
-            .with_pool_pda(&pool_pda_str)
-            .with_details(serde_json::json!({
-                "pool_pda": pool_pda_str,
-                "record_id": committed.record_id,
-                "row_count": committed.rows,
-                "schema_id": meta.schema_id,
-                "state_transition": "needs_init -> ready"
-            }));
-        state.storage.audit().log(audit_event).await;
-    }
+    audit::upload(&committed.record_id, committed.rows);
 
     info!(
         pool = %pool_pda_str,
@@ -834,6 +764,7 @@ pub async fn issue_credentials(
 
     // ── BURN (irreversible) ───────────────────────────────────────
 
+    audit::upload(&record_id, row_count);
     let ix = build_grant_right(
         &pool_pda,
         &drt_config_pda,
@@ -841,9 +772,8 @@ pub async fn issue_credentials(
         &keypair.pubkey(),
         &commitment,
     );
-    let (sig_str, events) = match sign_send_and_parse(&state, &keypair, vec![ix], "finalized").await
-    {
-        Ok(result) => result,
+    let sig_str = match sign_and_send(&state, &keypair, vec![ix], "finalized").await {
+        Ok(sig) => sig,
         Err(failure) => {
             match &failure.sent {
                 // Nothing reached the chain, so no DRT was burned.
@@ -859,19 +789,7 @@ pub async fn issue_credentials(
             return Err(failure.error);
         }
     };
-
-    let chain = |meta: &PoolMetadata| {
-        let mut extra = serde_json::Map::new();
-        extra.insert(
-            hex::encode(commitment),
-            serde_json::Value::String(format!("upload {record_id}")),
-        );
-        crate::api::pools::chain_section(
-            std::slice::from_ref(&sig_str),
-            &events,
-            crate::api::pools::pool_labels(meta, Some(extra)),
-        )
-    };
+    audit::signature(&sig_str);
 
     // ── COMMIT ────────────────────────────────────────────────────
 
@@ -887,39 +805,12 @@ pub async fn issue_credentials(
     {
         warn!(pool = %pool_pda_str, record_id = %record_id, redeem_sig = %sig_str, error = %e,
             "DRT burned but the record couldn't be committed");
-        let mut fail_event = AuditEvent::new(AuditEventType::CredentialIssuanceFailed)
-            .with_user(&token.sub)
-            .with_resource("drt_pool", &pool_pda_str)
-            .with_pool_pda(&pool_pda_str)
-            .with_details(serde_json::json!({
-                "pool_pda": pool_pda_str,
-                "record_id": record_id,
-                "redeem_tx_sig": sig_str,
-                "error": e.to_string(),
-                "chain": chain(&meta),
-            }));
-        fail_event.success = false;
-        state.storage.audit().log(fail_event).await;
         return Err(ApiError::internal(format!(
             "the append DRT was burned (sig: {sig_str}) but the record couldn't be committed; it stays staged for reconciliation"
         )));
     }
 
     let totals = pool_totals(&state, &pool_pda_str).await?;
-
-    let audit_event = AuditEvent::new(AuditEventType::CredentialIssued)
-        .with_user(&token.sub)
-        .with_resource("drt_pool", &pool_pda_str)
-        .with_pool_pda(&pool_pda_str)
-        .with_details(serde_json::json!({
-            "pool_pda": pool_pda_str,
-            "record_id": record_id,
-            "row_count": row_count,
-            "redeem_tx_sig": sig_str,
-            "total_credentials": totals.rows,
-            "chain": chain(&meta),
-        }));
-    state.storage.audit().log(audit_event).await;
 
     let explorer_url = state.solana_client.network().explorer_tx_url(&sig_str);
 
@@ -1014,18 +905,6 @@ pub async fn revoke_credentials(
         }
     }
 
-    let audit_event = AuditEvent::new(AuditEventType::CredentialRevoked)
-        .with_user(&token.sub)
-        .with_resource("drt_pool", &pool_pda_str)
-        .with_pool_pda(&pool_pda_str)
-        .with_details(serde_json::json!({
-            "pool_pda": pool_pda_str,
-            "credential_ids": credential_ids,
-            "revoked_count": newly_revoked,
-            "reason": payload.reason
-        }));
-    state.storage.audit().log(audit_event).await;
-
     info!(
         pool = %pool_pda_str,
         count = credential_ids.len(),
@@ -1089,98 +968,13 @@ pub async fn list_revocations(
     }))
 }
 
-/// Query pool-scoped audit events.
-///
-/// Reads the pool's audit index, newest first, verifying every event.
-/// Filters apply in storage; `cursor` continues a previous page.
-#[utoipa::path(
-    get,
-    path = "/v1/drt/pools/{pool_pda}/audit",
-    tag = "Credentials",
-    summary = "Pool audit log",
-    description = "Audit events for one pool, newest first, one cursor page at a time. Every event is verified; `hmac_valid: false` marks one that failed. Admin only.",
-    security(("bearer_auth" = [])),
-    params(
-        ("pool_pda" = String, Path, description = "Pool PDA address (base58)"),
-        PoolAuditQuery,
-    ),
-    responses(
-        (status = 200, description = "Audit events", body = PoolAuditResponse),
-        (status = 400, description = "Invalid filter or cursor"),
-        (status = 401, description = "Unauthorized"),
-    )
-)]
-pub async fn pool_audit(
-    crate::auth::AnalystToken(_token): crate::auth::AnalystToken,
-    State(state): State<AppState>,
-    Path(pool_pda_str): Path<String>,
-    Query(query): Query<PoolAuditQuery>,
-) -> Result<Json<PoolAuditResponse>, ApiError> {
-    // Any admin can view audit events (no ownership check).
-    let time = |value: &Option<String>, name: &str| {
-        value
-            .as_deref()
-            .map(|s| {
-                chrono::DateTime::parse_from_rfc3339(s)
-                    .map(|d| d.with_timezone(&Utc))
-                    .map_err(|_| ApiError::bad_request(format!("{name} must be an RFC 3339 time")))
-            })
-            .transpose()
-    };
-    let filter = AuditFilter {
-        event_types: query
-            .event_type
-            .as_deref()
-            .map(|s| {
-                s.split(',')
-                    .map(str::trim)
-                    .filter(|t| !t.is_empty())
-                    .map(String::from)
-                    .collect()
-            })
-            .unwrap_or_default(),
-        actor: query.actor.clone().filter(|a| !a.is_empty()),
-        success: match query.status.as_deref() {
-            Some("ok" | "success") => Some(true),
-            Some("failed" | "error") => Some(false),
-            _ => None,
-        },
-        from: time(&query.from, "from")?,
-        to: time(&query.to, "to")?,
-    };
-
-    // The cursor is bound to the pool and the filters it was issued for.
-    let scope = format!(
-        "audit:{pool_pda_str}:{}:{}:{}:{}:{}",
-        query.event_type.as_deref().unwrap_or(""),
-        query.actor.as_deref().unwrap_or(""),
-        query.status.as_deref().unwrap_or(""),
-        query.from.as_deref().unwrap_or(""),
-        query.to.as_deref().unwrap_or(""),
-    );
-    let page = state.storage.page_from(&scope, query.cursor.as_deref())?;
-    let got = state
-        .storage
-        .audit()
-        .pool_events(&pool_pda_str, &filter, query.limit.clamp(1, 200), page)
-        .await?;
-
-    Ok(Json(PoolAuditResponse {
-        pool_pda: pool_pda_str,
-        events: got.items,
-        next_cursor: got
-            .next
-            .map(|next| state.storage.sign_cursor(&scope, &next)),
-    }))
-}
-
-/// Get pool summary (enclave metadata + on-chain state + recent events).
+/// Get pool summary (enclave metadata + on-chain state).
 #[utoipa::path(
     get,
     path = "/v1/drt/pools/{pool_pda}/summary",
     tag = "Credentials",
     summary = "Pool summary",
-    description = "Combined view of pool enclave metadata, on-chain DRT state, and recent audit events.",
+    description = "Combined view of pool enclave metadata and on-chain DRT state.",
     security(("bearer_auth" = [])),
     params(
         ("pool_pda" = String, Path, description = "Pool PDA address (base58)"),
@@ -1221,13 +1015,6 @@ pub async fn pool_summary(
         });
     }
 
-    // The pool's 10 most recent audit events.
-    let recent_events = state
-        .storage
-        .audit()
-        .pool_events(&pool_pda_str, &AuditFilter::default(), 10, None)
-        .await?
-        .items;
     let totals = pool_totals(&state, &pool_pda_str).await?;
 
     Ok(Json(PoolSummaryResponse {
@@ -1243,7 +1030,6 @@ pub async fn pool_summary(
         initialized_at: meta.initialized_at.map(|d| d.to_rfc3339()),
         last_issue_at: totals.last_issue_at.map(|d| d.to_rfc3339()),
         drts,
-        recent_events,
     }))
 }
 

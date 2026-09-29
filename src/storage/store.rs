@@ -23,8 +23,6 @@ pub enum Container {
     Datasets,
     /// Wallet keypairs; create-only.
     Wallets,
-    /// Encrypted, HMAC-tagged audit events; append blobs.
-    Audit,
     /// Encrypted, HMAC-tagged revocation log; append blobs.
     Revocations,
     /// Daily table exports; create-only.
@@ -38,10 +36,9 @@ pub enum Container {
 }
 
 impl Container {
-    pub const ALL: [Container; 8] = [
+    pub const ALL: [Container; 7] = [
         Container::Datasets,
         Container::Wallets,
-        Container::Audit,
         Container::Revocations,
         Container::Exports,
         Container::Leases,
@@ -53,7 +50,6 @@ impl Container {
         match self {
             Container::Datasets => "datasets",
             Container::Wallets => "wallets",
-            Container::Audit => "audit",
             Container::Revocations => "revocations",
             Container::Exports => "exports",
             Container::Leases => "leases",
@@ -70,18 +66,16 @@ pub enum Table {
     Records,
     Revocations,
     Wallets,
-    Audit,
     Idempotency,
     Identities,
 }
 
 impl Table {
-    pub const ALL: [Table; 7] = [
+    pub const ALL: [Table; 6] = [
         Table::Pools,
         Table::Records,
         Table::Revocations,
         Table::Wallets,
-        Table::Audit,
         Table::Idempotency,
         Table::Identities,
     ];
@@ -92,7 +86,6 @@ impl Table {
             Table::Records => "records",
             Table::Revocations => "revocations",
             Table::Wallets => "wallets",
-            Table::Audit => "audit",
             Table::Idempotency => "idempotency",
             Table::Identities => "identities",
         }
@@ -151,6 +144,7 @@ impl Entity {
         self
     }
 
+    #[cfg(test)]
     pub fn str(&self, name: &str) -> Option<&str> {
         match self.props.get(name) {
             Some(Prop::Str(s)) => Some(s),
@@ -161,13 +155,6 @@ impl Entity {
     pub fn bin(&self, name: &str) -> Option<&[u8]> {
         match self.props.get(name) {
             Some(Prop::Bin(b)) => Some(b),
-            _ => None,
-        }
-    }
-
-    pub fn bool(&self, name: &str) -> Option<bool> {
-        match self.props.get(name) {
-            Some(Prop::Bool(b)) => Some(*b),
             _ => None,
         }
     }
@@ -200,6 +187,7 @@ impl RkRange {
         }
     }
 
+    #[cfg(test)]
     pub fn between(start: Option<String>, end: Option<String>) -> Self {
         Self { start, end }
     }
@@ -227,29 +215,6 @@ fn prefix_end(prefix: &str) -> Option<String> {
 pub enum BatchOp {
     Insert(Entity),
     UpdateIfMatch(Entity, ETag),
-}
-
-/// A filter on plaintext properties.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Filter {
-    Eq(String, Prop),
-    And(Vec<Filter>),
-    Or(Vec<Filter>),
-}
-
-impl Filter {
-    pub fn eq(name: &str, prop: Prop) -> Self {
-        Filter::Eq(name.to_string(), prop)
-    }
-
-    #[cfg(any(test, feature = "dev"))]
-    pub fn matches(&self, props: &BTreeMap<String, Prop>) -> bool {
-        match self {
-            Filter::Eq(name, value) => props.get(name) == Some(value),
-            Filter::And(all) => all.iter().all(|f| f.matches(props)),
-            Filter::Or(any) => any.iter().any(|f| f.matches(props)),
-        }
-    }
 }
 
 /// Where the next page of a query starts. Opaque and backend-specific.
@@ -382,7 +347,6 @@ pub trait IndexStore: Send + Sync {
         t: Table,
         pk: &'a str,
         rk: RkRange,
-        filter: Option<Filter>,
         top: usize,
         page: Option<Continuation>,
     ) -> BoxFuture<'a, Result<Page<Entity>, StoreError>>;
@@ -419,26 +383,5 @@ mod tests {
         assert!(!range.contains("d"));
         assert!(!range.contains("a"));
         assert!(RkRange::all().contains(""));
-    }
-
-    #[test]
-    fn filters_combine() {
-        let props: BTreeMap<String, Prop> = [
-            ("event_type".to_string(), Prop::Str("pool_created".into())),
-            ("success".to_string(), Prop::Bool(true)),
-        ]
-        .into();
-        let either = Filter::Or(vec![
-            Filter::eq("event_type", Prop::Str("pool_created".into())),
-            Filter::eq("event_type", Prop::Str("credential_issued".into())),
-        ]);
-        assert!(Filter::And(vec![
-            either.clone(),
-            Filter::eq("success", Prop::Bool(true))
-        ])
-        .matches(&props));
-        assert!(
-            !Filter::And(vec![either, Filter::eq("success", Prop::Bool(false))]).matches(&props)
-        );
     }
 }

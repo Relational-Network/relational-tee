@@ -4,7 +4,7 @@
 //! Durable state: envelope-encrypted objects in Blob storage and rows in
 //! Table storage, behind the [`store::ObjectStore`] and [`store::IndexStore`]
 //! traits. The repositories ([`pools`], [`records`], [`revocations`],
-//! [`wallets`], [`audit`]) seal everything before it
+//! [`wallets`]) seal everything before it
 //! reaches a store, so a storage administrator sees only ciphertext and
 //! hashed identifiers. Workers keep no durable local state.
 
@@ -16,11 +16,10 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use store::{
-    Container, Continuation, ETag, Entity, Filter, IndexStore, ObjectStore, Page, Prop, PutOutcome,
+    Container, Continuation, ETag, Entity, IndexStore, ObjectStore, Page, Prop, PutOutcome,
     RkRange, Table,
 };
 
-pub mod audit;
 pub mod azure;
 #[cfg(test)]
 mod conformance;
@@ -110,10 +109,6 @@ impl Storage {
 
     pub fn wallets(&self) -> wallets::Wallets<'_> {
         wallets::Wallets::new(self)
-    }
-
-    pub fn audit(&self) -> audit::AuditLog<'_> {
-        audit::AuditLog::new(self)
     }
 
     pub fn worker_id(&self) -> &str {
@@ -216,7 +211,6 @@ impl Storage {
         table: Table,
         pk: &str,
         rk: RkRange,
-        filter: Option<Filter>,
         limit: usize,
         mut page: Option<Continuation>,
     ) -> Result<Page<Entity>, StoreError> {
@@ -225,14 +219,7 @@ impl Storage {
         loop {
             let got = self
                 .index
-                .query(
-                    table,
-                    pk,
-                    rk.clone(),
-                    filter.clone(),
-                    limit - items.len(),
-                    page,
-                )
+                .query(table, pk, rk.clone(), limit - items.len(), page)
                 .await?;
             items.extend(got.items);
             page = got.next;
@@ -248,15 +235,11 @@ impl Storage {
         table: Table,
         pk: &str,
         rk: RkRange,
-        filter: Option<Filter>,
     ) -> Result<Vec<Entity>, StoreError> {
         let mut all = Vec::new();
         let mut page = None;
         loop {
-            let got = self
-                .index
-                .query(table, pk, rk.clone(), filter.clone(), 1000, page)
-                .await?;
+            let got = self.index.query(table, pk, rk.clone(), 1000, page).await?;
             all.extend(got.items);
             match got.next {
                 Some(next) => page = Some(next),

@@ -330,7 +330,7 @@ impl<'a> Wallets<'a> {
     ) -> Result<Page<WalletMetadata>, StoreError> {
         let rows = self
             .s
-            .query_rows(Table::Wallets, WALLET_PK, RkRange::all(), None, limit, page)
+            .query_rows(Table::Wallets, WALLET_PK, RkRange::all(), limit, page)
             .await?;
         Ok(Page {
             items: rows
@@ -345,7 +345,7 @@ impl<'a> Wallets<'a> {
     /// Every wallet.
     pub async fn all(&self) -> Result<Vec<WalletMetadata>, StoreError> {
         self.s
-            .query_all(Table::Wallets, WALLET_PK, RkRange::all(), None)
+            .query_all(Table::Wallets, WALLET_PK, RkRange::all())
             .await?
             .iter()
             .map(|e| self.s.open_row(Table::Wallets, PAYLOAD_VERSION, e))

@@ -7,8 +7,8 @@
 use bytes::Bytes;
 
 use super::store::{
-    BatchOp, Container, Entity, Filter, IndexStore, InsertOutcome, ObjectStore, Prop, PutOutcome,
-    RkRange, StoreError, Table,
+    BatchOp, Container, Entity, IndexStore, InsertOutcome, ObjectStore, Prop, PutOutcome, RkRange,
+    StoreError, Table,
 };
 
 /// Run every check. `run` keeps keys unique, so reruns against a shared
@@ -61,11 +61,15 @@ async fn append_blobs(objects: &dyn ObjectStore, run: &str) {
     let path = format!("conformance/{run}/log.jsonl");
     for line in ["one\n", "two\n"] {
         objects
-            .append(Container::Audit, &path, Bytes::from(line))
+            .append(Container::Revocations, &path, Bytes::from(line))
             .await
             .unwrap();
     }
-    let got = objects.get(Container::Audit, &path).await.unwrap().unwrap();
+    let got = objects
+        .get(Container::Revocations, &path)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(got.body.as_ref(), b"one\ntwo\n");
 }
 
@@ -177,15 +181,11 @@ async fn conditional_row_writes(index: &dyn IndexStore, run: &str) {
 
 async fn queries_and_pages(index: &dyn IndexStore, run: &str) {
     let pk = format!("query-{run}");
-    for (rk, state, ok) in [
-        ("log:1", "ready", true),
-        ("log:2", "needs_init", true),
-        ("log:3", "ready", false),
-        ("log:4", "ready", true),
-        ("rec:1", "ready", true),
-    ] {
-        let entity = row(&pk, rk, state).with("success", Prop::Bool(ok));
-        index.insert(Table::Records, entity).await.unwrap();
+    for rk in ["log:1", "log:2", "log:3", "log:4", "rec:1"] {
+        index
+            .insert(Table::Records, row(&pk, rk, "ready"))
+            .await
+            .unwrap();
     }
     // Another partition never leaks in.
     index
@@ -198,10 +198,14 @@ async fn queries_and_pages(index: &dyn IndexStore, run: &str) {
     let mut page = None;
     loop {
         let got = index
-            .query(Table::Records, &pk, logs.clone(), None, 2, page)
+            .query(Table::Records, &pk, logs.clone(), 2, page)
             .await
             .unwrap();
         assert!(got.items.len() <= 2);
+        assert!(
+            got.items.iter().all(|e| e.etag.is_some()),
+            "query rows carry ETags"
+        );
         seen.extend(got.items.into_iter().map(|e| e.rk));
         match got.next {
             Some(next) => page = Some(next),
@@ -209,39 +213,6 @@ async fn queries_and_pages(index: &dyn IndexStore, run: &str) {
         }
     }
     assert_eq!(seen, ["log:1", "log:2", "log:3", "log:4"]);
-
-    let ready_and_ok = Filter::And(vec![
-        Filter::eq("state", Prop::Str("ready".into())),
-        Filter::eq("success", Prop::Bool(true)),
-    ]);
-    let got = index
-        .query(
-            Table::Records,
-            &pk,
-            logs.clone(),
-            Some(ready_and_ok),
-            100,
-            None,
-        )
-        .await
-        .unwrap();
-    let rks: Vec<_> = got.items.iter().map(|e| e.rk.as_str()).collect();
-    assert_eq!(rks, ["log:1", "log:4"]);
-
-    let either = Filter::Or(vec![
-        Filter::eq("state", Prop::Str("needs_init".into())),
-        Filter::eq("success", Prop::Bool(false)),
-    ]);
-    let got = index
-        .query(Table::Records, &pk, RkRange::all(), Some(either), 100, None)
-        .await
-        .unwrap();
-    let rks: Vec<_> = got.items.iter().map(|e| e.rk.as_str()).collect();
-    assert_eq!(rks, ["log:2", "log:3"]);
-    assert!(
-        got.items.iter().all(|e| e.etag.is_some()),
-        "query rows carry ETags"
-    );
 }
 
 async fn atomic_batches(index: &dyn IndexStore, run: &str) {

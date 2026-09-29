@@ -13,8 +13,8 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 
 use super::store::{
-    BatchOp, BoxFuture, Container, Continuation, ETag, Entity, Filter, IndexStore, InsertOutcome,
-    Object, ObjectStore, Page, Prop, PutOutcome, RkRange, StoreError, Table,
+    BatchOp, BoxFuture, Container, Continuation, ETag, Entity, IndexStore, InsertOutcome, Object,
+    ObjectStore, Page, Prop, PutOutcome, RkRange, StoreError, Table,
 };
 
 /// A row's properties and ETag, keyed by partition and row key.
@@ -299,7 +299,6 @@ impl IndexStore for MemoryStore {
         t: Table,
         pk: &'a str,
         rk: RkRange,
-        filter: Option<Filter>,
         top: usize,
         page: Option<Continuation>,
     ) -> BoxFuture<'a, Result<Page<Entity>, StoreError>> {
@@ -312,8 +311,7 @@ impl IndexStore for MemoryStore {
                 .range((pk.to_string(), String::new())..)
                 .take_while(|((p, _), _)| p == pk)
                 .filter(|((_, r), _)| rk.contains(r))
-                .filter(|((_, r), _)| start_after.as_deref().is_none_or(|s| r.as_str() >= s))
-                .filter(|(_, (props, _))| filter.as_ref().is_none_or(|f| f.matches(props)));
+                .filter(|((_, r), _)| start_after.as_deref().is_none_or(|s| r.as_str() >= s));
             for ((p, r), (props, etag)) in matching {
                 if items.len() == top.max(1) {
                     next = Some(Continuation(r.clone()));

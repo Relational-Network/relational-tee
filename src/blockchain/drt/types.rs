@@ -36,9 +36,8 @@ pub const APPEND_DRT_NAME: &str = "append";
 // ── Discriminators re-exported from idl_generated ───────────────
 
 pub use super::idl_generated::{
-    DISC_CREATE_POOL, DISC_DRT_CONFIG_ACCOUNT, DISC_DRT_REGISTERED, DISC_GRANT_RIGHT,
-    DISC_POOL_ACCOUNT, DISC_POOL_CREATED, DISC_POOL_SEALED, DISC_REGISTER_DRT, DISC_RIGHT_GRANTED,
-    DISC_RIGHT_REVOKED, DISC_SEAL_POOL,
+    DISC_CREATE_POOL, DISC_DRT_CONFIG_ACCOUNT, DISC_GRANT_RIGHT, DISC_POOL_ACCOUNT,
+    DISC_REGISTER_DRT, DISC_SEAL_POOL,
 };
 
 // ── Limits ──────────────────────────────────────────────────────
@@ -173,47 +172,4 @@ pub struct PoolInfoResponse {
     pub owner: String,
     pub sealed: bool,
     pub drts: Vec<DrtConfigResponse>,
-}
-
-// ============================================================================
-// Event response types (embedded in audit details)
-// ============================================================================
-
-/// Single event in API format.
-#[derive(Debug, Serialize, ToSchema)]
-#[serde(tag = "type")]
-pub enum DrtEventResponse {
-    #[serde(rename = "pool_created")]
-    PoolCreated {
-        pool: String,
-        uuid: String,
-        owner: String,
-        created_at: i64,
-    },
-    #[serde(rename = "drt_registered")]
-    DrtRegistered {
-        pool: String,
-        drt_config: String,
-        mint: String,
-        right_id: String,
-        supply: u64,
-        code_hash: String,
-        created_at: i64,
-    },
-    #[serde(rename = "right_granted")]
-    RightGranted {
-        pool: String,
-        drt_config: String,
-        commitment: String,
-        granted_at: i64,
-    },
-    #[serde(rename = "right_revoked")]
-    RightRevoked {
-        pool: String,
-        drt_config: String,
-        commitment: String,
-        revoked_at: i64,
-    },
-    #[serde(rename = "pool_sealed")]
-    PoolSealed { pool: String, sealed_at: i64 },
 }

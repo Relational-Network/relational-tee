@@ -20,13 +20,12 @@ use std::str::FromStr;
 use tracing::info;
 use utoipa::{IntoParams, ToSchema};
 
-use crate::audit_log;
+use crate::audit;
 use crate::auth::UserToken;
 use crate::blockchain::signing::keypair_from_bytes_verified;
 use crate::error::ApiError;
 use crate::history::{WalletRef, WalletTransaction};
 use crate::state::AppState;
-use crate::storage::audit::AuditEventType;
 
 use super::{enforce_owner_active, load_wallet};
 
@@ -226,16 +225,9 @@ pub async fn send_transaction(
         amount = payload.amount,
         "Transaction sent"
     );
+    audit::signature(&result.signature);
     state.history.invalidate(&wallet.public_address);
     state.history.invalidate(&payload.recipient);
-
-    audit_log!(
-        state,
-        AuditEventType::TransactionBroadcast,
-        &token.sub,
-        "wallet",
-        &wallet_id
-    );
 
     Ok(Json(SendTransactionResponse {
         signature: result.signature,

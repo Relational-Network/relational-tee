@@ -27,8 +27,8 @@ use zeroize::Zeroizing;
 use chrono::{DateTime, Utc};
 
 use super::store::{
-    BatchOp, BoxFuture, Container, Continuation, ETag, Entity, Filter, IndexStore, InsertOutcome,
-    Object, ObjectStore, Page, Prop, PutOutcome, RkRange, StoreError, Table,
+    BatchOp, BoxFuture, Container, Continuation, ETag, Entity, IndexStore, InsertOutcome, Object,
+    ObjectStore, Page, Prop, PutOutcome, RkRange, StoreError, Table,
 };
 use crate::http_client::{HttpClient, Response};
 
@@ -738,28 +738,6 @@ fn literal(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
-fn render_filter(filter: &Filter) -> Result<String, StoreError> {
-    Ok(match filter {
-        Filter::Eq(name, Prop::Str(s)) => format!("{name} eq {}", literal(s)),
-        Filter::Eq(name, Prop::Bool(b)) => format!("{name} eq {b}"),
-        Filter::Eq(_, Prop::Bin(_)) => {
-            return Err(StoreError::Invalid(
-                "binary properties can't be filtered".into(),
-            ))
-        }
-        Filter::And(all) => all
-            .iter()
-            .map(|f| render_filter(f).map(|s| format!("({s})")))
-            .collect::<Result<Vec<_>, _>>()?
-            .join(" and "),
-        Filter::Or(any) => any
-            .iter()
-            .map(|f| render_filter(f).map(|s| format!("({s})")))
-            .collect::<Result<Vec<_>, _>>()?
-            .join(" or "),
-    })
-}
-
 impl IndexStore for AzureStore {
     fn get<'a>(
         &'a self,
@@ -890,7 +868,6 @@ impl IndexStore for AzureStore {
         t: Table,
         pk: &'a str,
         rk: RkRange,
-        filter: Option<Filter>,
         top: usize,
         page: Option<Continuation>,
     ) -> BoxFuture<'a, Result<Page<Entity>, StoreError>> {
@@ -901,9 +878,6 @@ impl IndexStore for AzureStore {
             }
             if let Some(end) = &rk.end {
                 clauses.push(format!("RowKey lt {}", literal(end)));
-            }
-            if let Some(filter) = &filter {
-                clauses.push(format!("({})", render_filter(filter)?));
             }
             let mut query = vec![
                 ("$filter", clauses.join(" and ")),
@@ -1071,18 +1045,8 @@ mod tests {
     }
 
     #[test]
-    fn filters_render_as_odata() {
-        let filter = Filter::And(vec![
-            Filter::Or(vec![
-                Filter::eq("event_type", Prop::Str("pool_created".into())),
-                Filter::eq("event_type", Prop::Str("o'brien".into())),
-            ]),
-            Filter::eq("success", Prop::Bool(false)),
-        ]);
-        assert_eq!(
-            render_filter(&filter).unwrap(),
-            "((event_type eq 'pool_created') or (event_type eq 'o''brien')) and (success eq false)"
-        );
+    fn keys_are_quoted_and_encoded() {
+        assert_eq!(literal("o'brien"), "'o''brien'");
         assert_eq!(table_key("owner:ab"), "owner%3Aab");
     }
 }

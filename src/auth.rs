@@ -337,11 +337,13 @@ impl FromRequestParts<AppState> for TokenData {
             .strip_prefix("Bearer ")
             .ok_or_else(|| ApiError::unauthorized("invalid authorization header format"))?;
 
-        validate_token(state, token).await.map_err(|_| {
+        let token = validate_token(state, token).await.map_err(|_| {
             // Detailed errors already logged inside validate_token.
             // Return generic message to prevent information leakage.
             ApiError::unauthorized("invalid or expired token")
-        })
+        })?;
+        crate::audit::caller(&token.sub);
+        Ok(token)
     }
 }
 

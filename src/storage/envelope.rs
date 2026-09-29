@@ -142,6 +142,7 @@ impl StorageKeys {
         hmac_hex(&self.audit_hmac, canonical)
     }
 
+    #[cfg(test)]
     pub fn audit_tag_valid(&self, canonical: &[u8], tag: &str) -> bool {
         hmac_verify(&self.audit_hmac, canonical, tag)
     }
@@ -576,19 +577,32 @@ mod tests {
     #[test]
     fn log_lines_are_bound_to_their_blob_and_event() {
         let k = keys();
-        let line = k.seal_log_line(Container::Audit, "2026/09/29/10/w.jsonl", "e1", b"event");
+        let line = k.seal_log_line(
+            Container::Revocations,
+            "2026/09/29/10/w.jsonl",
+            "e1",
+            b"event",
+        );
         assert!(line.ends_with('\n'));
         let (id, plain) = k
-            .open_log_line(Container::Audit, "2026/09/29/10/w.jsonl", line.trim_end())
+            .open_log_line(
+                Container::Revocations,
+                "2026/09/29/10/w.jsonl",
+                line.trim_end(),
+            )
             .expect("opens");
         assert_eq!((id.as_str(), plain.as_slice()), ("e1", b"event".as_slice()));
         assert!(k
-            .open_log_line(Container::Audit, "2026/09/29/11/w.jsonl", line.trim_end())
+            .open_log_line(
+                Container::Revocations,
+                "2026/09/29/11/w.jsonl",
+                line.trim_end()
+            )
             .is_err());
         let renamed = line.replace("\"id\":\"e1\"", "\"id\":\"e2\"");
         assert!(k
             .open_log_line(
-                Container::Audit,
+                Container::Revocations,
                 "2026/09/29/10/w.jsonl",
                 renamed.trim_end()
             )

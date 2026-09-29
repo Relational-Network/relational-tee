@@ -16,12 +16,11 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 use utoipa::ToSchema;
 
-use crate::audit_log;
+use crate::audit;
 use crate::auth::UserToken;
 use crate::blockchain::signing::generate_solana_keypair;
 use crate::error::ApiError;
 use crate::state::AppState;
-use crate::storage::audit::AuditEventType;
 use crate::storage::wallets::{CreateOutcome, WalletMetadata, WalletResponse, WalletStatus};
 
 use super::{enforce_owner, load_wallet};
@@ -135,14 +134,7 @@ pub async fn create_wallet(
         owner = %token.sub,
         "Wallet created"
     );
-
-    audit_log!(
-        state,
-        AuditEventType::WalletCreated,
-        &token.sub,
-        "wallet",
-        &wallet_id
-    );
+    audit::wallet(&wallet_id);
 
     let explorer_url = state
         .solana_client
@@ -259,14 +251,6 @@ pub async fn delete_wallet(
         wallet_id = %wallet_id,
         owner = %token.sub,
         "Wallet soft-deleted"
-    );
-
-    audit_log!(
-        state,
-        AuditEventType::WalletDeleted,
-        &token.sub,
-        "wallet",
-        &wallet_id
     );
 
     Ok(Json(DeleteWalletResponse {

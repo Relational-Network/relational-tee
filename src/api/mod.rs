@@ -155,7 +155,6 @@ pub fn wallet_router() -> Router<AppState> {
         // ── Admin ───────────────────────────────────────────────
         .route("/v1/admin/wallet-stats", get(admin::get_wallet_stats))
         .route("/v1/admin/wallets", get(admin::list_all_wallets))
-        .route("/v1/admin/audit/events", get(admin::query_audit_logs))
         .route(
             "/v1/admin/wallets/{wallet_id}/suspend",
             post(admin::suspend_wallet),
@@ -164,7 +163,6 @@ pub fn wallet_router() -> Router<AppState> {
             "/v1/admin/wallets/{wallet_id}/activate",
             post(admin::activate_wallet),
         )
-        .route("/v1/admin/log-role-change", post(admin::log_role_change))
 }
 
 /// Build the DRT pool routes (nested under `/v1/drt`).
@@ -200,10 +198,6 @@ pub fn drt_router() -> Router<AppState> {
         .route(
             "/v1/drt/pools/{pool_pda}/revocations",
             get(credentials::list_revocations),
-        )
-        .route(
-            "/v1/drt/pools/{pool_pda}/audit",
-            get(credentials::pool_audit),
         )
         .route(
             "/v1/drt/pools/{pool_pda}/summary",

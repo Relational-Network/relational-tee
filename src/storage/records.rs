@@ -368,7 +368,6 @@ impl<'a> Records<'a> {
                 Table::Records,
                 pool_pda,
                 RkRange::prefix(LOG_PREFIX),
-                None,
                 limit,
                 page,
             )
@@ -393,7 +392,6 @@ impl<'a> Records<'a> {
                 Table::Records,
                 pool_pda,
                 RkRange::prefix(LOG_PREFIX),
-                None,
                 1,
                 None,
             )
@@ -412,7 +410,7 @@ impl<'a> Records<'a> {
         let mut totals = RecordTotals::default();
         for row in self
             .s
-            .query_all(Table::Records, pool_pda, RkRange::prefix(LOG_PREFIX), None)
+            .query_all(Table::Records, pool_pda, RkRange::prefix(LOG_PREFIX))
             .await?
         {
             let meta: RecordMeta = self.s.open_row(Table::Records, PAYLOAD_VERSION, &row)?;

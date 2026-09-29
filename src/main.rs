@@ -17,6 +17,7 @@
 
 mod api;
 mod attestation;
+mod audit;
 mod auth;
 mod blockchain;
 mod config;
@@ -117,7 +118,6 @@ Protected endpoints require a JWT issued by the Attestation Verification Service
         api::transactions::get_transaction_status,
         api::admin::get_wallet_stats,
         api::admin::list_all_wallets,
-        api::admin::query_audit_logs,
         api::admin::suspend_wallet,
         api::admin::activate_wallet,
         // DRT Pool API (new contract)
@@ -131,7 +131,6 @@ Protected endpoints require a JWT issued by the Attestation Verification Service
         api::credentials::issue_credentials,
         api::credentials::revoke_credentials,
         api::credentials::list_revocations,
-        api::credentials::pool_audit,
         api::credentials::pool_summary,
         api::credentials::get_issuance_log,
         api::credentials::list_pools_by_wallet,
@@ -167,7 +166,6 @@ Protected endpoints require a JWT issued by the Attestation Verification Service
         api::admin::WalletStatsResponse,
         api::admin::AdminListWalletsResponse,
         api::admin::AdminWalletEntry,
-        api::admin::AuditEventsResponse,
         api::admin::WalletStatusChangeResponse,
         // Shared domain types
         storage::wallets::WalletResponse,
@@ -196,7 +194,6 @@ Protected endpoints require a JWT issued by the Attestation Verification Service
         api::credentials::RevokeCredentialsResponse,
         api::credentials::RevocationEntry,
         api::credentials::RevocationsResponse,
-        api::credentials::PoolAuditResponse,
         api::credentials::PoolSummaryResponse,
         api::credentials::DrtConfigResponseCompact,
         api::credentials::PoolListEntry,
@@ -206,10 +203,6 @@ Protected endpoints require a JWT issued by the Attestation Verification Service
         api::credentials::AllPoolsResponse,
         api::credentials::IssuanceRecord,
         api::credentials::IssuanceLogResponse,
-        // Audit schemas
-        storage::audit::AuditEvent,
-        storage::audit::AuditEventView,
-        storage::audit::AuditEventType,
     )),
     modifiers(&SecurityAddon),
     tags(
@@ -554,6 +547,7 @@ fn router(state: AppState) -> Router {
         // DRT pool routes.
         .merge(api::drt_router())
         .fallback(request_id::not_found)
+        .layer(axum::middleware::from_fn(audit::record))
         .with_state(state);
 
     // SwaggerUi serves the OpenAPI document itself.

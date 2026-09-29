@@ -156,14 +156,7 @@ impl<'a> Revocations<'a> {
     ) -> Result<Page<Revocation>, StoreError> {
         let rows = self
             .s
-            .query_rows(
-                Table::Revocations,
-                pool_pda,
-                RkRange::all(),
-                None,
-                limit,
-                page,
-            )
+            .query_rows(Table::Revocations, pool_pda, RkRange::all(), limit, page)
             .await?;
         let mut items = Vec::with_capacity(rows.items.len());
         for entity in &rows.items {
@@ -187,7 +180,7 @@ impl<'a> Revocations<'a> {
     pub async fn count(&self, pool_pda: &str) -> Result<u64, StoreError> {
         Ok(self
             .s
-            .query_all(Table::Revocations, pool_pda, RkRange::all(), None)
+            .query_all(Table::Revocations, pool_pda, RkRange::all())
             .await?
             .len() as u64)
     }

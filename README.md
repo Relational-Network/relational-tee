@@ -90,7 +90,6 @@ The worker reaches Azure Storage over its own hyper and rustls client, with Entr
 - **Keys.** HKDF-SHA256 over `storage-root`'s private scalar, salt `relational-tee/storage-root`, with a versioned label per purpose: `blob-kek-v1`, `table-payload-v1`, `index-hmac-v1`, `audit-hmac-v1`, `log-enc-v1` and `cursor-hmac-v1`.
 - **Blobs** get a fresh AES-256-GCM data key each, wrapped (RFC 3394) under the blob key. The additional authenticated data binds each object to its container and path.
 - **Table rows** carry their fields in one encrypted `payload` property, bound to the table and the row's keys. Plaintext properties are copies of filter fields; the worker trusts only the payload. User IDs appear in keys only as `h(x)`, an HMAC under the index key.
-- **Audit events** carry an HMAC tag under `audit-hmac-v1`, so every worker can verify every event. Each is appended encrypted to the worker's hourly append blob, then indexed by pool and by day. Reads verify each event and return failures with `hmac_valid: false` instead of dropping them.
 - **Pools** are rows changed only by ETag compare-and-swap, so no worker needs a lock. Their totals are computed from committed records and revocations, and cached per worker until the pool's newest record changes.
 - **Datasets** are staged (a record row claims the ID, then the create-only blob is written), then committed in one atomic batch, and made immutable for 7 days. The dataset's data key lives only in its record row, so deleting it there erases the blob. If an append-DRT burn never reaches the chain, the staged dataset is removed; if it was sent but not confirmed, the record stays staged for reconciliation.
 - **Revocations** are appended to an encrypted, HMAC-tagged log (the authoritative record), then indexed per pool.
@@ -112,7 +111,8 @@ CI (`.github/workflows/ci.yml`) runs `just check` in the dev shell, `nix flake c
 
 ## API conventions
 
-- **Request IDs.** Every response carries `X-Request-Id`: the client's value if it's a valid UUID, otherwise a new one. The same ID is on the request's log lines and is the `correlation_id` of every audit event the request causes.
+- **Request IDs.** Every response carries `X-Request-Id`: the client's value if it's a valid UUID, otherwise a new one. The same ID is on the request's log lines and on its audit event.
+- **Audit events.** Every mutation, failed mutation and admin read logs exactly one event with target `audit` when it completes, for operators to query in Azure Monitor. An event carries only `event` (for example `credential_issued`), `outcome` (`success` or `failure`), `code` on failure, `request_id`, `user_id`, and where relevant `pool`, `record_id`, `wallet_id`, `rows` and `signature`; never CSV content, emails, free-text reasons, keys or client IP addresses. The output leaves the TEE through the host, so these events are diagnostics: the pool's own records and the chain are the audit trail users rely on.
 - **Errors.** Every error, including unknown routes and malformed bodies, has one body shape: `{ "error": "<message>", "code": "<snake_case code>", "request_id": "<id>" }`. Clients branch on `code`; `error` is for people. Codes by status: `bad_request`, `unauthorized`, `forbidden`, `not_found`, `method_not_allowed`, `request_timeout`, `conflict`, `payload_too_large`, `unsupported_media_type`, `unprocessable_entity`, `rate_limited`, `internal_error`, `service_unavailable`. More specific codes: `invalid_cursor` and `validation_failed` (400), `wallet_exists` and `initialization_in_progress` (409), `integrity_error` (500), `storage_unavailable`, `rpc_unavailable` and `attestation_unavailable` (503).
 - **Pagination.** Lists take `cursor` and `limit` and return `next_cursor` when there's another page (see [Storage](#storage)).
 
@@ -122,8 +122,8 @@ CI (`.github/workflows/ci.yml`) runs `just check` in the dev shell, `nix flake c
 - **Attestation:** `GET /v1/attestation` returns `{ maa_token, transport_jwk, kid }`: an MAA token whose `x-ms-runtime.keys[0]` is the transport public key, and the key's RFC 7638 thumbprint. The worker requests the token at startup, refreshes it at 80% of its lifetime and serves it from memory; it answers 503 until the first token arrives. `GET /v1/attestation/public-key` still returns the bare transport public key, which the dashboard seals uploads to.
 - **Users:** `GET /v1/users/me`.
 - **Wallets:** `GET` and `POST /v1/wallets`; `GET` and `DELETE /v1/wallets/{id}`; `GET …/balance`; `POST …/estimate` and `…/send`; `GET …/transactions` and `…/transactions/{signature}`.
-- **Pools:** `POST /v1/drt/pools/malta`; `GET /v1/drt/pools/list`, `/v1/drt/pools/{pda}`, `…/drt/{name}` and `/v1/drt/pools/by-wallet/{wallet_id}`; `POST` and `GET …/schema`; `POST …/initialize`, `…/issue` and `…/revoke`; `GET …/revocations`, `…/audit`, `…/summary` and `…/issuance-log`.
-- **Admin:** `GET /v1/admin/status`, `/v1/admin/wallet-stats`, `/v1/admin/wallets` and `/v1/admin/audit/events`; `POST /v1/admin/wallets/{id}/suspend` and `…/activate`; `POST /v1/admin/log-role-change`.
+- **Pools:** `POST /v1/drt/pools/malta`; `GET /v1/drt/pools/list`, `/v1/drt/pools/{pda}`, `…/drt/{name}` and `/v1/drt/pools/by-wallet/{wallet_id}`; `POST` and `GET …/schema`; `POST …/initialize`, `…/issue` and `…/revoke`; `GET …/revocations`, `…/summary` and `…/issuance-log`.
+- **Admin:** `GET /v1/admin/status`, `/v1/admin/wallet-stats` and `/v1/admin/wallets`; `POST /v1/admin/wallets/{id}/suspend` and `…/activate`.
 - **Docs:** `GET /api-doc/openapi.json`; Swagger UI at `/docs` in builds with the `swagger-ui` feature.
 
 Analyst grants, DRT script execution and the data query were removed from this server and will be rebuilt on the new stack. `drt-examples/` keeps an example DRT script for that work.
