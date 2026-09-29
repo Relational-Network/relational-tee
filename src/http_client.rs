@@ -5,9 +5,10 @@
 //!
 //! Replaces `reqwest` to drop the entire `url` → `idna` → `icu_*` chain
 //! (~25 transitive crates carrying Unicode normalization data tables) from
-//! the dependency tree. Only supports the two operations this crate uses:
-//! GET and POST-with-JSON-body. URLs are passed straight to `http::Uri` —
-//! no host normalization, no redirects, no cookies, no proxy support.
+//! the dependency tree. [`HttpClient::get`] and [`HttpClient::post_json`]
+//! cover JSON APIs; [`HttpClient::send`] takes any prepared request, for the
+//! storage REST APIs. URLs are passed straight to `http::Uri` — no host
+//! normalization, no redirects, no cookies, no proxy support.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -91,7 +92,7 @@ impl HttpClient {
 
     /// GET `url`. The full response body is collected into [`Response`].
     pub async fn get(&self, url: &str) -> Result<Response, HttpError> {
-        self.send(Method::GET, url, None).await
+        self.send_json(Method::GET, url, None).await
     }
 
     /// POST `url` with `body` serialized as JSON.
@@ -102,7 +103,35 @@ impl HttpClient {
     ) -> Result<Response, HttpError> {
         let bytes = serde_json::to_vec(body)
             .map_err(|e| HttpError::new(format!("serialize request body: {e}")))?;
-        self.send(Method::POST, url, Some(bytes)).await
+        self.send_json(Method::POST, url, Some(bytes)).await
+    }
+
+    /// Send a prepared request and collect the whole response. Adds a
+    /// `User-Agent` header when the request has none.
+    pub async fn send(&self, mut req: Request<Full<Bytes>>) -> Result<Response, HttpError> {
+        if !req.headers().contains_key(header::USER_AGENT) {
+            req.headers_mut().insert(
+                header::USER_AGENT,
+                header::HeaderValue::from_static(USER_AGENT),
+            );
+        }
+
+        let resp = tokio::time::timeout(self.timeout, self.inner.request(req))
+            .await
+            .map_err(|_| HttpError::new(format!("request timed out after {:?}", self.timeout)))?
+            .map_err(|e| HttpError::new(format!("request failed: {e}")))?;
+
+        let status = resp.status();
+        let collected = tokio::time::timeout(self.timeout, resp.into_body().collect())
+            .await
+            .map_err(|_| HttpError::new("timed out reading the response body"))?
+            .map_err(|e| HttpError::new(format!("read response body: {e}")))?
+            .to_bytes();
+
+        Ok(Response {
+            status,
+            body: collected,
+        })
     }
 
     fn build(roots: RootCertStore) -> Self {
@@ -126,7 +155,7 @@ impl HttpClient {
         }
     }
 
-    async fn send(
+    async fn send_json(
         &self,
         method: Method,
         url: &str,
@@ -139,7 +168,6 @@ impl HttpClient {
         let mut builder = Request::builder()
             .method(&method)
             .uri(&uri)
-            .header(header::USER_AGENT, USER_AGENT)
             .header(header::ACCEPT, "application/json");
 
         let body_bytes = match body {
@@ -153,24 +181,7 @@ impl HttpClient {
         let req = builder
             .body(Full::new(body_bytes))
             .map_err(|e| HttpError::new(format!("build request: {e}")))?;
-
-        let resp = tokio::time::timeout(self.timeout, self.inner.request(req))
-            .await
-            .map_err(|_| HttpError::new(format!("request timed out after {:?}", self.timeout)))?
-            .map_err(|e| HttpError::new(format!("request failed: {e}")))?;
-
-        let status = resp.status();
-        let collected = resp
-            .into_body()
-            .collect()
-            .await
-            .map_err(|e| HttpError::new(format!("read response body: {e}")))?
-            .to_bytes();
-
-        Ok(Response {
-            status,
-            body: collected,
-        })
+        self.send(req).await
     }
 }
 

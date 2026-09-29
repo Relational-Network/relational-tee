@@ -10,6 +10,8 @@ use std::env;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 
+use crate::tee::skr::SkrConfig;
+
 // ============================================================================
 // Auth (AVS JWT)
 // ============================================================================
@@ -68,16 +70,38 @@ pub enum Transport {
     PlainHttp,
 }
 
+/// Where the worker's keys come from (`KEY_PROVIDER`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyProviderConfig {
+    /// `skr`: the SKR sidecar in the same container group.
+    Skr(SkrConfig),
+    /// `local`: dev key files in `DEV_KEYS_DIR`. Not compiled into release builds.
+    #[cfg(feature = "dev")]
+    Local { dir: PathBuf },
+}
+
+/// Default SKR sidecar address: localhost, port 9000.
+pub const DEFAULT_SKR_ENDPOINT: &str = "http://localhost:9000";
+
+/// Default attestation authority (the shared West Europe MAA endpoint).
+pub const DEFAULT_MAA_ENDPOINT: &str = "sharedweu.weu.attest.azure.net";
+
+/// Key Vault placeholder for dev builds, where the fake sidecar ignores it.
+#[cfg(feature = "dev")]
+const DEV_KEY_VAULT_URL: &str = "https://dev.vault.azure.net";
+
 /// Process configuration read once from the environment at startup.
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     pub addr: SocketAddr,
     pub data_dir: PathBuf,
     pub transport: Transport,
+    pub keys: KeyProviderConfig,
 }
 
 impl ServerConfig {
-    /// Read `BIND_ADDR`, `PORT`, `DATA_DIR`, `TLS_CERT_PATH` and `TLS_KEY_PATH`.
+    /// Read `BIND_ADDR`, `PORT`, `DATA_DIR`, `TLS_CERT_PATH`, `TLS_KEY_PATH`
+    /// and the key provider settings (see [`key_provider_from_lookup`]).
     pub fn from_env() -> Result<Self, String> {
         Self::from_lookup(|key| env::var(key).ok().filter(|v| !v.is_empty()))
     }
@@ -121,8 +145,99 @@ impl ServerConfig {
             addr: SocketAddr::new(ip, port),
             data_dir,
             transport,
+            keys: key_provider_from_lookup(&lookup)?,
         })
     }
+}
+
+/// Read `KEY_PROVIDER` (`skr`, or `local` in dev builds) and its settings:
+/// `SKR_ENDPOINT`, `MAA_ENDPOINT`, `KEY_VAULT_URL` and `KEY_NAMES` for `skr`,
+/// `DEV_KEYS_DIR` for `local`. Dev builds default to `local`, release builds
+/// to `skr`.
+fn key_provider_from_lookup(
+    lookup: &impl Fn(&str) -> Option<String>,
+) -> Result<KeyProviderConfig, String> {
+    #[cfg(feature = "dev")]
+    let default = "local";
+    #[cfg(not(feature = "dev"))]
+    let default = "skr";
+
+    match lookup("KEY_PROVIDER").as_deref().unwrap_or(default) {
+        "skr" => skr_config_from_lookup(lookup).map(KeyProviderConfig::Skr),
+        #[cfg(feature = "dev")]
+        "local" => Ok(KeyProviderConfig::Local {
+            dir: lookup("DEV_KEYS_DIR")
+                .unwrap_or_else(|| crate::tee::dev_keys::DEFAULT_DIR.into())
+                .into(),
+        }),
+        #[cfg(not(feature = "dev"))]
+        "local" => Err(
+            "KEY_PROVIDER=local isn't available: release builds contain only \
+                        the skr provider"
+                .into(),
+        ),
+        other => Err(format!(
+            "KEY_PROVIDER {other:?} is unknown: use skr or local"
+        )),
+    }
+}
+
+fn skr_config_from_lookup(lookup: &impl Fn(&str) -> Option<String>) -> Result<SkrConfig, String> {
+    let endpoint = lookup("SKR_ENDPOINT").unwrap_or_else(|| DEFAULT_SKR_ENDPOINT.into());
+    if !endpoint.starts_with("http://") {
+        return Err(format!("SKR_ENDPOINT {endpoint:?} must be an http:// URL"));
+    }
+    // The sidecar speaks plain HTTP and returns private keys, so release
+    // builds only talk to it over loopback.
+    #[cfg(not(feature = "dev"))]
+    if !is_loopback_http_url(&endpoint) {
+        return Err(format!(
+            "SKR_ENDPOINT {endpoint:?} must be on localhost: the sidecar returns keys in the clear"
+        ));
+    }
+
+    #[cfg(feature = "dev")]
+    let vault = lookup("KEY_VAULT_URL").unwrap_or_else(|| DEV_KEY_VAULT_URL.into());
+    #[cfg(not(feature = "dev"))]
+    let vault = lookup("KEY_VAULT_URL").ok_or("KEY_VAULT_URL is required when KEY_PROVIDER=skr")?;
+
+    let key_names = match lookup("KEY_NAMES") {
+        Some(list) => {
+            let names: Vec<String> = list.split(',').map(|s| s.trim().to_string()).collect();
+            <[String; 4]>::try_from(names).map_err(|_| {
+                "KEY_NAMES must list four names: transport, storage root, TLS and commitment"
+                    .to_string()
+            })?
+        }
+        None => crate::tee::KeyName::ALL.map(|k| k.as_str().to_string()),
+    };
+    if key_names.iter().any(|n| n.is_empty()) {
+        return Err("KEY_NAMES has an empty name".into());
+    }
+
+    Ok(SkrConfig {
+        endpoint,
+        maa_endpoint: host_only(
+            "MAA_ENDPOINT",
+            &lookup("MAA_ENDPOINT").unwrap_or_else(|| DEFAULT_MAA_ENDPOINT.into()),
+        )?,
+        akv_endpoint: host_only("KEY_VAULT_URL", &vault)?,
+        key_names,
+    })
+}
+
+/// The sidecar takes bare hosts: strip `https://` and any trailing slash.
+fn host_only(name: &str, value: &str) -> Result<String, String> {
+    let host = value
+        .strip_prefix("https://")
+        .unwrap_or(value)
+        .trim_end_matches('/');
+    if host.is_empty() || host.contains(['/', '?', '#', ' ']) || host.starts_with("http://") {
+        return Err(format!(
+            "{name} {value:?} must be a host name or an https:// URL"
+        ));
+    }
+    Ok(host.to_string())
 }
 
 // ============================================================================
@@ -228,11 +343,12 @@ pub const ALLOW_HTTP_JWKS: bool = true;
 /// Returns `true` when `url` is an `http://` URL whose host is the loopback
 /// interface (`localhost`, `127.0.0.1`, or `::1`).
 ///
-/// Used to gate the "plain HTTP JWKS" warning and the production hard-block.
+/// Used to gate the "plain HTTP JWKS" warning and the production hard-block,
+/// and to keep release builds' SKR sidecar traffic on loopback.
 /// Substring matching (e.g. `url.contains("localhost")`) is unsafe — a host
 /// like `attacker.example.com/localhost/...` would have falsely passed.
 /// This parser extracts the authority and matches the host exactly.
-pub fn is_loopback_http_jwks(url: &str) -> bool {
+pub fn is_loopback_http_url(url: &str) -> bool {
     let Some(rest) = url.strip_prefix("http://") else {
         return false;
     };
@@ -264,24 +380,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn loopback_http_jwks_accepts_loopback_hosts() {
-        assert!(is_loopback_http_jwks("http://localhost:9100/jwks"));
-        assert!(is_loopback_http_jwks(
+    fn loopback_http_url_accepts_loopback_hosts() {
+        assert!(is_loopback_http_url("http://localhost:9100/jwks"));
+        assert!(is_loopback_http_url(
             "http://127.0.0.1:9100/.well-known/jwks.json"
         ));
-        assert!(is_loopback_http_jwks("http://[::1]:9100/jwks"));
-        assert!(is_loopback_http_jwks("http://localhost"));
+        assert!(is_loopback_http_url("http://[::1]:9100/jwks"));
+        assert!(is_loopback_http_url("http://localhost"));
     }
 
     #[test]
-    fn loopback_http_jwks_rejects_substring_bypass() {
+    fn loopback_http_url_rejects_substring_bypass() {
         // The old `url.contains("localhost")` check would have accepted these.
-        assert!(!is_loopback_http_jwks(
+        assert!(!is_loopback_http_url(
             "http://attacker.example.com/localhost"
         ));
-        assert!(!is_loopback_http_jwks("http://localhost.evil.com/jwks"));
-        assert!(!is_loopback_http_jwks("http://user@evil.com/127.0.0.1"));
-        assert!(!is_loopback_http_jwks(
+        assert!(!is_loopback_http_url("http://localhost.evil.com/jwks"));
+        assert!(!is_loopback_http_url("http://user@evil.com/127.0.0.1"));
+        assert!(!is_loopback_http_url(
             "http://example.com:8080/path?host=127.0.0.1"
         ));
     }
@@ -302,6 +418,7 @@ mod tests {
             ("DATA_DIR", "/var/lib/rt"),
             ("TLS_CERT_PATH", "cert.pem"),
             ("TLS_KEY_PATH", "key.pem"),
+            ("KEY_VAULT_URL", "kv.vault.azure.net"),
         ])
         .expect("valid config");
         assert_eq!(config.addr, "[::1]:9443".parse().unwrap());
@@ -336,16 +453,101 @@ mod tests {
     #[cfg(not(feature = "dev"))]
     #[test]
     fn release_build_requires_tls() {
-        assert!(config_from(&[]).is_err());
-        let config = config_from(&[("TLS_CERT_PATH", "c"), ("TLS_KEY_PATH", "k")])
-            .expect("release config with TLS");
+        let vault = ("KEY_VAULT_URL", "kv.vault.azure.net");
+        assert!(config_from(&[vault]).is_err());
+        let config =
+            config_from(&[RELEASE_TLS[0], RELEASE_TLS[1], vault]).expect("release config with TLS");
         assert_eq!(config.addr, "0.0.0.0:8443".parse().unwrap());
         assert_eq!(config.data_dir, PathBuf::from("/data"));
     }
 
+    const RELEASE_TLS: [(&str, &str); 2] = [("TLS_CERT_PATH", "c"), ("TLS_KEY_PATH", "k")];
+
     #[test]
-    fn loopback_http_jwks_rejects_https_and_other_schemes() {
-        assert!(!is_loopback_http_jwks("https://localhost/jwks"));
-        assert!(!is_loopback_http_jwks("file:///tmp/jwks"));
+    #[allow(clippy::infallible_destructuring_match)] // release builds have only the skr provider
+    fn skr_settings_are_read_as_bare_hosts() {
+        let config = config_from(&[
+            RELEASE_TLS[0],
+            RELEASE_TLS[1],
+            ("KEY_PROVIDER", "skr"),
+            ("SKR_ENDPOINT", "http://127.0.0.1:9000"),
+            ("MAA_ENDPOINT", "https://sharedweu.weu.attest.azure.net/"),
+            (
+                "KEY_VAULT_URL",
+                "https://kv-iob-micres-pilot.vault.azure.net",
+            ),
+            ("KEY_NAMES", "t,s, tls ,c"),
+        ])
+        .expect("valid config");
+        let skr = match config.keys {
+            KeyProviderConfig::Skr(skr) => skr,
+            #[cfg(feature = "dev")]
+            other => panic!("expected the skr provider, got {other:?}"),
+        };
+        assert_eq!(skr.endpoint, "http://127.0.0.1:9000");
+        assert_eq!(skr.maa_endpoint, "sharedweu.weu.attest.azure.net");
+        assert_eq!(skr.akv_endpoint, "kv-iob-micres-pilot.vault.azure.net");
+        assert_eq!(skr.key_names, ["t", "s", "tls", "c"].map(String::from));
+    }
+
+    #[test]
+    fn skr_settings_reject_bad_values() {
+        // The first match wins, so `extra` overrides the defaults after it.
+        let with = |extra: (&str, &str)| {
+            config_from(&[
+                extra,
+                RELEASE_TLS[0],
+                RELEASE_TLS[1],
+                ("KEY_PROVIDER", "skr"),
+                ("KEY_VAULT_URL", "kv.vault.azure.net"),
+            ])
+        };
+        assert!(with(("PORT", "9443")).is_ok());
+        assert!(with(("KEY_NAMES", "a,b,c")).is_err());
+        assert!(with(("SKR_ENDPOINT", "https://localhost:9000")).is_err());
+        assert!(with(("MAA_ENDPOINT", "http://maa.example")).is_err());
+        assert!(with(("KEY_PROVIDER", "vault")).is_err());
+    }
+
+    #[cfg(feature = "dev")]
+    #[test]
+    fn dev_build_defaults_to_local_dev_keys() {
+        let config = config_from(&[]).expect("dev defaults");
+        assert_eq!(
+            config.keys,
+            KeyProviderConfig::Local {
+                dir: PathBuf::from("dev/keys")
+            }
+        );
+    }
+
+    #[cfg(not(feature = "dev"))]
+    #[test]
+    fn release_build_rejects_the_local_key_provider() {
+        let err = config_from(&[RELEASE_TLS[0], RELEASE_TLS[1], ("KEY_PROVIDER", "local")])
+            .expect_err("local isn't compiled in");
+        assert!(err.contains("KEY_PROVIDER=local"), "{err}");
+    }
+
+    #[cfg(not(feature = "dev"))]
+    #[test]
+    fn release_build_requires_a_vault_and_a_loopback_sidecar() {
+        assert!(config_from(&[RELEASE_TLS[0], RELEASE_TLS[1]]).is_err());
+        let vault = ("KEY_VAULT_URL", "kv.vault.azure.net");
+        let config = config_from(&[RELEASE_TLS[0], RELEASE_TLS[1], vault]).expect("skr default");
+        assert!(matches!(config.keys, KeyProviderConfig::Skr(_)));
+        assert!(config_from(&[
+            RELEASE_TLS[0],
+            RELEASE_TLS[1],
+            vault,
+            ("SKR_ENDPOINT", "http://10.0.0.5:9000")
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn loopback_http_url_rejects_https_and_other_schemes() {
+        assert!(!is_loopback_http_url("https://localhost/jwks"));
+        assert!(!is_loopback_http_url("file:///tmp/jwks"));
     }
 }

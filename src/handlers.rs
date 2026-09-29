@@ -9,45 +9,47 @@
 //! - Admin endpoints (require admin role)
 //! - Sealed CSV upload parsing and validation shared by the pool endpoints
 
-use axum::{extract::Multipart, Json};
+use axum::{
+    extract::{Multipart, State},
+    Json,
+};
 use serde::Serialize;
 use tracing::{debug, info};
 use utoipa::ToSchema;
 
 use crate::auth::AdminToken;
 use crate::config::MAX_BODY_SIZE;
-use crate::crypto::{enclave_key, Jwk};
+use crate::crypto::{jwk_for_public_key, Jwk};
 use crate::data_validation::{
     load_pool_schema, validate_csv_bytes, ValidationMode, ValidationSummary,
 };
 use crate::error::ApiError;
+use crate::state::AppState;
 use crate::storage::paths::StoragePaths;
+use crate::tee::{KeyName, ReleasedKey};
 
 // ============================================================================
 // Public Key Endpoint
 // ============================================================================
 
-/// Get the enclave's public key for encrypting data.
+/// Get the transport public key that uploads are sealed to.
 ///
-/// Browsers use this key to encrypt payloads that only the enclave can decrypt.
-/// The key is ephemeral and generated at enclave startup.
-///
-/// **Note:** In production, verify this key via AVS attestation tokens instead
-/// of fetching directly.
+/// Every worker holds the same transport key, released at startup, so an
+/// upload sealed on one worker's answer opens on any worker.
 #[utoipa::path(
     get,
     path = "/v1/attestation/public-key",
     tag = "Attestation",
-    summary = "Get enclave public key",
-    description = "Returns the enclave's P-256 public key in JWK format for browser encryption.",
+    summary = "Get the transport public key",
+    description = "Returns the current P-256 transport public key in JWK format for browser encryption.",
     responses(
         (status = 200, description = "Public key returned", body = Jwk)
     )
 )]
-pub async fn get_public_key() -> Json<Jwk> {
-    debug!("Serving enclave public key");
-    let key = enclave_key();
-    Json(key.public_jwk().clone())
+pub async fn get_public_key(State(state): State<AppState>) -> Json<Jwk> {
+    debug!("Serving the transport public key");
+    let transport = state.keys.get(KeyName::Transport);
+    Json(jwk_for_public_key(&transport.current.public_key()))
 }
 
 // ============================================================================
@@ -129,12 +131,16 @@ pub(crate) fn validate_payload(
     Ok(validate_csv_bytes(csv_bytes, &schema, mode))
 }
 
-pub(crate) async fn parse_csv_payload(multipart: Multipart) -> Result<ParsedCsvPayload, ApiError> {
+pub(crate) async fn parse_csv_payload(
+    transport: &ReleasedKey,
+    multipart: Multipart,
+) -> Result<ParsedCsvPayload, ApiError> {
     let input = parse_multipart_fields(multipart).await?;
     let (encrypted_data, ephemeral_key, nonce) = input.encrypted_parts()?;
 
-    let csv_bytes = crate::crypto::decrypt_ecdh_payload(&encrypted_data, &ephemeral_key, &nonce)
-        .map_err(ApiError::bad_request)?;
+    let csv_bytes =
+        crate::crypto::decrypt_ecdh_payload(transport, &encrypted_data, &ephemeral_key, &nonce)
+            .map_err(ApiError::bad_request)?;
 
     ensure_size_limit(&csv_bytes)?;
 

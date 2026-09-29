@@ -23,7 +23,7 @@ default:
     @just --list
 
 # Run the dev build natively on 127.0.0.1:8443 (HTTPS once `just cert` has run).
-dev *args:
+dev *args: dev-keys
     #!/usr/bin/env bash
     set -euo pipefail
     if [[ -f dev/certs/cert.pem && -f dev/certs/key.pem ]]; then
@@ -31,6 +31,10 @@ dev *args:
         export TLS_KEY_PATH="${TLS_KEY_PATH:-dev/certs/key.pem}"
     fi
     exec cargo run --features dev,swagger-ui -- {{ args }}
+
+# Create any missing dev keys in dev/keys/; existing keys are kept.
+dev-keys:
+    cargo run --quiet --features dev -- dev-keys dev/keys
 
 # Create a locally trusted certificate for localhost with mkcert.
 cert:

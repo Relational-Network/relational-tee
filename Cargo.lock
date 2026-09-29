@@ -1639,6 +1639,7 @@ dependencies = [
  "utoipa-swagger-ui",
  "uuid",
  "webpki-roots",
+ "zeroize",
 ]
 
 [[package]]

@@ -7,6 +7,7 @@ The worker behind IOB MicRes: an Axum server that runs Use Case 1 credential poo
 ## What works today, and what's interim
 
 - **Transport.** Dev builds serve plain HTTP on `127.0.0.1:8443`, or HTTPS with a local mkcert certificate. Release builds have no plain HTTP path: they read a PEM certificate and key from `TLS_CERT_PATH` and `TLS_KEY_PATH`, and refuse to start without them.
+- **Keys.** At startup the worker obtains four P-256 keys, `transport-key`, `storage-root`, `tls-key` and `commitment-key`, and keeps them in memory only. Release builds get them from Microsoft's SKR sidecar on localhost (`KEY_PROVIDER=skr`), which releases a key only to a confidential container group whose attested policy matches the key's release policy. Dev builds default to `KEY_PROVIDER=local`, which reads dev keys from `dev/keys/` (`just dev-keys` creates them); release builds don't contain that provider and refuse `KEY_PROVIDER=local`. Uploads are sealed to `transport-key`, which every worker shares.
 - **Storage.** State lives under `DATA_DIR` as JSON files plus a redb database, **unencrypted on disk**. Use synthetic data only; the server warns about this at startup.
 - **Auth.** Protected endpoints still validate ES256 tokens from the Attestation Verification Service (AVS). The AVS only issues tokens to an SGX enclave it has attested, so authenticated endpoints can't be exercised locally until Entra ID validation replaces it. Public endpoints (`/health*`, `/v1/attestation/public-key`, `/docs`) work.
 - **Solana.** The public devnet RPC by default. It is rate-limited and has no SLA, and the server warns about it at startup.
@@ -23,7 +24,8 @@ just            # list the recipes
 
 | Recipe | What it does |
 |---|---|
-| `just dev` | Run the dev build natively on `127.0.0.1:8443`, with Swagger UI at `/docs` |
+| `just dev` | Run the dev build natively on `127.0.0.1:8443`, with Swagger UI at `/docs` (creates missing dev keys first) |
+| `just dev-keys` | Create any missing dev keys in `dev/keys/`, one private JWK per key; existing keys are kept |
 | `just cert` | Create a locally trusted mkcert certificate in `dev/certs/`; `just dev` then serves HTTPS |
 | `just test` | Run the tests with cargo-nextest, in the release and dev configurations |
 | `just check` | Run every gate: rustfmt, clippy (`-D warnings`, with and without all features), the tests, the banned-crate check and `cargo audit` |
@@ -43,6 +45,12 @@ Not there yet: a container stack with several replicas and local fakes for stora
 | `PORT` | `8443` | `8443` | Listening port |
 | `DATA_DIR` | `data` | `/data` | Local storage directory |
 | `TLS_CERT_PATH`, `TLS_KEY_PATH` | unset: plain HTTP | required | PEM certificate chain and private key |
+| `KEY_PROVIDER` | `local` | `skr` (the only one) | Where keys come from: the SKR sidecar, or dev key files |
+| `DEV_KEYS_DIR` | `dev/keys` | n/a | Dev key files for `KEY_PROVIDER=local` |
+| `SKR_ENDPOINT` | `http://localhost:9000` | same, loopback only | SKR sidecar address |
+| `MAA_ENDPOINT` | `sharedweu.weu.attest.azure.net` | same | Attestation authority the sidecar uses |
+| `KEY_VAULT_URL` | a placeholder | required | Key Vault the sidecar releases keys from |
+| `KEY_NAMES` | `transport-key,storage-root,tls-key,commitment-key` | same | Key Vault names of the four keys, in that order |
 | `SOLANA_RPC_URL` | `https://api.devnet.solana.com` | same | Solana RPC endpoint |
 | `SOLANA_NETWORK` | `devnet` | same | `devnet` or `mainnet`, for explorer links |
 | `AVS_JWKS_URL` | `http://127.0.0.1:9100/.well-known/jwks.json` | same | AVS signing keys |
@@ -64,7 +72,7 @@ CI (`.github/workflows/ci.yml`) runs `just check` in the dev shell, `nix flake c
 ## Endpoints
 
 - **Health:** `GET /health`, `/health/live`, `/health/ready`.
-- **Attestation:** `GET /v1/attestation/public-key` returns the per-process P-256 key that the dashboard seals uploads to.
+- **Attestation:** `GET /v1/attestation/public-key` returns the public half of `transport-key`, which the dashboard seals uploads to.
 - **Users:** `GET /v1/users/me`.
 - **Wallets:** `GET` and `POST /v1/wallets`; `GET` and `DELETE /v1/wallets/{id}`; `GET …/balance`; `POST …/estimate` and `…/send`; `GET …/transactions` and `…/transactions/{signature}`.
 - **Pools:** `POST /v1/drt/pools/malta`; `GET /v1/drt/pools/list`, `/v1/drt/pools/{pda}`, `…/drt/{name}` and `/v1/drt/pools/by-wallet/{wallet_id}`; `POST` and `GET …/schema`; `POST …/initialize`, `…/issue` and `…/revoke`; `GET …/revocations`, `…/audit`, `…/summary` and `…/issuance-log`.

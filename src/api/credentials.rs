@@ -40,6 +40,7 @@ use crate::state::AppState;
 use crate::storage::audit::{AuditEvent, AuditEventType, AuditRepository};
 use crate::storage::pool_metadata::{PoolKind, PoolMetadata, PoolState};
 use crate::storage::repository::wallets::WalletRepository;
+use crate::tee::KeyName;
 use sha2::{Digest, Sha256};
 
 use super::pools::{load_wallet_keypair, sign_send_and_parse, verify_pool_ownership};
@@ -598,7 +599,7 @@ pub async fn initialize_pool(
     multipart: Multipart,
 ) -> Result<Json<InitializePoolResponse>, ApiError> {
     // Parse and decrypt the CSV payload.
-    let parsed = parse_csv_payload(multipart).await?;
+    let parsed = parse_csv_payload(state.keys.get(KeyName::Transport), multipart).await?;
 
     // Validate the pool PDA format.
     let pool_pda = Pubkey::from_str(&pool_pda_str)
@@ -758,7 +759,7 @@ pub async fn issue_credentials(
     // ── VALIDATION (reversible, cheap) ────────────────────────────
 
     // Parse and decrypt the CSV payload.
-    let parsed = parse_csv_payload(multipart).await?;
+    let parsed = parse_csv_payload(state.keys.get(KeyName::Transport), multipart).await?;
 
     let pool_pda = Pubkey::from_str(&pool_pda_str)
         .map_err(|_| ApiError::bad_request("invalid pool PDA address"))?;

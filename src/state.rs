@@ -10,10 +10,14 @@ use crate::blockchain::SolanaClient;
 use crate::storage::tx_cache::TxCache;
 use crate::storage::tx_database::TxDatabase;
 use crate::storage::EncryptedStorage;
+use crate::tee::WorkerKeys;
 
 /// Shared application state passed to every handler via Axum's `State` extractor.
 #[derive(Clone)]
 pub struct AppState {
+    /// The worker's released keys.
+    pub keys: Arc<WorkerKeys>,
+
     // ── Auth (existing) ─────────────────────────────────────────
     /// Expected `aud` claim.
     pub audience: String,

@@ -28,6 +28,7 @@ mod http_client;
 mod indexer;
 mod state;
 mod storage;
+mod tee;
 
 use axum::{
     extract::DefaultBodyLimit,
@@ -45,12 +46,14 @@ use utoipa::{openapi::security::SecurityScheme, Modify, OpenApi};
 #[cfg(feature = "swagger-ui")]
 use utoipa_swagger_ui::SwaggerUi;
 
-use config::{avs_jwks_url, ServerConfig, Transport, AVS_AUDIENCE, MAX_BODY_SIZE};
+use config::{
+    avs_jwks_url, KeyProviderConfig, ServerConfig, Transport, AVS_AUDIENCE, MAX_BODY_SIZE,
+};
 
-use crypto::enclave_key;
 use handlers::{admin_status, get_public_key, AdminStatusResponse};
 use health::{health, liveness, readiness, HealthChecks, HealthResponse, ReadyResponse};
 use state::AppState;
+use tee::{KeyProvider, WorkerKeys};
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -236,9 +239,65 @@ async fn openapi_json() -> axum::Json<utoipa::openapi::OpenApi> {
 // Application Entry Point
 // ============================================================================
 
+/// Dev-only commands: `relational-tee dev-keys [DIR]` creates any missing dev
+/// key files. Returns the exit code when the arguments name a command.
+#[cfg(feature = "dev")]
+fn run_dev_command(args: &[String]) -> Option<i32> {
+    let command = args.get(1)?;
+    match command.as_str() {
+        "dev-keys" => {
+            let dir = std::path::PathBuf::from(
+                args.get(2)
+                    .map(String::as_str)
+                    .unwrap_or(tee::dev_keys::DEFAULT_DIR),
+            );
+            match tee::dev_keys::generate_missing(&dir) {
+                Ok(created) => {
+                    for path in &created {
+                        println!("created {}", path.display());
+                    }
+                    if created.is_empty() {
+                        println!("dev keys in {} are complete", dir.display());
+                    }
+                    Some(0)
+                }
+                Err(e) => {
+                    eprintln!("error: creating dev keys in {}: {e}", dir.display());
+                    Some(1)
+                }
+            }
+        }
+        other => {
+            eprintln!("error: unknown command {other:?} (dev commands: dev-keys)");
+            Some(2)
+        }
+    }
+}
+
+/// Build the configured key provider.
+fn key_provider(config: &KeyProviderConfig) -> Box<dyn KeyProvider> {
+    match config {
+        KeyProviderConfig::Skr(skr) => {
+            info!(endpoint = %skr.endpoint, vault = %skr.akv_endpoint, maa = %skr.maa_endpoint,
+                "Releasing keys through the SKR sidecar");
+            Box::new(tee::skr::SkrSidecar::new(skr.clone()))
+        }
+        #[cfg(feature = "dev")]
+        KeyProviderConfig::Local { dir } => {
+            warn!(dir = %dir.display(), "KEY_PROVIDER=local: using dev keys (dev builds only)");
+            Box::new(tee::local::LocalDev::new(dir.clone()))
+        }
+    }
+}
+
 /// Service entrypoint: read configuration, build the router, and serve.
 #[tokio::main]
 async fn main() {
+    #[cfg(feature = "dev")]
+    if let Some(code) = run_dev_command(&std::env::args().collect::<Vec<_>>()) {
+        std::process::exit(code);
+    }
+
     // Initialize tracing with environment filter (RUST_LOG).
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -259,8 +318,14 @@ async fn main() {
     // http_client (hyper-rustls) pick this up via process-global default.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-    // Initialize enclave keypair.
-    let _ = enclave_key();
+    // Release the four keys before anything else; without them the worker
+    // can't serve. Exiting lets the platform restart it.
+    let keys = WorkerKeys::release_all(key_provider(&server_config.keys).as_ref())
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!(error = %e, "Key release failed");
+            std::process::exit(1);
+        });
 
     // Initialize local storage.
     let data_dir = server_config.data_dir.as_path();
@@ -286,7 +351,7 @@ async fn main() {
     {
         let url = avs_jwks_url();
         if url.starts_with("http://") {
-            let is_local = config::is_loopback_http_jwks(&url);
+            let is_local = config::is_loopback_http_url(&url);
             if !is_local {
                 tracing::error!(
                     jwks_url = %url,
@@ -307,7 +372,7 @@ async fn main() {
     {
         let url = avs_jwks_url();
         if url.starts_with("http://") {
-            let is_local = config::is_loopback_http_jwks(&url);
+            let is_local = config::is_loopback_http_url(&url);
             if !is_local && !config::ALLOW_HTTP_JWKS {
                 panic!(
                     "AVS_JWKS_URL is plain HTTP for a remote host: {url}. \
@@ -345,6 +410,7 @@ async fn main() {
 
     // Create shared application state.
     let state = AppState {
+        keys: Arc::new(keys),
         audience: AVS_AUDIENCE.to_string(),
         jwks_cache: Arc::new(tokio::sync::RwLock::new(None)),
         storage: Arc::new(encrypted_storage),

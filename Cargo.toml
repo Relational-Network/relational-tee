@@ -43,6 +43,7 @@ hmac = { version = "0.12", default-features = false }
 base64 = { version = "0.22.1", default-features = false }
 hkdf = { version = "0.12.4", default-features = false }
 aes-gcm = { version = "0.10.3", default-features = false, features = ["aes", "alloc"] }
+zeroize = { version = "1.8", default-features = false, features = ["alloc"] }
 
 # ── HTTP client (hyper-direct, no reqwest) ────────────────────────
 # Hand-rolled minimal client in src/http_client.rs avoids the entire
@@ -93,3 +94,6 @@ mimalloc = { version = "0.1.52", default-features = false }
 # ── In-process cache ──────────────────────────────────────────────
 lru = { version = "0.18", default-features = false }
 dashmap = { version = "6", default-features = false }
+
+[dev-dependencies]
+tokio = { version = "1.49.0", default-features = false, features = ["test-util"] }

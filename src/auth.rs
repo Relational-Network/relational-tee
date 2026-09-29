@@ -45,10 +45,11 @@ use serde::Deserialize;
 use std::time::Instant;
 use tracing::{debug, warn};
 
-use crate::config::{avs_jwks_url, is_loopback_http_jwks, AVS_ISSUER, JWKS_CACHE_TTL_SECS};
-use crate::crypto::{enclave_key, Jwk, JwksResponse};
+use crate::config::{avs_jwks_url, is_loopback_http_url, AVS_ISSUER, JWKS_CACHE_TTL_SECS};
+use crate::crypto::{jwk_for_public_key, Jwk, JwksResponse};
 use crate::http_client::HttpClient;
 use crate::state::AppState;
+use crate::tee::KeyName;
 
 /// Claims from AVS-issued attestation tokens.
 ///
@@ -188,7 +189,7 @@ pub async fn get_decoding_keys(state: &AppState) -> Result<Vec<(String, Decoding
     // Warn if using HTTP for a non-loopback host (insecure in production).
     // Uses parsed-host check; substring matching would let `evil.com/localhost`
     // through.
-    if url.starts_with("http://") && !is_loopback_http_jwks(&url) {
+    if url.starts_with("http://") && !is_loopback_http_url(&url) {
         tracing::warn!(
             "JWKS URL uses HTTP - this is insecure in production: {}",
             url
@@ -260,9 +261,9 @@ pub async fn validate_token(state: &AppState, token: &str) -> Result<TokenData, 
             format!("token validation failed: {e}")
         })?;
 
-    // Verify token is bound to THIS enclave by comparing public key coordinates.
-    // Prevents token-swap attacks where a legitimate AVS token issued for a
-    // different enclave instance is replayed against this one.
+    // Verify the token is bound to this deployment's transport key by
+    // comparing public key coordinates, so an AVS token issued for another
+    // deployment can't be replayed here.
     // This claim is MANDATORY — tokens without it are rejected.
     let token_key = token_data
         .claims
@@ -273,7 +274,7 @@ pub async fn validate_token(state: &AppState, token: &str) -> Result<TokenData, 
             "token missing required enclave_public_key claim".to_string()
         })?;
     {
-        let actual = enclave_key().public_jwk();
+        let actual = jwk_for_public_key(&state.keys.get(KeyName::Transport).current.public_key());
         let key_matches = token_key.x.as_deref() == actual.x.as_deref()
             && token_key.y.as_deref() == actual.y.as_deref()
             && token_key.x.is_some()
@@ -281,11 +282,11 @@ pub async fn validate_token(state: &AppState, token: &str) -> Result<TokenData, 
         if !key_matches {
             warn!(
                 sub = %token_data.claims.sub,
-                "Token enclave_public_key does not match this enclave — possible token-swap attack"
+                "Token enclave_public_key does not match the transport key — possible token-swap attack"
             );
-            return Err("token is not bound to this enclave".to_string());
+            return Err("token is not bound to this deployment".to_string());
         }
-        debug!("Token enclave_public_key verified — matches this enclave");
+        debug!("Token enclave_public_key verified — matches the transport key");
     }
 
     // Missing role defaults to least privilege rather than elevated access.
