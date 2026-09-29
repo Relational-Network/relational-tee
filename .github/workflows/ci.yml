@@ -1,49 +1,62 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 Relational Network
 
+# Every job gets its toolchain from the Nix flake, which pins Rust through
+# rust-toolchain.toml, so CI and local builds can't drift apart.
+
 name: CI
 
 on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
-  RUST_BACKTRACE: 1
 
 jobs:
-  check:
-    name: Lint and Test
+  gates:
+    name: Gates (fmt, clippy, tests, banned crates, audit)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6.0.2
+      - uses: cachix/install-nix-action@v31
+      # cargo audit needs the advisory database, so it runs outside the Nix
+      # sandbox, in the dev shell. deny-crates fails if rsa or openssl-sys
+      # appears in the dependency graph.
+      - name: just check
+        run: nix develop --command just check
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-
-      - uses: Swatinem/rust-cache@v2.8.2
-
-      - name: Check formatting
-        run: cargo fmt --check
-
-      - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
-
-      - name: Run tests
-        run: cargo test --verbose
-
-  security:
-    name: Security Audit
+  flake-check:
+    name: nix flake check
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
     steps:
       - uses: actions/checkout@v6.0.2
+      - uses: cachix/install-nix-action@v31
+      - run: nix flake check --print-build-logs
 
-      - uses: rustsec/audit-check@v2.0.0
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+  image:
+    name: Build the x86_64-linux image
+    runs-on: ubuntu-latest
+    needs: [gates, flake-check]
+    steps:
+      - uses: actions/checkout@v6.0.2
+      - uses: cachix/install-nix-action@v31
+      - name: nix build
+        run: nix build --print-build-logs .#packages.x86_64-linux.image
+      - name: Record the image hash
+        run: |
+          {
+            echo '## Image'
+            echo '```'
+            echo "Store path: $(readlink result)"
+            echo "SHA-256:    $(sha256sum result | cut -d' ' -f1)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
