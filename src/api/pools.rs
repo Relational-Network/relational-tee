@@ -184,13 +184,15 @@ fn pool_instructions(
 /// The pool's UUID, and so its PDA, derives from the caller and the
 /// `Idempotency-Key`. The pool document is staged first; the creating
 /// transaction follows the stored-transaction rule, so a retry never creates
-/// a second pool; then the document is written with the creation signature.
+/// a second pool; then, once that transaction is finalized, the document is
+/// written with the creation signature. Waiting for `finalized` means a
+/// document never names a pool that a rolled-back block took away.
 #[utoipa::path(
     post,
     path = "/v1/drt/pools/malta",
     tag = "DRT Pools",
     summary = "Create MALTA pool",
-    description = "Atomically: create_pool + register_drt × N (always includes 'append') + seal_pool, then store the pool's document with its inline schema. Idempotent: retries with the same Idempotency-Key create one pool.",
+    description = "Atomically: create_pool + register_drt × N (always includes 'append') + seal_pool, then, once that transaction is finalized, store the pool's document with its inline schema. Idempotent: retries with the same Idempotency-Key create one pool.",
     security(("bearer_auth" = [])),
     params(
         ("Idempotency-Key" = String, Header, description = "A UUID naming this user action; reuse it on every retry"),
@@ -299,7 +301,7 @@ pub async fn create_malta_pool(
         &state.solana_client,
         &mut op,
         &Effect::Account(pool_pda),
-        "confirmed",
+        "finalized",
         signed(&keypair, &ixs),
     )
     .await?;
