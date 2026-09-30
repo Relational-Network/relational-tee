@@ -208,6 +208,11 @@ pub const MAX_HEADER_BYTES: usize = 16 * 1024;
 /// requests too, so idle connections close after it.
 pub const HEADER_READ_TIME: Duration = Duration::from_secs(10);
 
+/// An HTTP/2 connection that hasn't heard from its client for this long is
+/// pinged, and closed if the ping goes unanswered as long again, so a
+/// client that vanished gives its place back.
+pub const H2_KEEP_ALIVE: Duration = Duration::from_secs(20);
+
 /// hyper's settings for client connections. hyper already refuses more than
 /// 100 HTTP/1.1 header fields with `431`, and setting that limit explicitly
 /// would cost a heap allocation per request. TLS handshakes get the TLS
@@ -220,6 +225,9 @@ pub fn http_settings(builder: &mut auto::Builder<TokioExecutor>) {
         .max_buf_size(MAX_HEADER_BYTES);
     builder
         .http2()
+        .timer(TokioTimer::new())
+        .keep_alive_interval(H2_KEEP_ALIVE)
+        .keep_alive_timeout(H2_KEEP_ALIVE)
         .max_header_list_size(MAX_HEADER_BYTES as u32);
 }
 
@@ -614,26 +622,36 @@ mod tests {
         }
     }
 
+    /// What the server sends until it closes the connection, and how long
+    /// that took. Under a paused clock a server that never closes would
+    /// hang the test, so this gives up after 5 minutes.
+    async fn until_closed(client: &mut DuplexStream) -> (Vec<u8>, Duration) {
+        let start = tokio::time::Instant::now();
+        let mut rest = Vec::new();
+        tokio::time::timeout(Duration::from_secs(300), client.read_to_end(&mut rest))
+            .await
+            .expect("the server closes the connection")
+            .unwrap();
+        (rest, start.elapsed())
+    }
+
+    fn about(waited: Duration, expected: Duration) {
+        assert!(
+            waited >= expected && waited < expected + Duration::from_secs(1),
+            "{waited:?}"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn headers_have_ten_seconds_to_arrive_even_between_requests() {
-        let closes_after_the_header_time = |since: tokio::time::Instant| {
-            let waited = since.elapsed();
-            assert!(
-                waited >= HEADER_READ_TIME && waited < HEADER_READ_TIME + Duration::from_secs(1),
-                "{waited:?}"
-            );
-        };
-
         let mut client = connection();
-        let start = tokio::time::Instant::now();
         client
             .write_all(b"GET / HTTP/1.1\r\nhost: worker\r\n")
             .await
             .unwrap();
-        let mut response = Vec::new();
-        client.read_to_end(&mut response).await.unwrap();
+        let (response, waited) = until_closed(&mut client).await;
         assert!(response.is_empty(), "closed without a response");
-        closes_after_the_header_time(start);
+        about(waited, HEADER_READ_TIME);
 
         let mut client = connection();
         client
@@ -647,11 +665,21 @@ mod tests {
             assert!(n > 0, "closed before the response");
             served.extend_from_slice(&chunk[..n]);
         }
-        let idle = tokio::time::Instant::now();
-        let mut rest = Vec::new();
-        client.read_to_end(&mut rest).await.unwrap();
+        let (rest, idle) = until_closed(&mut client).await;
         assert!(rest.is_empty());
-        closes_after_the_header_time(idle);
+        about(idle, HEADER_READ_TIME);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn http2_connections_close_once_the_client_stops_answering_pings() {
+        let mut client = connection();
+        // The HTTP/2 preface and an empty SETTINGS frame, then silence.
+        client
+            .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\0\0\0\x04\0\0\0\0\0")
+            .await
+            .unwrap();
+        let (_, waited) = until_closed(&mut client).await;
+        about(waited, 2 * H2_KEEP_ALIVE);
     }
 
     #[tokio::test]
