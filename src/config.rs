@@ -78,7 +78,8 @@ pub const DEFAULT_BIND_ADDR: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 #[cfg(not(feature = "dev"))]
 pub const DEFAULT_BIND_ADDR: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
 
-/// Maximum request body size (50 MiB).
+/// The largest body the upload routes accept (50 MiB); other routes take
+/// 1 MiB ([`crate::edge::REQUESTS`]).
 pub const MAX_BODY_SIZE: usize = 50 * 1024 * 1024;
 
 /// How the server speaks to clients.

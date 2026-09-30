@@ -44,7 +44,6 @@ mod tee;
 mod tls;
 
 use axum::{
-    extract::DefaultBodyLimit,
     http::{header, HeaderValue},
     routing::get,
     Router,
@@ -59,7 +58,7 @@ use utoipa::{openapi::security::SecurityScheme, Modify, OpenApi};
 #[cfg(feature = "swagger-ui")]
 use utoipa_swagger_ui::SwaggerUi;
 
-use config::{KeyProviderConfig, ServerConfig, StorageConfig, Transport, MAX_BODY_SIZE};
+use config::{KeyProviderConfig, ServerConfig, StorageConfig, Transport};
 
 use handlers::{admin_status, AdminStatusResponse};
 use health::{
@@ -568,8 +567,11 @@ async fn main() {
             let tls_config =
                 axum_server::tls_rustls::RustlsConfig::from_config(certificates.server_config());
             info!(%addr, "Serving HTTPS");
-            axum_server::bind_rustls(addr, tls_config)
-                .handle(handle)
+            let mut server = axum_server::bind_rustls(addr, tls_config)
+                .map(|tls| edge::ConnectionLimit::new(tls, edge::MAX_CONNECTIONS))
+                .handle(handle);
+            edge::http_settings(server.http_builder());
+            server
                 .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
                 .await
                 .expect("server error");
@@ -581,8 +583,11 @@ async fn main() {
             } else {
                 warn!(%addr, "Serving plain HTTP on a non-loopback address (dev build)");
             }
-            axum_server::bind(addr)
-                .handle(handle)
+            let mut server = axum_server::bind(addr)
+                .map(|plain| edge::ConnectionLimit::new(plain, edge::MAX_CONNECTIONS))
+                .handle(handle);
+            edge::http_settings(server.http_builder());
+            server
                 .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
                 .await
                 .expect("server error");
@@ -593,11 +598,12 @@ async fn main() {
 /// Every route, with the middleware every response passes through. The
 /// request context is outermost, so every response, the fallback's and
 /// CORS preflights included, carries `X-Request-Id` and the error body;
-/// CORS comes next, so rate-limited responses carry its headers too.
+/// CORS comes next, so rate-limited responses carry its headers too. The
+/// upload routes may send more, for longer, than the rest.
 fn router(state: AppState) -> Router {
     let cors = edge::cors(&state.dashboard_origin);
     let limiter = state.limiter.clone();
-    let app = Router::new()
+    let routes = Router::new()
         // Health endpoints (unversioned for k8s probes).
         .route("/health", get(health))
         .route("/health/live", get(liveness))
@@ -612,7 +618,10 @@ fn router(state: AppState) -> Router {
         // Wallet service routes.
         .merge(api::wallet_router())
         // DRT pool routes.
-        .merge(api::drt_router())
+        .merge(api::drt_router());
+    let app = edge::REQUESTS
+        .apply(routes)
+        .merge(edge::UPLOADS.apply(api::upload_router()))
         .fallback(request_id::not_found)
         .layer(axum::middleware::from_fn(audit::record));
     #[cfg(feature = "dev")]
@@ -625,22 +634,19 @@ fn router(state: AppState) -> Router {
     #[cfg(not(feature = "swagger-ui"))]
     let app = app.route("/api-doc/openapi.json", get(openapi_json));
 
-    // Body limit: 50MB max for upload endpoints, prevents unbounded memory usage.
-    app.layer(DefaultBodyLimit::max(MAX_BODY_SIZE))
-        .layer(
-            TraceLayer::new_for_http()
-                .make_span_with(|request: &axum::http::Request<axum::body::Body>| {
-                    let id = request
-                        .extensions()
-                        .get::<request_id::RequestId>()
-                        .map(|id| id.0.as_str())
-                        .unwrap_or("-");
-                    tracing::info_span!("request", method = %request.method(),
-                        path = %request.uri().path(), request_id = %id)
-                })
-                .on_request(DefaultOnRequest::new().level(Level::INFO))
-                .on_response(DefaultOnResponse::new().level(Level::INFO)),
-        )
+    let trace = TraceLayer::new_for_http()
+        .make_span_with(|request: &axum::http::Request<axum::body::Body>| {
+            let id = request
+                .extensions()
+                .get::<request_id::RequestId>()
+                .map(|id| id.0.as_str())
+                .unwrap_or("-");
+            tracing::info_span!("request", method = %request.method(),
+                path = %request.uri().path(), request_id = %id)
+        })
+        .on_request(DefaultOnRequest::new().level(Level::INFO))
+        .on_response(DefaultOnResponse::new().level(Level::INFO));
+    app.layer(trace)
         .layer(SetResponseHeaderLayer::if_not_present(
             header::HeaderName::from_static("x-content-type-options"),
             HeaderValue::from_static("nosniff"),
@@ -857,5 +863,52 @@ mod tests {
             get_as(&app, &expired.sign(entra_key()).unwrap(), "/v1/users/me").await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert_eq!(body["error"], "invalid or expired token");
+    }
+
+    #[tokio::test]
+    async fn only_the_upload_routes_take_bodies_over_a_mebibyte() {
+        use auth::entra::mint::Spec;
+        use auth::entra::tests::{config, entra_key};
+        use seal::tests::{form, BOUNDARY};
+
+        let app = router(AppState::for_tests());
+        let mut spec = Spec::valid(&config());
+        spec.roles = vec!["Admin".into()];
+        let token = spec.sign(entra_key()).unwrap();
+        let post = |path: &str, content_type: String, body: Vec<u8>| {
+            let request = Request::post(path)
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .header("idempotency-key", uuid::Uuid::new_v4().to_string())
+                .header(header::CONTENT_TYPE, content_type)
+                .body(Body::from(body))
+                .unwrap();
+            app.clone().oneshot(request)
+        };
+        let over = vec![b' '; edge::REQUESTS.body + 1];
+
+        let json = post("/v1/wallets", "application/json".into(), over.clone())
+            .await
+            .unwrap();
+        assert_eq!(json.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        // An issuance reads it all, and refuses it for what it holds.
+        let upload = form(&[
+            ("v", &b"1"[..]),
+            ("kid", &b"unknown"[..]),
+            ("enc", &b"AAAA"[..]),
+            ("ct", &over[..]),
+        ]);
+        let response = post(
+            "/v1/drt/pools/P/issue",
+            format!("multipart/form-data; boundary={BOUNDARY}"),
+            upload,
+        )
+        .await
+        .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["code"], "sealed_payload_invalid");
     }
 }

@@ -23,7 +23,7 @@ axum = { version = "0.8.8", default-features =  false, features = ["multipart", 
 axum-server = { version = "0.8.0", default-features = false, features = ["tls-rustls-no-provider"] }
 tower-http = { version = "0.6", default-features = false, features = ["cors", "set-header", "trace"] }
 governor = { version = "0.10", default-features = false, features = ["std", "dashmap"] }
-tokio = { version = "1.49.0", default-features = false, features = ["macros", "rt-multi-thread", "signal"] }
+tokio = { version = "1.49.0", default-features = false, features = ["macros", "rt-multi-thread", "signal", "time"] }
 
 # ── Serialization ──────────────────────────────────────────────────
 serde = { version = "1.0.228", default-features = false }
@@ -61,7 +61,9 @@ aws-lc-rs = { version = "1.18", default-features = false, features = ["aws-lc-sy
 # url → idna → icu_* chain (~25 transitive crates of Unicode data
 # tables) that `reqwest` would otherwise pull in.
 hyper = { version = "1", default-features = false, features = ["client"] }
-hyper-util = { version = "0.1", default-features = false, features = ["client-legacy", "http1", "tokio"] }
+# The server side (`server-auto`, `service`) is axum-server's; the worker
+# configures its HTTP/1.1 and HTTP/2 settings.
+hyper-util = { version = "0.1", default-features = false, features = ["client-legacy", "http1", "server-auto", "service", "tokio"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1"] }
 http-body-util = { version = "0.1", default-features = false }
 bytes = { version = "1", default-features = false }
@@ -105,7 +107,7 @@ mimalloc = { version = "0.1.52", default-features = false }
 lru = { version = "0.18", default-features = false }
 
 [dev-dependencies]
-tokio = { version = "1.49.0", default-features = false, features = ["test-util"] }
+tokio = { version = "1.49.0", default-features = false, features = ["io-util", "test-util"] }
 tower = { version = "0.5", default-features = false, features = ["util"] }
 # Tests in every configuration mint RS256 tokens, as the dev token signer does.
 aws-lc-rs = { version = "1.18", default-features = false, features = ["aws-lc-sys", "ring-io"] }

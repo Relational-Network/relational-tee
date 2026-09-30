@@ -224,15 +224,7 @@ pub fn drt_router() -> Router<AppState> {
             "/v1/drt/pools/{pool_pda}/schema",
             post(credentials::schema::upload_schema).get(credentials::schema::get_schema),
         )
-        // ── Credential issuance ─────────────────────────────────
-        .route(
-            "/v1/drt/pools/{pool_pda}/initialize",
-            post(credentials::initialize::initialize_pool),
-        )
-        .route(
-            "/v1/drt/pools/{pool_pda}/issue",
-            post(credentials::issue::issue_credentials),
-        )
+        // ── Revocation (issuance is in `upload_router`) ─────────
         .route(
             "/v1/drt/pools/{pool_pda}/revoke",
             post(credentials::revoke::revoke_credentials),
@@ -257,6 +249,20 @@ pub fn drt_router() -> Router<AppState> {
         .route(
             "/v1/drt/pools/list",
             get(credentials::reads::list_all_pools),
+        )
+}
+
+/// The routes that take a sealed dataset, which get larger body and time
+/// limits than the rest ([`crate::edge::UPLOADS`]).
+pub fn upload_router() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/v1/drt/pools/{pool_pda}/initialize",
+            post(credentials::initialize::initialize_pool),
+        )
+        .route(
+            "/v1/drt/pools/{pool_pda}/issue",
+            post(credentials::issue::issue_credentials),
         )
 }
 

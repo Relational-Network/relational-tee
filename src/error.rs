@@ -89,6 +89,12 @@ impl ApiError {
         Self::new(StatusCode::NOT_FOUND, "not_found", msg)
     }
 
+    /// 408 `request_timeout` — the request didn't finish in the time its
+    /// route allows.
+    pub fn request_timeout(msg: impl Into<String>) -> Self {
+        Self::new(StatusCode::REQUEST_TIMEOUT, "request_timeout", msg)
+    }
+
     /// 409 `conflict` — the resource exists, or changed concurrently.
     pub fn conflict(msg: impl Into<String>) -> Self {
         Self::new(StatusCode::CONFLICT, "conflict", msg)

@@ -143,8 +143,9 @@ impl Api {
     }
 
     /// Send until a worker gives a final answer, as a client retries: after
-    /// a dropped connection, a 502 or 503, or a lost compare-and-swap. The
-    /// wait grows, because devnet's public RPC rate-limits bursts.
+    /// a dropped connection, a request that ran out of time, a 502 or 503,
+    /// or a lost compare-and-swap. The wait grows, because devnet's public
+    /// RPC rate-limits bursts.
     async fn settle(&self, call: &Call) -> Result<Reply, String> {
         let mut last = String::new();
         let mut wait = Duration::from_millis(1500);
@@ -188,7 +189,8 @@ impl Api {
 }
 
 fn retryable(reply: &Reply) -> bool {
-    matches!(reply.status, 502 | 503) || (reply.status == 409 && reply.body["code"] == "conflict")
+    matches!(reply.status, 408 | 502 | 503)
+        || (reply.status == 409 && reply.body["code"] == "conflict")
 }
 
 fn uuid() -> String {
