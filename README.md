@@ -2,7 +2,7 @@
 
 The worker behind IOB MicRes: an Axum server that runs Use Case 1 credential pools on Solana (create a Malta pool, upload its schema, initialise it, issue and revoke credentials, read the issuance log and audit trail) and custodial Solana wallets (create, balance, fee estimate, send, history, admin suspend and activate).
 
-> **Migration in progress.** This repo was imported from `relational-sdk`, a Gramine SGX enclave, and is being moved to Azure Confidential Containers (AMD SEV-SNP). Gramine, RA-TLS, the SGX build and the old SSH deployment are gone, and the server now builds and runs natively. Still to come: key release and attestation on real Azure hardware, idempotent mutations, Entra ID sign-in, and in-app edge controls. Until then, parts of the server are interim, as described below.
+> **Migration in progress.** This repo was imported from `relational-sdk`, a Gramine SGX enclave, and is being moved to Azure Confidential Containers (AMD SEV-SNP). Gramine, RA-TLS, the SGX build and the old SSH deployment are gone, and the server now builds and runs natively. Still to come: key release and attestation on real Azure hardware, and the fault-injection suite for the idempotency work. Until then, parts of the server are interim, as described below.
 
 ## What works today, and what's interim
 
