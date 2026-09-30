@@ -40,6 +40,7 @@ fn event_for(method: &Method, route: &str) -> Option<&'static str> {
         ("GET", "/v1/admin/status") => "admin_status_read",
         ("GET", "/v1/admin/wallet-stats") => "admin_wallet_stats_read",
         ("GET", "/v1/admin/wallets") => "admin_wallets_listed",
+        ("GET", "/v1/users") => "admin_users_listed",
         _ => return None,
     })
 }

@@ -298,12 +298,7 @@ pub async fn health(State(state): State<AppState>) -> Json<HealthDetails> {
             status: "unknown".into(),
             checked_age_seconds: None,
         });
-    let jwks_cache_age_seconds = state
-        .jwks_cache
-        .read()
-        .await
-        .as_ref()
-        .map(|c| c.fetched_at.elapsed().as_secs());
+    let jwks_cache_age_seconds = state.auth.keys_age().await.map(|age| age.as_secs());
     let token = state.attestation.token();
     let certificate = match &h.certificate {
         Certificate::File { not_after } => CertificateDetails {

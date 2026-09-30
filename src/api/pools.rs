@@ -23,7 +23,7 @@ use std::str::FromStr;
 use tracing::info;
 
 use crate::audit;
-use crate::auth::AdminToken;
+use crate::auth::{Caller, Permission};
 use crate::blockchain::drt::{
     accounts::{fetch_drt_config, fetch_pool},
     instructions::{
@@ -208,7 +208,7 @@ fn pool_instructions(
     )
 )]
 pub async fn create_malta_pool(
-    AdminToken(token): AdminToken,
+    caller: Caller,
     request: Idempotent,
     State(state): State<AppState>,
     JsonBody {
@@ -216,7 +216,8 @@ pub async fn create_malta_pool(
         bytes,
     }: JsonBody<CreateMaltaPoolRequest>,
 ) -> Result<Response, ApiError> {
-    let mut op = open_or_replay!(state, &token.sub, request, &bytes);
+    caller.require(Permission::PoolsCreate)?;
+    let mut op = open_or_replay!(state, &caller.user_id, request, &bytes);
 
     validate_pool_name(&payload.pool_name)?;
     let resolved = validate_drt_requests(&payload.drts)?;
@@ -225,9 +226,10 @@ pub async fn create_malta_pool(
             "MALTA pools must include the 'append' DRT",
         ));
     }
-    let pool_uuid = ids::pool_uuid(&token.sub, &request.key);
+    let pool_uuid = ids::pool_uuid(&caller.user_id, &request.key);
     let (schema_id, fields) = parse_schema(&payload.schema, &pool_uuid)?;
-    let (wallet, keypair) = load_wallet_keypair(&state, &payload.wallet_id, &token.sub).await?;
+    let (wallet, keypair) =
+        load_wallet_keypair(&state, &payload.wallet_id, &caller.user_id).await?;
 
     let (pool_pda, _bump) = derive_pool_pda(&pool_uuid);
     let pool_pda_str = pool_pda.to_string();
@@ -266,7 +268,7 @@ pub async fn create_malta_pool(
         schema_id,
         schema: fields,
         validation_mode: crate::data_validation::ValidationMode::HeadersOnly,
-        created_by: token.sub.clone(),
+        created_by: caller.user_id.clone(),
         created_at: now,
         creation_signature: String::new(),
         initial: None,
@@ -366,10 +368,11 @@ pub async fn create_malta_pool(
     )
 )]
 pub async fn get_pool(
-    crate::auth::AnalystToken(_token): crate::auth::AnalystToken,
+    caller: Caller,
     State(state): State<AppState>,
     Path(pool_pda_str): Path<String>,
 ) -> Result<Json<PoolInfoResponse>, ApiError> {
+    caller.require(Permission::PoolsRead)?;
     let pool_pda = Pubkey::from_str(&pool_pda_str)
         .map_err(|_| ApiError::bad_request("invalid pool PDA address"))?;
 
@@ -433,10 +436,11 @@ pub async fn get_pool(
     )
 )]
 pub async fn get_drt(
-    crate::auth::AnalystToken(_token): crate::auth::AnalystToken,
+    caller: Caller,
     State(state): State<AppState>,
     Path((pool_pda_str, drt_name)): Path<(String, String)>,
 ) -> Result<Json<DrtConfigResponse>, ApiError> {
+    caller.require(Permission::PoolsRead)?;
     let pool_pda = Pubkey::from_str(&pool_pda_str)
         .map_err(|_| ApiError::bad_request("invalid pool PDA address"))?;
     let meta = load_pool(&state, &pool_pda_str).await?;

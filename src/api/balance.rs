@@ -12,7 +12,7 @@ use axum::{
 use serde::Serialize;
 use utoipa::ToSchema;
 
-use crate::auth::UserToken;
+use crate::auth::{Caller, Permission};
 use crate::blockchain::types::TokenBalance;
 use crate::error::ApiError;
 use crate::state::AppState;
@@ -56,12 +56,13 @@ pub struct BalanceResponse {
     )
 )]
 pub async fn get_balance(
-    UserToken(token): UserToken,
+    caller: Caller,
     State(state): State<AppState>,
     Path(wallet_id): Path<String>,
 ) -> Result<Json<BalanceResponse>, ApiError> {
+    caller.require(Permission::WalletsRead)?;
     let wallet = load_wallet(&state, &wallet_id).await?;
-    enforce_owner_active(&wallet, &token.sub)?;
+    enforce_owner_active(&wallet, &caller.user_id)?;
 
     // Fetch native SOL balance.
     let sol_balance = state

@@ -38,12 +38,6 @@ pub struct Jwk {
     pub kid: Option<String>,
 }
 
-/// JWKS response from AVS.
-#[derive(Clone, Deserialize)]
-pub struct JwksResponse {
-    pub keys: Vec<Jwk>,
-}
-
 /// Decrypt an ECDH-ES + AES-256-GCM payload sealed to the transport key,
 /// trying its current version and then, during a rotation, the previous one.
 ///

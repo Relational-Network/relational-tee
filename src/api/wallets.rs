@@ -19,7 +19,7 @@ use tracing::info;
 use utoipa::ToSchema;
 
 use crate::audit;
-use crate::auth::UserToken;
+use crate::auth::{Caller, Permission};
 use crate::blockchain::signing::{generate_solana_keypair, keypair_from_bytes};
 use crate::error::ApiError;
 use crate::idempotency::{Idempotent, JsonBody};
@@ -98,7 +98,7 @@ pub struct DeleteWalletResponse {
     )
 )]
 pub async fn create_wallet(
-    UserToken(token): UserToken,
+    caller: Caller,
     request: Idempotent,
     State(state): State<AppState>,
     JsonBody {
@@ -106,7 +106,8 @@ pub async fn create_wallet(
         bytes,
     }: JsonBody<CreateWalletRequest>,
 ) -> Result<Response, ApiError> {
-    let mut op = open_or_replay!(state, &token.sub, request, &bytes);
+    caller.require_admin()?;
+    let mut op = open_or_replay!(state, &caller.user_id, request, &bytes);
 
     // Validate label length.
     if let Some(ref label) = payload.label {
@@ -121,7 +122,7 @@ pub async fn create_wallet(
         bytes: zeroize::Zeroizing::new(keypair_bytes),
         address: public_address,
     };
-    let wallet_id = ids::wallet_id(&token.sub, &request.key);
+    let wallet_id = ids::wallet_id(&caller.user_id, &request.key);
 
     op.begin().await?;
     let address_of = |bytes: &[u8]| {
@@ -133,7 +134,13 @@ pub async fn create_wallet(
     let wallet = match state
         .storage
         .wallets()
-        .create(&token.sub, &wallet_id, payload.label, keypair, address_of)
+        .create(
+            &caller.user_id,
+            &wallet_id,
+            payload.label,
+            keypair,
+            address_of,
+        )
         .await?
     {
         CreateOutcome::Created(wallet) => wallet,
@@ -148,7 +155,7 @@ pub async fn create_wallet(
     info!(
         wallet_id = %wallet_id,
         address = %wallet.public_address,
-        owner = %token.sub,
+        owner = %caller.user_id,
         "Wallet created"
     );
     audit::wallet(&wallet_id);
@@ -180,15 +187,16 @@ pub async fn create_wallet(
     )
 )]
 pub async fn list_wallets(
-    UserToken(token): UserToken,
+    caller: Caller,
     State(state): State<AppState>,
 ) -> Result<Json<ListWalletsResponse>, ApiError> {
+    caller.require(Permission::WalletsRead)?;
     let wallets = state.storage.wallets();
-    let mine = match wallets.wallet_id_for_owner(&token.sub).await? {
+    let mine = match wallets.wallet_id_for_owner(&caller.user_id).await? {
         Some(wallet_id) => wallets
             .get(&wallet_id)
             .await?
-            .filter(|w| w.status != WalletStatus::Deleted && w.owner_user_id == token.sub),
+            .filter(|w| w.status != WalletStatus::Deleted && w.owner_user_id == caller.user_id),
         None => None,
     };
 
@@ -220,12 +228,13 @@ pub async fn list_wallets(
     )
 )]
 pub async fn get_wallet(
-    UserToken(token): UserToken,
+    caller: Caller,
     State(state): State<AppState>,
     Path(wallet_id): Path<String>,
 ) -> Result<Json<GetWalletResponse>, ApiError> {
+    caller.require(Permission::WalletsRead)?;
     let metadata = load_wallet(&state, &wallet_id).await?;
-    enforce_owner(&metadata, &token.sub)?;
+    enforce_owner(&metadata, &caller.user_id)?;
 
     if metadata.status == WalletStatus::Deleted {
         return Err(ApiError::not_found(format!("wallet {wallet_id} not found")));
@@ -258,21 +267,22 @@ pub async fn get_wallet(
     )
 )]
 pub async fn delete_wallet(
-    UserToken(token): UserToken,
+    caller: Caller,
     request: Idempotent,
     State(state): State<AppState>,
     Path(wallet_id): Path<String>,
 ) -> Result<Response, ApiError> {
-    let mut op = open_or_replay!(state, &token.sub, request, b"");
+    caller.require_admin()?;
+    let mut op = open_or_replay!(state, &caller.user_id, request, b"");
     let wallet = load_wallet(&state, &wallet_id).await?;
-    enforce_owner(&wallet, &token.sub)?;
+    enforce_owner(&wallet, &caller.user_id)?;
 
     op.begin().await?;
     state.storage.wallets().soft_delete(&wallet).await?;
 
     info!(
         wallet_id = %wallet_id,
-        owner = %token.sub,
+        owner = %caller.user_id,
         "Wallet soft-deleted"
     );
 

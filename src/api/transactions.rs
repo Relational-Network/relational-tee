@@ -24,7 +24,7 @@ use tracing::info;
 use utoipa::{IntoParams, ToSchema};
 
 use crate::audit;
-use crate::auth::UserToken;
+use crate::auth::{Caller, Permission};
 use crate::blockchain::signing::keypair_from_bytes_verified;
 use crate::blockchain::transactions::native_transfer;
 use crate::chain::{self, Effect};
@@ -138,13 +138,14 @@ pub struct TransactionStatusResponse {
     )
 )]
 pub async fn estimate_fee(
-    UserToken(token): UserToken,
+    caller: Caller,
     State(state): State<AppState>,
     Path(wallet_id): Path<String>,
     Json(payload): Json<EstimateFeeRequest>,
 ) -> Result<Json<EstimateFeeResponse>, ApiError> {
+    caller.require(Permission::WalletsRead)?;
     let wallet = load_wallet(&state, &wallet_id).await?;
-    enforce_owner_active(&wallet, &token.sub)?;
+    enforce_owner_active(&wallet, &caller.user_id)?;
 
     let from = Pubkey::from_str(&wallet.public_address)
         .map_err(|_| ApiError::internal("stored address is invalid"))?;
@@ -191,7 +192,7 @@ pub async fn estimate_fee(
     )
 )]
 pub async fn send_transaction(
-    UserToken(token): UserToken,
+    caller: Caller,
     request: Idempotent,
     State(state): State<AppState>,
     Path(wallet_id): Path<String>,
@@ -200,9 +201,10 @@ pub async fn send_transaction(
         bytes,
     }: JsonBody<SendTransactionRequest>,
 ) -> Result<Response, ApiError> {
-    let mut op = open_or_replay!(state, &token.sub, request, &bytes);
+    caller.require_admin()?;
+    let mut op = open_or_replay!(state, &caller.user_id, request, &bytes);
     let wallet = load_wallet(&state, &wallet_id).await?;
-    enforce_owner_active(&wallet, &token.sub)?;
+    enforce_owner_active(&wallet, &caller.user_id)?;
 
     let recipient = Pubkey::from_str(&payload.recipient)
         .map_err(|_| ApiError::unprocessable("invalid recipient address"))?;
@@ -283,13 +285,14 @@ pub async fn send_transaction(
     )
 )]
 pub async fn list_transactions(
-    UserToken(token): UserToken,
+    caller: Caller,
     State(state): State<AppState>,
     Path(wallet_id): Path<String>,
     Query(query): Query<ListTransactionsQuery>,
 ) -> Result<Json<ListTransactionsResponse>, ApiError> {
+    caller.require(Permission::WalletsRead)?;
     let wallet = load_wallet(&state, &wallet_id).await?;
-    enforce_owner_active(&wallet, &token.sub)?;
+    enforce_owner_active(&wallet, &caller.user_id)?;
 
     let limit = query.limit.unwrap_or(20).clamp(1, 100);
     let cursor = query.cursor.as_deref().filter(|c| !c.is_empty());
@@ -332,12 +335,13 @@ pub async fn list_transactions(
     )
 )]
 pub async fn get_transaction_status(
-    UserToken(token): UserToken,
+    caller: Caller,
     State(state): State<AppState>,
     Path((wallet_id, signature)): Path<(String, String)>,
 ) -> Result<Json<TransactionStatusResponse>, ApiError> {
+    caller.require(Permission::WalletsRead)?;
     let wallet = load_wallet(&state, &wallet_id).await?;
-    enforce_owner_active(&wallet, &token.sub)?;
+    enforce_owner_active(&wallet, &caller.user_id)?;
 
     // Only transactions that touch this wallet are visible.
     let transaction = state

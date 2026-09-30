@@ -3,7 +3,7 @@
 
 //! Admin endpoints for the wallet service.
 //!
-//! All endpoints require `AdminToken` (admin role).
+//! All endpoints require the `Admin` role.
 //!
 //! - `GET  /v1/admin/wallet-stats`              — aggregate stats
 //! - `GET  /v1/admin/wallets`                   — list all wallets (any owner)
@@ -20,7 +20,7 @@ use serde::Serialize;
 use tracing::info;
 use utoipa::ToSchema;
 
-use crate::auth::AdminToken;
+use crate::auth::Caller;
 use crate::error::ApiError;
 use crate::idempotency::{Idempotent, Operation};
 use crate::state::AppState;
@@ -110,9 +110,10 @@ async fn set_status(
     )
 )]
 pub async fn get_wallet_stats(
-    AdminToken(_token): AdminToken,
+    caller: Caller,
     State(state): State<AppState>,
 ) -> Result<Json<WalletStatsResponse>, ApiError> {
+    caller.require_admin()?;
     let all = state.storage.wallets().all().await?;
 
     let active = all
@@ -153,10 +154,11 @@ pub async fn get_wallet_stats(
     )
 )]
 pub async fn list_all_wallets(
-    AdminToken(_token): AdminToken,
+    caller: Caller,
     State(state): State<AppState>,
     Query(query): Query<CursorQuery>,
 ) -> Result<Json<AdminListWalletsResponse>, ApiError> {
+    caller.require_admin()?;
     let (wallets, next_cursor) = page(
         state.storage.wallets().all().await?,
         |w| &w.wallet_id,
@@ -199,12 +201,13 @@ pub async fn list_all_wallets(
     )
 )]
 pub async fn suspend_wallet(
-    AdminToken(token): AdminToken,
+    caller: Caller,
     request: Idempotent,
     State(state): State<AppState>,
     Path(wallet_id): Path<String>,
 ) -> Result<Response, ApiError> {
-    let mut op = open_or_replay!(state, &token.sub, request, b"");
+    caller.require_admin()?;
+    let mut op = open_or_replay!(state, &caller.user_id, request, b"");
     set_status(
         &state,
         &mut op,
@@ -216,7 +219,7 @@ pub async fn suspend_wallet(
 
     info!(
         wallet_id = %wallet_id,
-        admin = %token.sub,
+        admin = %caller.user_id,
         "Wallet suspended by admin"
     );
 
@@ -252,12 +255,13 @@ pub async fn suspend_wallet(
     )
 )]
 pub async fn activate_wallet(
-    AdminToken(token): AdminToken,
+    caller: Caller,
     request: Idempotent,
     State(state): State<AppState>,
     Path(wallet_id): Path<String>,
 ) -> Result<Response, ApiError> {
-    let mut op = open_or_replay!(state, &token.sub, request, b"");
+    caller.require_admin()?;
+    let mut op = open_or_replay!(state, &caller.user_id, request, b"");
     set_status(
         &state,
         &mut op,
@@ -269,7 +273,7 @@ pub async fn activate_wallet(
 
     info!(
         wallet_id = %wallet_id,
-        admin = %token.sub,
+        admin = %caller.user_id,
         "Wallet activated by admin"
     );
 

@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use crate::attestation::Attestation;
-use crate::auth::JwksCache;
+use crate::auth::entra::Verifier;
 use crate::blockchain::SolanaClient;
 use crate::health::Health;
 use crate::history::History;
@@ -23,11 +23,9 @@ pub struct AppState {
     /// Readiness state, kept current in the background.
     pub health: Arc<Health>,
 
-    // ── Auth (existing) ─────────────────────────────────────────
-    /// Expected `aud` claim.
-    pub audience: String,
-    /// Cached AVS JWKS keys for token verification.
-    pub jwks_cache: Arc<tokio::sync::RwLock<Option<JwksCache>>>,
+    // ── Auth ────────────────────────────────────────────────────
+    /// Validates Entra ID access tokens.
+    pub auth: Arc<Verifier>,
 
     // ── Storage ─────────────────────────────────────────────────
     /// Sealed documents in Blob storage.
@@ -59,8 +57,7 @@ impl AppState {
             keys,
             attestation,
             health,
-            audience: crate::config::AVS_AUDIENCE.to_string(),
-            jwks_cache: Arc::new(tokio::sync::RwLock::new(None)),
+            auth: Arc::new(crate::auth::entra::tests::verifier()),
             storage: Arc::new(crate::storage::tests::files_storage()),
             solana_client: Arc::new(SolanaClient::new(
                 unreachable,

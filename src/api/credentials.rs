@@ -33,7 +33,7 @@ use tracing::{info, warn};
 use utoipa::{IntoParams, ToSchema};
 
 use crate::audit;
-use crate::auth::AdminToken;
+use crate::auth::{Caller, Permission};
 use crate::blockchain::drt::{
     accounts::fetch_pool,
     instructions::build_grant_right,
@@ -374,7 +374,7 @@ fn parse_pda(pool_pda: &str) -> Result<Pubkey, ApiError> {
     )
 )]
 pub async fn upload_schema(
-    AdminToken(token): AdminToken,
+    caller: Caller,
     request: Idempotent,
     State(state): State<AppState>,
     Path(pool_pda_str): Path<String>,
@@ -383,7 +383,8 @@ pub async fn upload_schema(
         bytes,
     }: JsonBody<UploadSchemaRequest>,
 ) -> Result<Response, ApiError> {
-    let mut op = open_or_replay!(state, &token.sub, request, &bytes);
+    caller.require(Permission::PoolsWrite)?;
+    let mut op = open_or_replay!(state, &caller.user_id, request, &bytes);
     let pool_pda = parse_pda(&pool_pda_str)?;
 
     // Validate schema_id is a safe identifier.
@@ -405,7 +406,7 @@ pub async fn upload_schema(
 
     // Fetch on-chain pool to verify it exists and get ownership.
     let pool = fetch_pool(state.solana_client.rpc(), &pool_pda).await?;
-    let wallet = super::get_active_wallet_for_user(&state, &token.sub).await?;
+    let wallet = super::get_active_wallet_for_user(&state, &caller.user_id).await?;
     verify_pool_ownership(&pool, &wallet)?;
 
     op.begin().await?;
@@ -464,10 +465,11 @@ pub async fn upload_schema(
     )
 )]
 pub async fn get_schema(
-    crate::auth::AnalystToken(_token): crate::auth::AnalystToken,
+    caller: Caller,
     State(state): State<AppState>,
     Path(pool_pda_str): Path<String>,
 ) -> Result<Json<GetSchemaResponse>, ApiError> {
+    caller.require(Permission::PoolsRead)?;
     let doc = load_pool(&state, &pool_pda_str).await?;
     if doc.schema.is_empty() {
         return Err(ApiError::not_found(format!(
@@ -511,24 +513,25 @@ pub async fn get_schema(
     )
 )]
 pub async fn initialize_pool(
-    AdminToken(token): AdminToken,
+    caller: Caller,
     request: Idempotent,
     State(state): State<AppState>,
     Path(pool_pda_str): Path<String>,
     multipart: Multipart,
 ) -> Result<Response, ApiError> {
+    caller.require(Permission::PoolsWrite)?;
     // Parse and decrypt the CSV payload; the fingerprint covers the plaintext.
     let parsed = parse_csv_payload(state.keys.get(KeyName::Transport), multipart).await?;
-    let mut op = open_or_replay!(state, &token.sub, request, &parsed.csv_bytes);
+    let mut op = open_or_replay!(state, &caller.user_id, request, &parsed.csv_bytes);
     let pool_pda = parse_pda(&pool_pda_str)?;
 
     // Fetch on-chain pool to verify it exists and get ownership.
     let pool = fetch_pool(state.solana_client.rpc(), &pool_pda).await?;
-    let wallet = super::get_active_wallet_for_user(&state, &token.sub).await?;
+    let wallet = super::get_active_wallet_for_user(&state, &caller.user_id).await?;
     verify_pool_ownership(&pool, &wallet)?;
 
     let doc = load_pool(&state, &pool_pda_str).await?;
-    let upload_id = ids::upload_id(&token.sub, &pool_pda_str, &request.key);
+    let upload_id = ids::upload_id(&caller.user_id, &pool_pda_str, &request.key);
     let ours = doc
         .initial
         .as_ref()
@@ -555,7 +558,7 @@ pub async fn initialize_pool(
         upload_id,
         sha256: sha256_hex(&parsed.csv_bytes),
         rows: count_csv_rows(&parsed.csv_bytes),
-        uploaded_by: token.sub.clone(),
+        uploaded_by: caller.user_id.clone(),
         uploaded_at: Utc::now(),
         signature: None,
         commitment: None,
@@ -632,17 +635,18 @@ pub async fn initialize_pool(
     )
 )]
 pub async fn issue_credentials(
-    AdminToken(token): AdminToken,
+    caller: Caller,
     request: Idempotent,
     State(state): State<AppState>,
     Path(pool_pda_str): Path<String>,
     multipart: Multipart,
 ) -> Result<Response, ApiError> {
+    caller.require(Permission::PoolsWrite)?;
     // ── VALIDATION (reversible, cheap) ────────────────────────────
 
     // Parse and decrypt the CSV payload; the fingerprint covers the plaintext.
     let parsed = parse_csv_payload(state.keys.get(KeyName::Transport), multipart).await?;
-    let mut op = open_or_replay!(state, &token.sub, request, &parsed.csv_bytes);
+    let mut op = open_or_replay!(state, &caller.user_id, request, &parsed.csv_bytes);
     let pool_pda = parse_pda(&pool_pda_str)?;
 
     // The pool must be ready.
@@ -654,7 +658,7 @@ pub async fn issue_credentials(
     }
 
     // An earlier attempt already recorded this upload: only the response is missing.
-    let record_id = ids::upload_id(&token.sub, &pool_pda_str, &request.key);
+    let record_id = ids::upload_id(&caller.user_id, &pool_pda_str, &request.key);
     if let Some(done) = doc.upload(&record_id) {
         let signature = done.signature.clone().unwrap_or_default();
         let response = IssueCredentialsResponse {
@@ -680,8 +684,8 @@ pub async fn issue_credentials(
     // Decode the pool uuid for the commitment hash.
     let pool_uuid = decode_right_id(&doc.pool_uuid_hex)?;
 
-    // Load caller's wallet (admin only — endpoint is `AdminToken`-gated).
-    let caller_wallet = super::get_active_wallet_for_user(&state, &token.sub).await?;
+    // Load the caller's own wallet: only the pool's owner can issue.
+    let caller_wallet = super::get_active_wallet_for_user(&state, &caller.user_id).await?;
     let keypair_bytes = state
         .storage
         .wallets()
@@ -763,7 +767,7 @@ pub async fn issue_credentials(
                         upload_id: record_id.clone(),
                         sha256: sha256_hex(&parsed.csv_bytes),
                         rows: row_count,
-                        uploaded_by: token.sub.clone(),
+                        uploaded_by: caller.user_id.clone(),
                         uploaded_at: Utc::now(),
                         signature: None,
                         commitment: Some(hex::encode(commitment)),
@@ -871,7 +875,7 @@ pub async fn issue_credentials(
     )
 )]
 pub async fn revoke_credentials(
-    AdminToken(token): AdminToken,
+    caller: Caller,
     request: Idempotent,
     State(state): State<AppState>,
     Path(pool_pda_str): Path<String>,
@@ -880,14 +884,15 @@ pub async fn revoke_credentials(
         bytes,
     }: JsonBody<RevokeCredentialsRequest>,
 ) -> Result<Response, ApiError> {
-    let mut op = open_or_replay!(state, &token.sub, request, &bytes);
+    caller.require(Permission::PoolsWrite)?;
+    let mut op = open_or_replay!(state, &caller.user_id, request, &bytes);
     if payload.credential_ids.is_empty() {
         return Err(ApiError::bad_request("credential_ids must not be empty"));
     }
     let pool_pda = parse_pda(&pool_pda_str)?;
 
     // Verify ownership.
-    let (wallet, _) = load_wallet_keypair(&state, &payload.wallet_id, &token.sub).await?;
+    let (wallet, _) = load_wallet_keypair(&state, &payload.wallet_id, &caller.user_id).await?;
     let pool = fetch_pool(state.solana_client.rpc(), &pool_pda).await?;
     verify_pool_ownership(&pool, &wallet)?;
 
@@ -916,7 +921,7 @@ pub async fn revoke_credentials(
                 if !doc.is_revoked(cid) {
                     doc.revocations.push(Revocation {
                         credential_id: cid.clone(),
-                        revoked_by: token.sub.clone(),
+                        revoked_by: caller.user_id.clone(),
                         revoked_at: now,
                         reason: payload.reason.clone(),
                     });
@@ -968,12 +973,13 @@ pub async fn revoke_credentials(
     )
 )]
 pub async fn list_revocations(
-    AdminToken(_token): AdminToken,
+    caller: Caller,
     State(state): State<AppState>,
     Path(pool_pda_str): Path<String>,
     Query(query): Query<CursorQuery>,
 ) -> Result<Json<RevocationsResponse>, ApiError> {
-    // Any admin can view revocations (no ownership check).
+    // Anyone who may read pools can view revocations (no ownership check).
+    caller.require(Permission::PoolsRead)?;
     let mut revocations = load_pool(&state, &pool_pda_str).await?.revocations;
     revocations.sort_by(|a, b| a.credential_id.cmp(&b.credential_id));
     let (items, next_cursor) = page(
@@ -1016,10 +1022,11 @@ pub async fn list_revocations(
     )
 )]
 pub async fn pool_summary(
-    crate::auth::AnalystToken(_token): crate::auth::AnalystToken,
+    caller: Caller,
     State(state): State<AppState>,
     Path(pool_pda_str): Path<String>,
 ) -> Result<Json<PoolSummaryResponse>, ApiError> {
+    caller.require(Permission::PoolsRead)?;
     let pool_pda = parse_pda(&pool_pda_str)?;
     let doc = load_pool(&state, &pool_pda_str).await?;
     let pool = fetch_pool(state.solana_client.rpc(), &pool_pda).await?;
@@ -1095,14 +1102,15 @@ fn list_entry(doc: &PoolDoc) -> PoolListEntry {
     )
 )]
 pub async fn list_pools_by_wallet(
-    crate::auth::UserToken(token): crate::auth::UserToken,
+    caller: Caller,
     State(state): State<AppState>,
     Path(wallet_id): Path<String>,
     Query(query): Query<CursorQuery>,
 ) -> Result<Json<PoolsByWalletResponse>, ApiError> {
+    caller.require(Permission::PoolsRead)?;
     // Verify wallet ownership.
     let wallet = super::load_wallet(&state, &wallet_id).await?;
-    super::enforce_owner(&wallet, &token.sub)?;
+    super::enforce_owner(&wallet, &caller.user_id)?;
 
     let owned: Vec<PoolDoc> = state
         .storage
@@ -1145,7 +1153,7 @@ pub async fn list_pools_by_wallet(
     )
 )]
 pub async fn list_all_pools(
-    crate::auth::ReadOnlyToken(_token): crate::auth::ReadOnlyToken,
+    _caller: Caller,
     State(state): State<AppState>,
     Query(query): Query<ListAllPoolsQuery>,
 ) -> Result<Json<AllPoolsResponse>, ApiError> {
@@ -1239,12 +1247,13 @@ pub async fn list_all_pools(
     )
 )]
 pub async fn get_issuance_log(
-    AdminToken(_token): AdminToken,
+    caller: Caller,
     State(state): State<AppState>,
     Path(pool_pda_str): Path<String>,
     Query(query): Query<CursorQuery>,
 ) -> Result<Json<IssuanceLogResponse>, ApiError> {
-    // Any admin can view issuance log (no ownership check).
+    // Anyone who may read pools can view the issuance log (no ownership check).
+    caller.require(Permission::PoolsRead)?;
     let doc = load_pool(&state, &pool_pda_str).await?;
     let newest_first: Vec<Upload> = doc.uploads().rev().cloned().collect();
     let (items, next_cursor) = page(

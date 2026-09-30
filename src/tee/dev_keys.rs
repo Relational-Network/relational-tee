@@ -2,8 +2,8 @@
 // Copyright (C) 2026 Relational Network
 
 //! Dev key files (dev builds only): one private JWK per worker key, in the
-//! format the SKR sidecar releases, and the dev MAA signing key, under
-//! `dev/keys/` by default.
+//! format the SKR sidecar releases, the dev MAA signing key and the dev
+//! token signing key, under `dev/keys/` by default.
 //!
 //! These keys stand in for Key Vault. They are never used outside dev builds,
 //! and the directory is gitignored.
@@ -70,6 +70,7 @@ pub fn generate_missing(dir: &Path) -> io::Result<Vec<PathBuf>> {
         created.push(path);
     }
     created.extend(super::dev_maa::generate_missing(dir)?);
+    created.extend(crate::auth::dev_token::generate_missing(dir)?);
     Ok(created)
 }
 
@@ -103,7 +104,7 @@ mod tests {
     fn generates_each_key_once_and_reads_it_back() {
         let dir = temp_dir("dev-keys");
         let created = generate_missing(&dir).expect("generate");
-        assert_eq!(created.len(), KeyName::ALL.len() + 1);
+        assert_eq!(created.len(), KeyName::ALL.len() + 2);
         let first = read_key(&key_path(&dir, KeyName::Transport)).expect("read");
 
         assert!(generate_missing(&dir).expect("second run").is_empty());

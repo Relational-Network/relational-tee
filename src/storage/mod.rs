@@ -73,10 +73,6 @@ impl Storage {
         staged::Sagas::new(self)
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "Entra ID sign-in creates and reads identities")
-    )]
     pub fn identities(&self) -> identities::Identities<'_> {
         identities::Identities::new(self)
     }

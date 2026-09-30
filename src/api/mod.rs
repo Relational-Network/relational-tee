@@ -166,6 +166,7 @@ pub fn wallet_router() -> Router<AppState> {
     Router::new()
         // ── User identity ───────────────────────────────────────
         .route("/v1/users/me", get(users::get_me))
+        .route("/v1/users", get(users::list_users))
         // ── Wallet CRUD ─────────────────────────────────────────
         .route("/v1/wallets", get(wallets::list_wallets))
         .route("/v1/wallets", post(wallets::create_wallet))

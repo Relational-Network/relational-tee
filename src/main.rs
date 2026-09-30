@@ -5,8 +5,7 @@
 //!
 //! An Axum server for Use Case 1 credential pools and custodial Solana
 //! wallets, being migrated to Azure Confidential Containers. It provides:
-//! - JWT validation using AVS-issued tokens
-//! - Role-based access control (admin, user, read_only)
+//! - Entra ID access token validation, and permissions from app roles
 //! - Sealed CSV uploads decrypted inside the worker
 //!
 //! # Building & Running
@@ -55,10 +54,7 @@ use utoipa::{openapi::security::SecurityScheme, Modify, OpenApi};
 #[cfg(feature = "swagger-ui")]
 use utoipa_swagger_ui::SwaggerUi;
 
-use config::{
-    avs_jwks_url, KeyProviderConfig, ServerConfig, StorageConfig, Transport, AVS_AUDIENCE,
-    MAX_BODY_SIZE,
-};
+use config::{KeyProviderConfig, ServerConfig, StorageConfig, Transport, MAX_BODY_SIZE};
 
 use handlers::{admin_status, get_public_key, AdminStatusResponse};
 use health::{
@@ -83,24 +79,21 @@ static STARTED_AT: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
     info(
         title = "relational-tee API",
         version = "0.1.0",
-        description = r#"IOB MicRes worker: Use Case 1 credential pools and custodial wallets, with JWT validation and RBAC.
+        description = r#"IOB MicRes worker: Use Case 1 credential pools and custodial wallets.
 
 ## Authentication
 
-Protected endpoints require a JWT issued by the Attestation Verification Service (AVS), until Entra ID replaces it.
+Protected endpoints need an Entra ID access token for this API, with the `access_as_user` scope, from an allowed client.
 
 ### How to use in Swagger UI:
 
-1. Click the **Authorize** button at the top right
-2. Paste your JWT token (without "Bearer " prefix)
+1. Get a token, for example with `az account get-access-token --scope api://<API client ID>/access_as_user --query accessToken -o tsv`
+2. Click **Authorize** at the top right and paste it (without "Bearer ")
 3. Click **Authorize**, then **Close**
-4. Now you can test protected endpoints
 
-### Roles:
+### Permissions:
 
-- **admin**: Full access to all endpoints
-- **user**: Can upload and query data
-- **read_only**: Can only query data
+The `Admin` app role grants `pools:read`, `pools:create`, `pools:write`, `wallets:read` and `users:read`, and is itself required for wallet creation, deletion and sends and for `/v1/admin/…`. A caller with no role can call only `/v1/users/me` and the pool list. `GET /v1/users/me` lists the caller's permissions.
 "#
     ),
     paths(
@@ -112,6 +105,7 @@ Protected endpoints require a JWT issued by the Attestation Verification Service
         handlers::admin_status,
         // Wallet API
         api::users::get_me,
+        api::users::list_users,
         api::wallets::create_wallet,
         api::wallets::list_wallets,
         api::wallets::get_wallet,
@@ -156,6 +150,10 @@ Protected endpoints require a JWT issued by the Attestation Verification Service
         crypto::Jwk,
         // Wallet schemas
         api::users::UserMeResponse,
+        api::users::UsersResponse,
+        api::users::UserEntry,
+        api::users::UserLookupResponse,
+        auth::Permission,
         api::wallets::CreateWalletRequest,
         api::wallets::CreateWalletResponse,
         api::wallets::ListWalletsResponse,
@@ -250,7 +248,8 @@ async fn openapi_json() -> axum::Json<utoipa::openapi::OpenApi> {
 // ============================================================================
 
 /// Dev-only commands: `relational-tee dev-keys [DIR]` creates any missing dev
-/// key files, and `relational-tee fake-skr` runs the fake SKR sidecar.
+/// key files, `relational-tee dev-token …` prints a token signed with the dev
+/// token signing key, and `relational-tee fake-skr` runs the fake SKR sidecar.
 /// Returns the exit code when the arguments name a command.
 #[cfg(feature = "dev")]
 async fn run_dev_command(args: &[String]) -> Option<i32> {
@@ -291,8 +290,11 @@ async fn run_dev_command(args: &[String]) -> Option<i32> {
                 }
             }
         }
+        "dev-token" => Some(auth::dev_token::run(&args[2..])),
         other => {
-            eprintln!("error: unknown command {other:?} (dev commands: dev-keys, fake-skr)");
+            eprintln!(
+                "error: unknown command {other:?} (dev commands: dev-keys, dev-token, fake-skr)"
+            );
             Some(2)
         }
     }
@@ -315,6 +317,33 @@ fn providers(config: &KeyProviderConfig) -> (Arc<dyn KeyProvider>, Arc<dyn Attes
             (local.clone(), local)
         }
     }
+}
+
+/// The access token verifier: Entra ID's keys for the pinned tenant, and in
+/// dev builds also the dev token signing key, if `just dev-keys` created it.
+fn token_verifier(config: &ServerConfig) -> auth::entra::Verifier {
+    let entra = &config.entra;
+    info!(tenant = %entra.tenant_id, api = %entra.api_client_id,
+        clients = ?entra.allowed_client_ids, "Validating Entra ID access tokens");
+    let verifier = auth::entra::Verifier::for_entra(entra.clone());
+    #[cfg(feature = "dev")]
+    let verifier = match tee::dev_rsa::RsaSigner::load(&config.dev_token_key) {
+        Ok(key) => {
+            warn!(key = %config.dev_token_key.display(), kid = %key.kid,
+                "Also trusting the dev token signing key (dev builds only)");
+            verifier
+                .trust_dev_key(key.kid.clone(), &key.n, &key.e)
+                .unwrap_or_else(|e| {
+                    tracing::error!("The dev token signing key is unusable: {e}");
+                    std::process::exit(2);
+                })
+        }
+        Err(e) => {
+            info!("No dev token signing key, so only Entra ID tokens are accepted: {e}");
+            verifier
+        }
+    };
+    verifier
 }
 
 /// Open the sealed `state` container. On Azure, any missing container is
@@ -404,47 +433,10 @@ async fn main() {
         std::process::exit(1);
     });
 
-    info!(jwks_url = %avs_jwks_url(), "JWT validation enabled");
+    let verifier = token_verifier(&server_config);
 
     // Log DRT program ID at startup.
     info!(drt_program_id = %config::DRT_PROGRAM_ID_STR, "DRT program ID");
-
-    // Warn if JWKS URL is plain HTTP pointing at a remote host (not loopback/localhost).
-    // In production the AVS must be behind TLS; accepting plain HTTP leaks attestation tokens.
-    {
-        let url = avs_jwks_url();
-        if url.starts_with("http://") {
-            let is_local = config::is_loopback_http_url(&url);
-            if !is_local {
-                tracing::error!(
-                    jwks_url = %url,
-                    "JWKS URL uses plain HTTP for a remote host — \
-                     attestation tokens will travel unencrypted. \
-                     Set AVS_JWKS_URL to an https:// endpoint in production."
-                );
-            } else {
-                tracing::warn!(
-                    jwks_url = %url,
-                    "JWKS URL is plain HTTP (loopback) — acceptable for local dev only"
-                );
-            }
-        }
-    }
-
-    // Hard-block: refuse to start when non-local HTTP JWKS unless ALLOW_HTTP_JWKS is true.
-    {
-        let url = avs_jwks_url();
-        if url.starts_with("http://") {
-            let is_local = config::is_loopback_http_url(&url);
-            if !is_local && !config::ALLOW_HTTP_JWKS {
-                panic!(
-                    "AVS_JWKS_URL is plain HTTP for a remote host: {url}. \
-                     Set AVS_JWKS_URL to an https:// endpoint, or flip config::ALLOW_HTTP_JWKS \
-                     and rebuild."
-                );
-            }
-        }
-    }
 
     // Initialize Solana client.
     let network_config = blockchain::types::network_config_from_env();
@@ -481,8 +473,7 @@ async fn main() {
         keys: Arc::new(keys),
         attestation,
         health,
-        audience: AVS_AUDIENCE.to_string(),
-        jwks_cache: Arc::new(tokio::sync::RwLock::new(None)),
+        auth: Arc::new(verifier),
         storage: Arc::new(storage),
         solana_client: Arc::new(solana_client),
         history,
@@ -660,5 +651,88 @@ mod tests {
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert_eq!(body["code"], "unauthorized");
         assert!(uuid::Uuid::parse_str(body["request_id"].as_str().unwrap()).is_ok());
+    }
+
+    async fn get_as(app: &Router, token: &str, path: &str) -> (StatusCode, serde_json::Value) {
+        let request = Request::builder()
+            .uri(path)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        (status, serde_json::from_slice(&body).unwrap_or_default())
+    }
+
+    #[tokio::test]
+    async fn callers_get_what_their_roles_permit() {
+        use auth::entra::mint::Spec;
+        use auth::entra::tests::{config, entra_key};
+
+        let app = router(AppState::for_tests());
+        let token = |roles: &[&str], email: &str| {
+            let mut spec = Spec::valid(&config());
+            spec.roles = roles.iter().map(|r| r.to_string()).collect();
+            spec.email = Some(email.into());
+            spec.name = Some(email.split('@').next().unwrap().into());
+            spec.sign(entra_key()).unwrap()
+        };
+        let admin = token(&["Admin"], "Ada@Example.com");
+        let nobody = token(&[], "bo@example.com");
+
+        // Before anyone signs in, nobody is found by email.
+        let (status, _) = get_as(&app, &admin, "/v1/users?email=bo@example.com").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (status, me) = get_as(&app, &admin, "/v1/users/me").await;
+        assert_eq!(status, StatusCode::OK, "{me}");
+        assert_eq!(me["roles"], serde_json::json!(["Admin"]));
+        assert_eq!(
+            me["permissions"],
+            serde_json::json!([
+                "pools:read",
+                "pools:create",
+                "pools:write",
+                "wallets:read",
+                "users:read"
+            ])
+        );
+        assert_eq!(me["email"], "Ada@Example.com");
+        assert_eq!(me["display_name"], "Ada");
+
+        // A caller with no role sees only themselves and the pool list.
+        let (status, them) = get_as(&app, &nobody, "/v1/users/me").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(them["permissions"], serde_json::json!([]));
+        assert_eq!(
+            get_as(&app, &nobody, "/v1/drt/pools/list").await.0,
+            StatusCode::OK
+        );
+        for path in ["/v1/users", "/v1/wallets", "/v1/admin/wallets"] {
+            let (status, body) = get_as(&app, &nobody, path).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{path}");
+            assert_eq!(body["code"], "forbidden");
+        }
+
+        // Admins list and look up users once they've signed in.
+        let (status, found) = get_as(&app, &admin, "/v1/users?email=BO@example.com").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(found["user_id"], them["user_id"]);
+        let (status, page) = get_as(&app, &admin, "/v1/users?limit=1").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(page["users"][0]["email"], "Ada@Example.com");
+        let cursor = page["next_cursor"].as_str().unwrap();
+        let (_, next) = get_as(&app, &admin, &format!("/v1/users?limit=1&cursor={cursor}")).await;
+        assert_eq!(next["users"][0]["user_id"], them["user_id"]);
+        assert!(next.get("next_cursor").is_none());
+
+        // Tokens that fail validation are 401.
+        let mut expired = Spec::valid(&config());
+        expired.expires_in = -3600;
+        let (status, body) =
+            get_as(&app, &expired.sign(entra_key()).unwrap(), "/v1/users/me").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"], "invalid or expired token");
     }
 }

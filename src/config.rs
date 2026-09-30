@@ -14,26 +14,54 @@ use crate::store::azure::{AzureConfig, CredentialConfig};
 use crate::tee::skr::SkrConfig;
 
 // ============================================================================
-// Auth (AVS JWT)
+// Auth (Entra ID)
 // ============================================================================
 
-/// Default AVS JWKS URL for token verification.
-/// Override with `AVS_JWKS_URL` environment variable.
-pub const DEFAULT_AVS_JWKS_URL: &str = "http://127.0.0.1:9100/.well-known/jwks.json";
-
-/// Get AVS JWKS URL from environment or use default.
-pub fn avs_jwks_url() -> String {
-    env::var("AVS_JWKS_URL").unwrap_or_else(|_| DEFAULT_AVS_JWKS_URL.to_string())
+/// Which Entra ID tokens the worker accepts. Pinned per environment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntraConfig {
+    /// The tenant ID: tokens' `tid`, and part of their `iss`.
+    pub tenant_id: String,
+    /// The API app registration's client ID: tokens' `aud`.
+    pub api_client_id: String,
+    /// Client IDs allowed as `azp`: the dashboard, and in dev the Azure CLI.
+    pub allowed_client_ids: Vec<String>,
 }
 
-/// Expected audience claim in AVS-issued tokens.
-pub const AVS_AUDIENCE: &str = "relational-sdk";
+impl EntraConfig {
+    /// The exact `iss` of the tenant's v2 access tokens.
+    pub fn issuer(&self) -> String {
+        format!("https://login.microsoftonline.com/{}/v2.0", self.tenant_id)
+    }
 
-/// Expected issuer claim in AVS-issued tokens.
-pub const AVS_ISSUER: &str = "attestation-verification-service";
+    /// The tenant's signing keys.
+    pub fn jwks_url(&self) -> String {
+        format!(
+            "https://login.microsoftonline.com/{}/discovery/v2.0/keys",
+            self.tenant_id
+        )
+    }
+}
 
-/// JWKS cache TTL in seconds (5 minutes).
-pub const JWKS_CACHE_TTL_SECS: u64 = 300;
+/// The Azure CLI's well-known client ID. Only the dev API pre-authorizes
+/// it, so scripts can get tokens; release builds refuse to allow it.
+pub const AZURE_CLI_CLIENT_ID: &str = "04b07795-8ddb-461a-bbee-02f9e1bf7b46";
+
+/// The dev app registrations in Relational's tenant, dev builds' defaults.
+#[cfg(feature = "dev")]
+pub mod dev_entra {
+    pub const TENANT_ID: &str = "7e3e38e3-f24b-4592-a71f-02cfd4e4faec";
+    pub const API_CLIENT_ID: &str = "aa827d93-d487-40bf-8956-b6872ed55290";
+    pub const DASHBOARD_CLIENT_ID: &str = "e2d026c4-13c5-4057-9090-a896e7bbc70f";
+}
+
+/// Dev builds' dashboard origin: the Vite dev server.
+#[cfg(feature = "dev")]
+pub const DEV_DASHBOARD_ORIGIN: &str = "http://localhost:5173";
+
+/// Where the dev token signing key lives, beside the other dev keys.
+#[cfg(feature = "dev")]
+pub const DEV_TOKEN_KEY_FILE: &str = "entra-signing-key.pem";
 
 // ============================================================================
 // Server
@@ -111,6 +139,16 @@ pub struct ServerConfig {
     pub transport: Transport,
     pub keys: KeyProviderConfig,
     pub storage: StorageConfig,
+    pub entra: EntraConfig,
+    /// The one origin CORS allows: the environment's dashboard.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "CORS allows only the dashboard origin")
+    )]
+    pub dashboard_origin: String,
+    /// The dev token signing key, whose public half dev builds also trust.
+    #[cfg(feature = "dev")]
+    pub dev_token_key: PathBuf,
 }
 
 impl ServerConfig {
@@ -155,13 +193,128 @@ impl ServerConfig {
             _ => return Err("set both TLS_CERT_PATH and TLS_KEY_PATH, or neither".into()),
         };
 
+        #[cfg(not(feature = "dev"))]
+        if lookup("DEV_TOKEN_KEY").is_some() {
+            return Err("DEV_TOKEN_KEY isn't available: release builds trust only \
+                        Entra ID's signing keys"
+                .into());
+        }
+
         Ok(Self {
             addr: SocketAddr::new(ip, port),
             transport,
             keys: key_provider_from_lookup(&lookup)?,
             storage: storage_from_lookup(&lookup)?,
+            entra: entra_from_lookup(&lookup)?,
+            dashboard_origin: dashboard_origin_from_lookup(&lookup)?,
+            #[cfg(feature = "dev")]
+            dev_token_key: dev_token_key_from_lookup(&lookup),
         })
     }
+}
+
+/// `DEV_TOKEN_KEY`, or `entra-signing-key.pem` in `DEV_KEYS_DIR`.
+#[cfg(feature = "dev")]
+pub fn dev_token_key_from_lookup(lookup: &impl Fn(&str) -> Option<String>) -> PathBuf {
+    lookup("DEV_TOKEN_KEY").map_or_else(
+        || {
+            PathBuf::from(
+                lookup("DEV_KEYS_DIR").unwrap_or_else(|| crate::tee::dev_keys::DEFAULT_DIR.into()),
+            )
+            .join(DEV_TOKEN_KEY_FILE)
+        },
+        PathBuf::from,
+    )
+}
+
+/// A UUID in canonical lowercase form, or an error naming `setting`.
+fn uuid_setting(setting: &str, value: &str) -> Result<String, String> {
+    uuid::Uuid::parse_str(value.trim())
+        .map(|u| u.hyphenated().to_string())
+        .map_err(|_| format!("{setting} {value:?} isn't a UUID"))
+}
+
+/// The dev app registrations' value for an Entra setting: dev builds'
+/// default. Release builds have none.
+fn entra_dev_default(name: &str) -> Option<String> {
+    #[cfg(feature = "dev")]
+    return match name {
+        "ENTRA_TENANT_ID" => Some(dev_entra::TENANT_ID.into()),
+        "ENTRA_API_CLIENT_ID" => Some(dev_entra::API_CLIENT_ID.into()),
+        "ENTRA_ALLOWED_CLIENT_IDS" => Some(format!(
+            "{},{AZURE_CLI_CLIENT_ID}",
+            dev_entra::DASHBOARD_CLIENT_ID
+        )),
+        _ => None,
+    };
+    #[cfg(not(feature = "dev"))]
+    {
+        let _ = name;
+        None
+    }
+}
+
+/// Read `ENTRA_TENANT_ID`, `ENTRA_API_CLIENT_ID` and
+/// `ENTRA_ALLOWED_CLIENT_IDS` (comma-separated). Dev builds default to the
+/// dev app registrations; release builds require all three and refuse the
+/// Azure CLI as a client.
+pub(crate) fn entra_from_lookup(
+    lookup: &impl Fn(&str) -> Option<String>,
+) -> Result<EntraConfig, String> {
+    let read = |name: &str| {
+        lookup(name)
+            .or_else(|| entra_dev_default(name))
+            .ok_or_else(|| format!("{name} is required"))
+    };
+    let tenant_id = uuid_setting("ENTRA_TENANT_ID", &read("ENTRA_TENANT_ID")?)?;
+    let api_client_id = uuid_setting("ENTRA_API_CLIENT_ID", &read("ENTRA_API_CLIENT_ID")?)?;
+    let allowed_client_ids = read("ENTRA_ALLOWED_CLIENT_IDS")?
+        .split(',')
+        .map(|id| uuid_setting("ENTRA_ALLOWED_CLIENT_IDS", id))
+        .collect::<Result<Vec<_>, _>>()?;
+    #[cfg(not(feature = "dev"))]
+    if allowed_client_ids
+        .iter()
+        .any(|id| id == AZURE_CLI_CLIENT_ID)
+    {
+        return Err(
+            "ENTRA_ALLOWED_CLIENT_IDS names the Azure CLI, which only dev builds allow".into(),
+        );
+    }
+    Ok(EntraConfig {
+        tenant_id,
+        api_client_id,
+        allowed_client_ids,
+    })
+}
+
+/// Read `DASHBOARD_ORIGIN`, the one origin CORS allows: an `https://`
+/// origin, required in release builds; dev builds default to the Vite dev
+/// server and also allow `http://`.
+fn dashboard_origin_from_lookup(
+    lookup: &impl Fn(&str) -> Option<String>,
+) -> Result<String, String> {
+    #[cfg(feature = "dev")]
+    let origin = lookup("DASHBOARD_ORIGIN").unwrap_or_else(|| DEV_DASHBOARD_ORIGIN.into());
+    #[cfg(not(feature = "dev"))]
+    let origin = lookup("DASHBOARD_ORIGIN").ok_or("DASHBOARD_ORIGIN is required")?;
+
+    let rest = origin
+        .strip_prefix("https://")
+        .or_else(|| {
+            if cfg!(feature = "dev") {
+                origin.strip_prefix("http://")
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| format!("DASHBOARD_ORIGIN {origin:?} must be an https:// origin"))?;
+    if rest.is_empty() || rest.contains(['/', '?', '#', ' ']) {
+        return Err(format!(
+            "DASHBOARD_ORIGIN {origin:?} must be a scheme and host, with no path"
+        ));
+    }
+    Ok(origin)
 }
 
 /// Read `STORAGE_BACKEND` and its settings: `STORAGE_BLOB_URL` and
@@ -369,20 +522,14 @@ pub fn drt_program_id() -> solana_pubkey::Pubkey {
 }
 
 // ============================================================================
-// JWKS Security
+// Loopback URLs
 // ============================================================================
-
-/// Whether plain HTTP is allowed for the JWKS URL.
-///
-/// Hardcoded to `true` for a co-located AVS on localhost. Entra ID, which
-/// replaces the AVS, always serves its keys over HTTPS.
-pub const ALLOW_HTTP_JWKS: bool = true;
 
 /// Returns `true` when `url` is an `http://` URL whose host is the loopback
 /// interface (`localhost`, `127.0.0.1`, or `::1`).
 ///
-/// Used to gate the "plain HTTP JWKS" warning and the production hard-block,
-/// and to keep release builds' SKR sidecar traffic on loopback.
+/// Keeps release builds' SKR sidecar traffic on loopback.
+#[cfg(any(test, not(feature = "dev")))]
 /// Substring matching (e.g. `url.contains("localhost")`) is unsafe — a host
 /// like `attacker.example.com/localhost/...` would have falsely passed.
 /// This parser extracts the authority and matches the host exactly.
@@ -448,13 +595,92 @@ mod tests {
         })
     }
 
+    const TENANT: &str = "11111111-1111-1111-1111-111111111111";
+    const API: &str = "22222222-2222-2222-2222-222222222222";
+    const DASHBOARD: &str = "33333333-3333-3333-3333-333333333333";
+
     /// Settings a release build requires.
-    const RELEASE_BASE: [(&str, &str); 4] = [
+    const RELEASE_BASE: [(&str, &str); 8] = [
         ("TLS_CERT_PATH", "c"),
         ("TLS_KEY_PATH", "k"),
         ("KEY_VAULT_URL", "kv.vault.azure.net"),
         ("STORAGE_BLOB_URL", "https://acct.blob.core.windows.net"),
+        ("ENTRA_TENANT_ID", TENANT),
+        ("ENTRA_API_CLIENT_ID", API),
+        ("ENTRA_ALLOWED_CLIENT_IDS", DASHBOARD),
+        ("DASHBOARD_ORIGIN", "https://app.pilot.example"),
     ];
+
+    #[test]
+    fn entra_settings_are_canonical_uuids() {
+        let config = complete(&[(
+            "ENTRA_ALLOWED_CLIENT_IDS",
+            "33333333-3333-3333-3333-333333333333, 44444444-4444-4444-4444-44444444444A",
+        )])
+        .expect("valid config");
+        assert_eq!(
+            config.entra,
+            EntraConfig {
+                tenant_id: TENANT.into(),
+                api_client_id: API.into(),
+                allowed_client_ids: vec![
+                    DASHBOARD.into(),
+                    "44444444-4444-4444-4444-44444444444a".into()
+                ],
+            }
+        );
+        assert_eq!(
+            config.entra.issuer(),
+            format!("https://login.microsoftonline.com/{TENANT}/v2.0")
+        );
+        assert!(complete(&[("ENTRA_TENANT_ID", "contoso")]).is_err());
+        assert!(complete(&[("ENTRA_ALLOWED_CLIENT_IDS", "a,b")]).is_err());
+        assert_eq!(config.dashboard_origin, "https://app.pilot.example");
+        assert!(complete(&[("DASHBOARD_ORIGIN", "https://app.pilot.example/")]).is_err());
+    }
+
+    #[cfg(feature = "dev")]
+    #[test]
+    fn dev_builds_default_to_the_dev_app_registrations_and_vite() {
+        let config = config_from(&[]).expect("dev defaults");
+        assert_eq!(config.entra.tenant_id, dev_entra::TENANT_ID);
+        assert_eq!(config.entra.api_client_id, dev_entra::API_CLIENT_ID);
+        assert_eq!(
+            config.entra.allowed_client_ids,
+            [dev_entra::DASHBOARD_CLIENT_ID, AZURE_CLI_CLIENT_ID]
+        );
+        assert_eq!(config.dashboard_origin, "http://localhost:5173");
+        assert_eq!(
+            config.dev_token_key,
+            PathBuf::from("dev/keys/entra-signing-key.pem")
+        );
+    }
+
+    #[cfg(not(feature = "dev"))]
+    #[test]
+    fn release_builds_require_entra_settings_and_refuse_dev_clients_and_keys() {
+        for name in [
+            "ENTRA_TENANT_ID",
+            "ENTRA_API_CLIENT_ID",
+            "ENTRA_ALLOWED_CLIENT_IDS",
+            "DASHBOARD_ORIGIN",
+        ] {
+            assert!(config_from(&base_without(&[name])).is_err(), "{name}");
+        }
+        let cli = format!("{DASHBOARD},{AZURE_CLI_CLIENT_ID}");
+        let err = config_from(
+            &[("ENTRA_ALLOWED_CLIENT_IDS", cli.as_str())]
+                .into_iter()
+                .chain(base_without(&["ENTRA_ALLOWED_CLIENT_IDS"]))
+                .collect::<Vec<_>>(),
+        )
+        .expect_err("the Azure CLI is dev-only");
+        assert!(err.contains("Azure CLI"), "{err}");
+        assert!(complete(&[("DASHBOARD_ORIGIN", "http://localhost:5173")]).is_err());
+        let err = complete(&[("DEV_TOKEN_KEY", "dev/keys/entra-signing-key.pem")])
+            .expect_err("no dev token key in release builds");
+        assert!(err.contains("DEV_TOKEN_KEY"), "{err}");
+    }
 
     /// `extra` followed by [`RELEASE_BASE`]; the first match wins, so `extra`
     /// overrides the base.

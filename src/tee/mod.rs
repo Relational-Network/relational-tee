@@ -29,6 +29,8 @@ use zeroize::Zeroizing;
 pub mod dev_keys;
 #[cfg(feature = "dev")]
 pub mod dev_maa;
+#[cfg(any(test, feature = "dev"))]
+pub mod dev_rsa;
 #[cfg(feature = "dev")]
 pub mod fake_skr;
 #[cfg(feature = "dev")]

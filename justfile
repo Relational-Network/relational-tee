@@ -39,6 +39,12 @@ dev *args: dev-keys
 dev-keys:
     cargo run --quiet --features dev -- dev-keys dev/keys
 
+# Print a token signed with the dev token signing key, which dev builds trust
+# (`just dev-token --help` lists the options, including deliberately bad tokens).
+dev-token *args:
+    @cargo run --quiet --features dev -- dev-keys dev/keys >&2
+    @cargo run --quiet --features dev -- dev-token {{ args }}
+
 # Run the fake SKR sidecar on 127.0.0.1:9000 (use KEY_PROVIDER=skr in the worker).
 skr: dev-keys
     cargo run --features dev -- fake-skr

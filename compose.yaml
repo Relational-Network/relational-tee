@@ -17,13 +17,18 @@ x-worker: &worker
   image: relational-tee:dev
   depends_on: [azurite, skr]
   restart: unless-stopped
+  # The dev token signing key is readable by its owner only.
+  user: "${STACK_UID:-0}:${STACK_GID:-0}"
   environment:
     BIND_ADDR: 0.0.0.0
     KEY_PROVIDER: skr
     SKR_ENDPOINT: http://skr:9000
     STORAGE_BACKEND: azurite
     STORAGE_BLOB_URL: http://azurite:10000/devstoreaccount1
+    DEV_TOKEN_KEY: /keys/entra-signing-key.pem
     RUST_LOG: ${RUST_LOG:-info}
+  volumes:
+    - ./dev/keys/entra-signing-key.pem:/keys/entra-signing-key.pem:ro
 
 services:
   azurite:

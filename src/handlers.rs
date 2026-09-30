@@ -17,7 +17,7 @@ use serde::Serialize;
 use tracing::{debug, info};
 use utoipa::ToSchema;
 
-use crate::auth::AdminToken;
+use crate::auth::Caller;
 use crate::config::MAX_BODY_SIZE;
 use crate::crypto::{jwk_for_public_key, Jwk};
 use crate::data_validation::{validate_csv_bytes, FieldSchema, ValidationMode, ValidationSummary};
@@ -77,17 +77,18 @@ pub struct AdminStatusResponse {
         (status = 403, description = "Forbidden - admin role required")
     )
 )]
-pub async fn admin_status(AdminToken(token): AdminToken) -> Json<AdminStatusResponse> {
-    info!(admin_user = %token.sub, "Admin status requested");
+pub async fn admin_status(caller: Caller) -> Result<Json<AdminStatusResponse>, ApiError> {
+    caller.require_admin()?;
+    info!(admin_user = %caller.user_id, "Admin status requested");
     let uptime_seconds = crate::STARTED_AT
         .get()
         .map(|t| t.elapsed().as_secs())
         .unwrap_or(0);
-    Json(AdminStatusResponse {
+    Ok(Json(AdminStatusResponse {
         status: "operational".to_string(),
-        admin_user: token.sub,
+        admin_user: caller.user_id,
         uptime_seconds,
-    })
+    }))
 }
 
 // ============================================================================

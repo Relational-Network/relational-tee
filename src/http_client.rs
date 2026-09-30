@@ -20,7 +20,7 @@ use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use hyper_util::rt::TokioExecutor;
 use rustls::{ClientConfig, RootCertStore};
-use serde::{de::DeserializeOwned, Serialize};
+use serde::Serialize;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
@@ -62,26 +62,6 @@ impl HttpClient {
     /// Build a client trusting Mozilla's webpki root CAs.
     pub fn new() -> Self {
         Self::build(default_root_store())
-    }
-
-    /// Build a client trusting the given PEM-encoded CA certificates *in
-    /// addition to* the webpki roots. Used for development / private AVS
-    /// deployments where the JWKS endpoint is signed by a custom CA.
-    pub fn with_extra_ca_pem(pem: &[u8]) -> Result<Self, HttpError> {
-        let mut roots = default_root_store();
-        let mut cursor = std::io::Cursor::new(pem);
-        let mut added = 0usize;
-        for cert in rustls_pemfile::certs(&mut cursor) {
-            let cert = cert.map_err(|e| HttpError::new(format!("invalid PEM: {e}")))?;
-            roots
-                .add(cert)
-                .map_err(|e| HttpError::new(format!("failed to add CA certificate: {e}")))?;
-            added += 1;
-        }
-        if added == 0 {
-            return Err(HttpError::new("no certificates found in PEM input"));
-        }
-        Ok(Self::build(roots))
     }
 
     /// Override the per-request timeout (default: 30s).
@@ -230,7 +210,8 @@ impl Response {
     }
 
     /// Consume the response, parsing the body as JSON.
-    pub fn into_json<T: DeserializeOwned>(self) -> Result<T, HttpError> {
+    #[cfg(all(test, feature = "dev"))]
+    pub fn into_json<T: serde::de::DeserializeOwned>(self) -> Result<T, HttpError> {
         serde_json::from_slice(&self.body)
             .map_err(|e| HttpError::new(format!("parse JSON response: {e}")))
     }

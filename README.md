@@ -9,7 +9,8 @@ The worker behind IOB MicRes: an Axum server that runs Use Case 1 credential poo
 - **Transport.** Dev builds serve plain HTTP on `127.0.0.1:8443`, or HTTPS with a local mkcert certificate. Release builds have no plain HTTP path: they read a PEM certificate and key from `TLS_CERT_PATH` and `TLS_KEY_PATH`, and refuse to start without them.
 - **Keys.** At startup the worker obtains four P-256 keys, `transport-key`, `storage-root`, `tls-key` and `commitment-key`, and keeps them in memory only. Release builds get them from Microsoft's SKR sidecar on localhost (`KEY_PROVIDER=skr`), which releases a key only to a confidential container group whose attested policy matches the key's release policy. Dev builds default to `KEY_PROVIDER=local`, which reads dev keys from `dev/keys/` (`just dev-keys` creates them); release builds don't contain that provider and refuse `KEY_PROVIDER=local`. Uploads are sealed to `transport-key`, which every worker shares.
 - **Storage.** All durable state lives in Azure Blob Storage as documents sealed inside the worker with a key derived from `storage-root` (see [Storage](#storage)); workers keep nothing on local disk. Dev builds default to the same sealed objects in local files under `./data`.
-- **Auth.** Protected endpoints still validate ES256 tokens from the Attestation Verification Service (AVS). The AVS only issues tokens to an SGX enclave it has attested, so authenticated endpoints can't be exercised locally until Entra ID validation replaces it. Public endpoints (`/health*`, `/v1/attestation/public-key`, `/docs`) work.
+- **Auth.** Protected endpoints take Entra ID access tokens for the worker's API app registration. A token must be RS256, signed by a key from the pinned tenant's JWKS (`https://login.microsoftonline.com/{tid}/discovery/v2.0/keys`, cached for 24 hours, fetched by one request at a time, and refetched for an unknown `kid` at most once a minute), with that tenant's exact `iss` and `tid`, the API's client ID as `aud`, an allowed client as `azp`, and `access_as_user` in `scp`; `exp` and `nbf` allow 60 seconds of skew. jsonwebtoken verifies RS256 through aws-lc-rs, so the `rsa` crate stays out. A caller's `(tid, oid)` maps to an internal `user_id`, created at their first sign-in; every stored reference to a person uses it. The `Admin` app role grants the permissions `pools:read`, `pools:create`, `pools:write`, `wallets:read` and `users:read`, and is itself required for wallet creation, deletion and sends and for `/v1/admin/…`; a caller with no role can call only `/v1/users/me` and the pool list. Pool writes also need pool ownership, and wallet routes wallet ownership.
+- **Dev tokens.** Dev builds also trust one more key, the dev token signing key `dev/keys/entra-signing-key.pem` (`just dev-keys` creates it), so tests, scripts and CI can call the API offline: `just dev-token` prints a token for it (see [Running it locally](#running-it-locally)). Release builds contain none of this code and refuse `DEV_TOKEN_KEY`.
 - **Solana.** The public devnet RPC by default. It is rate-limited and has no SLA, and the server warns about it at startup.
 
 ## Develop locally
@@ -25,7 +26,8 @@ just            # list the recipes
 | Recipe | What it does |
 |---|---|
 | `just dev` | Run the dev build natively on `127.0.0.1:8443`, with Swagger UI at `/docs` (creates missing dev keys first) |
-| `just dev-keys` | Create any missing dev keys in `dev/keys/`: one private JWK per key, and the dev MAA signing key; existing keys are kept |
+| `just dev-keys` | Create any missing dev keys in `dev/keys/`: one private JWK per key, the dev MAA signing key and the dev token signing key; existing keys are kept |
+| `just dev-token` | Print a token signed with the dev token signing key: `Admin` by default; `--roles`, `--oid`, `--tid`, `--email`, `--name` and `--azp` change it, and `--bad expired\|not-yet-valid\|audience\|tenant\|client\|scope` makes one the worker must refuse |
 | `just skr` | Run the fake SKR sidecar on `127.0.0.1:9000`; start the worker with `KEY_PROVIDER=skr` to use it |
 | `just cert` | Create a locally trusted mkcert certificate in `dev/certs/`; `just dev` then serves HTTPS |
 | `just test` | Run the tests with cargo-nextest, in the release and dev configurations; storage tests use local files in temporary directories |
@@ -58,7 +60,19 @@ Not there yet: a fault-injection suite for the idempotency work, and a debug-mod
 - **Production code paths:** `just skr` and `just azurite` in other terminals, then `KEY_PROVIDER=skr STORAGE_BACKEND=azurite just dev`. The worker then releases keys and attests through the SKR client, and stores everything in Azurite through the Azure client, signing with Azurite's well-known Shared Key.
 - **Several workers:** `just image-dev` once, then `just stack-up` ([`compose.yaml`](compose.yaml)). Three workers share Azurite and one fake SKR sidecar behind HAProxy on `127.0.0.1:8443`, which round-robins at layer 4 and probes `/health/ready` like the Azure load balancer. The fake sidecar's `/certs` is on `127.0.0.1:9000`.
 
-Authenticated endpoints still need AVS-issued tokens, which the local stack can't mint, so locally they answer 401 until Entra ID sign-in lands.
+**Calling the API.** Dev builds accept tokens from the dev app registrations in Relational's tenant, and from the dev token signing key:
+
+```bash
+# A real token, as a user with the Admin role in the dev registration
+TOKEN=$(az account get-access-token \
+  --scope api://aa827d93-d487-40bf-8956-b6872ed55290/access_as_user \
+  --query accessToken -o tsv)
+# Or offline, signed with the dev key (also in the compose stack)
+TOKEN=$(just dev-token)
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8443/v1/users/me
+```
+
+Never print, log or commit a real token.
 
 ### Configuration
 
@@ -79,7 +93,10 @@ Authenticated endpoints still need AVS-issued tokens, which the local stack can'
 | `MANAGED_IDENTITY_CLIENT_ID` | unset | the worker identity | Which managed identity to request storage tokens for |
 | `SOLANA_RPC_URL` | `https://api.devnet.solana.com` | same | Solana RPC endpoint |
 | `SOLANA_NETWORK` | `devnet` | same | `devnet` or `mainnet`, for explorer links |
-| `AVS_JWKS_URL` | `http://127.0.0.1:9100/.well-known/jwks.json` | same | AVS signing keys |
+| `ENTRA_TENANT_ID` | the dev tenant `7e3e38e3-…` | required | The tenant whose tokens are accepted |
+| `ENTRA_API_CLIENT_ID` | the dev API `aa827d93-…` | required | The API app registration: tokens' `aud` |
+| `ENTRA_ALLOWED_CLIENT_IDS` | the dev dashboard `e2d026c4-…` and the Azure CLI | required; the Azure CLI is refused | Comma-separated client IDs allowed as `azp` |
+| `DEV_TOKEN_KEY` | `{DEV_KEYS_DIR}/entra-signing-key.pem`, trusted if it exists | refused | The dev token signing key |
 | `RUST_LOG` | `info` | `info` | Log filter |
 
 Dev builds are the ones with the `dev` Cargo feature (`just dev`, or `cargo run --features dev`).
@@ -121,7 +138,7 @@ CI (`.github/workflows/ci.yml`) runs `just check` in the dev shell, `nix flake c
 
 - **Health:** `GET /health/live` answers 200 while the process runs. `GET /health/ready` answers 200 only when the worker holds its four keys, has a valid certificate (or serves plain HTTP in a dev build), its storage canary (a read and a conditional write of the sealed `state/canary/{worker_id}`, every 20 seconds) succeeded within 60 seconds, and it isn't draining. It reads cached state only and never depends on Solana RPC. `GET /health` returns details for operators: keys held, certificate expiry, canary age, key cache age, Solana RPC status (checked every 30 seconds), version and host data. On SIGTERM the worker fails readiness at once, keeps serving for 10 seconds so the load balancer notices, then stops accepting connections and gives in-flight requests up to 40 seconds; Ctrl-C skips the 10 seconds, and a second Ctrl-C exits at once.
 - **Attestation:** `GET /v1/attestation` returns `{ maa_token, transport_jwk, kid }`: an MAA token whose `x-ms-runtime.keys[0]` is the transport public key, and the key's RFC 7638 thumbprint. The worker requests the token at startup, refreshes it at 80% of its lifetime and serves it from memory; it answers 503 until the first token arrives. `GET /v1/attestation/public-key` still returns the bare transport public key, which the dashboard seals uploads to.
-- **Users:** `GET /v1/users/me`.
+- **Users:** `GET /v1/users/me` returns `{ user_id, email, display_name, roles, permissions }`. `GET /v1/users` (`users:read`) lists everyone who has signed in, `{ users: [{ user_id, email, display_name, roles, first_seen, last_seen }], next_cursor }`, sorted by email; `GET /v1/users?email=` is an exact, case-insensitive match returning `{ user_id, email, display_name }`, or 404.
 - **Wallets:** `GET` and `POST /v1/wallets`; `GET` and `DELETE /v1/wallets/{id}`; `GET …/balance`; `POST …/estimate` and `…/send`; `GET …/transactions` and `…/transactions/{signature}`.
 - **Pools:** `POST /v1/drt/pools/malta`; `GET /v1/drt/pools/list`, `/v1/drt/pools/{pda}`, `…/drt/{name}` and `/v1/drt/pools/by-wallet/{wallet_id}`; `POST` and `GET …/schema`; `POST …/initialize`, `…/issue` and `…/revoke`; `GET …/revocations`, `…/summary` and `…/issuance-log`. The summary, issuance log and revocations together are the pool's audit trail: who created it and when, with the creation signature; the initial upload; each issuance with its burn signature; and each revocation with who, when and why.
 - **Admin:** `GET /v1/admin/status`, `/v1/admin/wallet-stats` and `/v1/admin/wallets`; `POST /v1/admin/wallets/{id}/suspend` and `…/activate`.

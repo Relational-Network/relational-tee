@@ -11,12 +11,8 @@
 //!   email, and which identity holds it. Create-only.
 //!
 //! `h(x)` keeps Entra object IDs and emails out of object names. The
-//! mapping never changes, so workers cache it without revalidating.
-
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "Entra ID sign-in creates and reads identities")
-)]
+//! mapping never changes, so workers cache it without revalidating. A
+//! token without an `email` claim gets no email index entry.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -116,18 +112,23 @@ impl<'a> Identities<'a> {
                 .map(|(i, _)| i)
                 .ok_or_else(|| StoreError::Invalid("an identity vanished".into()))?,
         };
-        let entry = EmailEntry {
-            user_id: identity.user_id.clone(),
-            identity: key,
-        };
-        state
-            .create_json(&self.email_path(&identity.email), &entry)
-            .await?;
+        if !identity.email.is_empty() {
+            let entry = EmailEntry {
+                user_id: identity.user_id.clone(),
+                identity: key,
+            };
+            state
+                .create_json(&self.email_path(&identity.email), &entry)
+                .await?;
+        }
         Ok(identity)
     }
 
     /// The identity with this email, once its owner has signed in.
     pub async fn by_email(&self, email: &str) -> Result<Option<Identity>, StoreError> {
+        if email.trim().is_empty() {
+            return Ok(None);
+        }
         let state = self.s.state();
         let Some(entry) = state
             .get_immutable_json::<EmailEntry>(&self.email_path(email))
@@ -226,5 +227,23 @@ mod tests {
             .unwrap();
         assert_eq!(later.user_id, first.user_id);
         assert!(later.roles.is_empty());
+    }
+
+    #[tokio::test]
+    async fn users_without_an_email_share_no_index_entry() {
+        let (a, _, _files) = two_workers();
+        let none: Vec<String> = Vec::new();
+        let x = a
+            .identities()
+            .sign_in(&sign_in("oid-x", "", &none))
+            .await
+            .unwrap();
+        let y = a
+            .identities()
+            .sign_in(&sign_in("oid-y", "", &none))
+            .await
+            .unwrap();
+        assert_ne!(x.user_id, y.user_id);
+        assert!(a.identities().by_email("").await.unwrap().is_none());
     }
 }
