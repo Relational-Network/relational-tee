@@ -1,0 +1,201 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Reference-values manifest",
+  "description": "The payload of an environment's reference-values manifest: a compact JWS (ES256, header { alg, kid }) signed with the environment's manifest-signing-key, served at GET /v1/reference-values and kept in the reference-values container as {environment}/{sequence}.jws and {environment}/latest.jws. It lists the workloads, transport keys and tls-key versions clients may trust. Manifests for environments other than dev also carry what rebuilds the release from source.",
+  "type": "object",
+  "required": ["environment", "sequence", "not_before", "not_after", "claim_sets", "keys", "provenance"],
+  "additionalProperties": false,
+  "properties": {
+    "environment": {
+      "description": "The environment, as its workers' ENVIRONMENT names it.",
+      "type": "string",
+      "pattern": "^[a-z0-9-]+$"
+    },
+    "sequence": {
+      "description": "Higher in every manifest the environment publishes. Clients remember the highest they have seen and refuse lower ones.",
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "not_before": {
+      "description": "Clients refuse the manifest before this time.",
+      "$ref": "#/$defs/timestamp"
+    },
+    "not_after": {
+      "description": "Clients refuse the manifest from this time on.",
+      "$ref": "#/$defs/timestamp"
+    },
+    "claim_sets": {
+      "description": "A worker is approved if its MAA token matches every claim of one set, with its host data among those the set lists.",
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/claim_set" }
+    },
+    "keys": {
+      "type": "object",
+      "required": ["transport", "tls"],
+      "additionalProperties": false,
+      "properties": {
+        "transport": {
+          "description": "The approved transport key versions. Clients seal uploads only to a listed key. Workers open uploads sealed to their current version and to every listed version with a version, which they release it by.",
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["kid"],
+            "additionalProperties": false,
+            "properties": {
+              "kid": {
+                "description": "The key's RFC 7638 JWK thumbprint: SHA-256, unpadded base64url.",
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{43}$"
+              },
+              "version": { "$ref": "#/$defs/key_version" }
+            }
+          }
+        },
+        "tls": {
+          "description": "The approved tls-key versions.",
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["spki_sha256"],
+            "additionalProperties": false,
+            "properties": {
+              "version": { "$ref": "#/$defs/key_version" },
+              "spki_sha256": {
+                "description": "SHA-256 of the key's DER SubjectPublicKeyInfo, padded base64.",
+                "type": "string",
+                "pattern": "^[A-Za-z0-9+/]{43}=$"
+              }
+            }
+          }
+        }
+      }
+    },
+    "images": {
+      "description": "The image digests the approved policies were generated from.",
+      "type": "object",
+      "required": ["worker", "skr"],
+      "additionalProperties": false,
+      "properties": {
+        "worker": { "$ref": "#/$defs/image_digest" },
+        "skr": { "$ref": "#/$defs/image_digest" }
+      }
+    },
+    "tools": {
+      "description": "The versions of the tools that generated the approved policies.",
+      "type": "object",
+      "required": ["confcom", "dmverity_vhd"],
+      "additionalProperties": false,
+      "properties": {
+        "confcom": { "type": "string", "minLength": 1 },
+        "dmverity_vhd": { "type": "string", "minLength": 1 }
+      }
+    },
+    "provenance": {
+      "description": "Where the approved release comes from.",
+      "type": "object",
+      "required": ["commit"],
+      "additionalProperties": false,
+      "properties": {
+        "commit": {
+          "description": "The git commit the release was built from; dev manifests signed outside a checkout say dev.",
+          "type": "string",
+          "pattern": "^([0-9a-f]{40}|dev)$"
+        },
+        "flake_lock_sha256": {
+          "description": "SHA-256 of the commit's flake.lock.",
+          "$ref": "#/$defs/sha256_hex"
+        },
+        "nix_output": {
+          "description": "The Nix store path of the image.",
+          "type": "string",
+          "pattern": "^/nix/store/[0-9a-z]{32}-[^/]+$"
+        },
+        "layers": {
+          "description": "The dm-verity root hash of each image layer, in order.",
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/sha256_hex" }
+        }
+      }
+    }
+  },
+  "if": {
+    "properties": { "environment": { "const": "dev" } }
+  },
+  "else": {
+    "required": ["images", "tools"],
+    "properties": {
+      "claim_sets": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "authority": { "type": "string", "pattern": "^https://" }
+          }
+        }
+      },
+      "provenance": {
+        "type": "object",
+        "required": ["commit", "flake_lock_sha256", "nix_output", "layers"],
+        "properties": {
+          "commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "timestamp": {
+      "description": "UTC, to the second, in RFC 3339 form.",
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    },
+    "claim_set": {
+      "description": "Claims as MAA tokens carry them for a confidential container group. Clients check every claim a set names, so a set can't name one they don't check.",
+      "type": "object",
+      "required": [
+        "authority",
+        "x-ms-attestation-type",
+        "x-ms-compliance-status",
+        "x-ms-sevsnpvm-is-debuggable",
+        "x-ms-sevsnpvm-vmpl",
+        "x-ms-sevsnpvm-hostdata"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "authority": {
+          "description": "The MAA endpoint that signs the tokens, as their iss: https, or plain http on loopback in dev.",
+          "type": "string",
+          "pattern": "^(https://[^/?#]+|http://(localhost|127\\.0\\.0\\.1)(:[0-9]{1,5})?)$"
+        },
+        "x-ms-attestation-type": { "const": "sevsnpvm" },
+        "x-ms-compliance-status": { "const": "azure-compliant-uvm" },
+        "x-ms-sevsnpvm-is-debuggable": { "const": false },
+        "x-ms-sevsnpvm-vmpl": { "const": 0 },
+        "x-ms-sevsnpvm-hostdata": {
+          "description": "The approved host data, each the SHA-256 of an approved CCE policy. A rollout lists the current and the next.",
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/sha256_hex" }
+        }
+      }
+    },
+    "key_version": {
+      "description": "A Key Vault key version.",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9]{1,64}$"
+    },
+    "image_digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "sha256_hex": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  }
+}

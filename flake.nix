@@ -49,7 +49,12 @@
       sourceDateEpoch = toString (self.lastModified or 1);
 
       commonArgs = craneLib: pkgs: {
-        src = craneLib.cleanCargoSource ./.;
+        # The Cargo sources, and the JSON schemas their tests check.
+        src = lib.cleanSourceWith {
+          src = lib.cleanSource ./.;
+          filter = path: type: craneLib.filterCargoSources path type || lib.hasSuffix ".schema.json" path;
+          name = "source";
+        };
         strictDeps = true;
         buildInputs = lib.optionals pkgs.stdenv.hostPlatform.isDarwin [ pkgs.libiconv ];
       };
