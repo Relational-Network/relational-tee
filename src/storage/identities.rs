@@ -210,6 +210,28 @@ mod tests {
             .all(|n| !n.contains("oid-ada") && !n.to_lowercase().contains("ada@")));
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ten_concurrent_first_sign_ins_on_two_workers_create_one_user_id() {
+        let (a, b, _files) = two_workers();
+        let workers = [std::sync::Arc::new(a), std::sync::Arc::new(b)];
+        let attempts: Vec<_> = (0..10)
+            .map(|i| {
+                let storage = workers[i % 2].clone();
+                tokio::spawn(async move {
+                    let roles = vec!["Admin".to_string()];
+                    let who = sign_in("oid-ten", "ten@example.com", &roles);
+                    storage.identities().sign_in(&who).await.unwrap().user_id
+                })
+            })
+            .collect();
+        let mut user_ids = std::collections::BTreeSet::new();
+        for attempt in attempts {
+            user_ids.insert(attempt.await.unwrap());
+        }
+        assert_eq!(user_ids.len(), 1, "{user_ids:?}");
+        assert_eq!(workers[1].identities().all().await.unwrap().len(), 1);
+    }
+
     #[tokio::test]
     async fn a_role_change_refreshes_the_identity() {
         let (a, _, _files) = two_workers();

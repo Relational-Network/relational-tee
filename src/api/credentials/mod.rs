@@ -407,4 +407,109 @@ mod tests {
         let entry = doc.upload(&record_id).expect("the issuance is recorded");
         assert_eq!(entry.commitment_bytes(), Some(earlier));
     }
+
+    #[tokio::test]
+    async fn an_admin_who_does_not_own_a_pool_gets_403_on_its_writes() {
+        let worker = worker();
+        let owner = worker.admin("oid-owner").await;
+        let other = worker.admin("oid-other").await;
+        let pool_pda = worker
+            .pool(&owner, Some(initial_upload(&owner.user_id)))
+            .await;
+        let base = format!("/v1/drt/pools/{pool_pda}");
+        let json_post = |path: String, token: &str, body: &Value| {
+            Request::post(path)
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .header(&KEY_HEADER, uuid::Uuid::new_v4().to_string())
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        let schema = json!({
+            "schema_id": "s",
+            "fields": [{ "name": "score", "field_type": "integer", "nullable": false }],
+        });
+        let revoke = json!({ "wallet_id": other.wallet_id, "credential_ids": [INITIAL] });
+
+        let mut requests = vec![
+            (
+                "schema",
+                json_post(format!("{base}/schema"), &other.token, &schema),
+            ),
+            (
+                "revoke",
+                json_post(format!("{base}/revoke"), &other.token, &revoke),
+            ),
+        ];
+        for route in ["initialize", "issue"] {
+            let path = format!("{base}/{route}");
+            let key = uuid::Uuid::new_v4().to_string();
+            let sealed = worker.sealed(&other, &path, &key, CSV);
+            requests.push((route, upload(&path, &key, &other.token, sealed)));
+        }
+        for (route, request) in requests {
+            let (status, _, err) = send(&worker.app, request).await;
+            assert_eq!(
+                (status, err["code"].as_str()),
+                (StatusCode::FORBIDDEN, Some("forbidden")),
+                "{route}: {err}"
+            );
+        }
+
+        // The pool's owner gets past the same check.
+        let request = json_post(format!("{base}/schema"), &owner.token, &schema);
+        let (status, _, saved) = send(&worker.app, request).await;
+        assert_eq!(status, StatusCode::OK, "{saved}");
+    }
+
+    #[tokio::test]
+    async fn two_workers_page_one_list_with_each_others_cursors() {
+        use crate::storage::pools::tests::pool;
+        use crate::storage::tests::two_workers;
+
+        let (a, b, _files) = two_workers();
+        for i in 0..5 {
+            a.pools()
+                .create(&pool(&format!("P{i}"), "w1"))
+                .await
+                .unwrap();
+        }
+        let router = |storage: Storage| {
+            let mut state = AppState::for_tests();
+            state.storage = Arc::new(storage);
+            crate::router(state)
+        };
+        let workers = [router(a), router(b)];
+        let token = admin_token("oid-reader");
+        let page = |worker: usize, cursor: Option<String>| {
+            let query = cursor.map(|c| format!("&cursor={c}")).unwrap_or_default();
+            let request = Request::get(format!("/v1/drt/pools/list?limit=2{query}"))
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap();
+            let app = workers[worker].clone();
+            async move {
+                let (status, _, body) = send(&app, request).await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                body
+            }
+        };
+
+        // Each page, asked of either worker with the cursor the other gave,
+        // is the same page.
+        let mut cursor = None;
+        let mut seen = Vec::new();
+        for turn in 0..3 {
+            let here = page(turn % 2, cursor.clone()).await;
+            let there = page((turn + 1) % 2, cursor.clone()).await;
+            assert_eq!(here, there, "page {turn}");
+            for entry in here["pools"].as_array().unwrap() {
+                seen.push(entry["pool_pda"].as_str().unwrap().to_string());
+            }
+            cursor = here["next_cursor"].as_str().map(String::from);
+        }
+        assert!(cursor.is_none(), "three pages of two hold five pools");
+        seen.sort();
+        assert_eq!(seen, ["P0", "P1", "P2", "P3", "P4"]);
+    }
 }
