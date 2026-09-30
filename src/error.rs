@@ -94,6 +94,11 @@ impl ApiError {
         Self::new(StatusCode::CONFLICT, "conflict", msg)
     }
 
+    /// 413 `payload_too_large` — the request body exceeds its limit.
+    pub fn payload_too_large(msg: impl Into<String>) -> Self {
+        Self::new(StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large", msg)
+    }
+
     /// 422 `unprocessable_entity` — semantically invalid (e.g., bad Solana address).
     pub fn unprocessable(msg: impl Into<String>) -> Self {
         Self::new(

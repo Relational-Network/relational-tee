@@ -46,6 +46,9 @@ hmac = { version = "0.12", default-features = false }
 base64 = { version = "0.22.1", default-features = false }
 hkdf = { version = "0.12.4", default-features = false }
 aes-gcm = { version = "0.10.3", default-features = false, features = ["aes", "alloc"] }
+# Sealed uploads (RFC 9180). 0.13 builds on the p256, hkdf and aes-gcm
+# versions above; 0.14 needs their next major versions.
+hpke = { version = "0.13", default-features = false, features = ["alloc", "p256"] }
 zeroize = { version = "1.8", default-features = false, features = ["alloc"] }
 percent-encoding = { version = "2.3", default-features = false, features = ["alloc"] }
 # Dev builds only: the fake MAA and the dev token signing key sign RS256 tokens
@@ -106,3 +109,5 @@ tokio = { version = "1.49.0", default-features = false, features = ["test-util"]
 tower = { version = "0.5", default-features = false, features = ["util"] }
 # Tests in every configuration mint RS256 tokens, as the dev token signer does.
 aws-lc-rs = { version = "1.18", default-features = false, features = ["aws-lc-sys", "ring-io"] }
+# Tests seal uploads as clients do; hpke takes this rand_core's RNGs.
+rand_core = { version = "0.9", default-features = false, features = ["os_rng"] }

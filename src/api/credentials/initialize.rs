@@ -20,9 +20,10 @@ use crate::audit;
 use crate::auth::{Caller, Permission};
 use crate::blockchain::drt::accounts::fetch_pool;
 use crate::error::ApiError;
-use crate::handlers::{parse_csv_payload, validate_payload};
+use crate::handlers::{open_sealed_csv, validate_payload};
 use crate::idempotency::Idempotent;
 use crate::ids;
+use crate::seal::SealedUploadForm;
 use crate::state::AppState;
 use crate::storage::pools::{PoolState, Upload, INITIAL};
 use crate::storage::Change;
@@ -61,15 +62,16 @@ pub struct InitializePoolResponse {
     path = "/v1/drt/pools/{pool_pda}/initialize",
     tag = "Credentials",
     summary = "Initialize pool dataset",
-    description = "Seed the initial credential dataset for a pool. Requires the pool to be in `needs_init` state. No DRT required — only the pool creator can call this.",
+    description = "Seed the initial credential dataset for a pool. Requires the pool to be in `needs_init` state. No DRT required — only the pool creator can call this. The CSV is sealed with HPKE to the transport key from `GET /v1/attestation`, with this request's AAD.",
     security(("bearer_auth" = [])),
     params(
         ("pool_pda" = String, Path, description = "Pool PDA address (base58)"),
         ("Idempotency-Key" = String, Header, description = "A UUID naming this user action; reuse it on every retry"),
     ),
+    request_body(content = SealedUploadForm, content_type = "multipart/form-data"),
     responses(
         (status = 200, description = "Dataset initialized", body = InitializePoolResponse),
-        (status = 400, description = "Validation error, pool already initialized, or no Idempotency-Key"),
+        (status = 400, description = "Validation error, pool already initialized, no Idempotency-Key, or the sealed payload doesn't open (`sealed_payload_invalid`)"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Not pool owner"),
         (status = 404, description = "Pool not found"),
@@ -85,9 +87,15 @@ pub async fn initialize_pool(
     multipart: Multipart,
 ) -> Result<Response, ApiError> {
     caller.require(Permission::PoolsWrite)?;
-    // Parse and decrypt the CSV payload; the fingerprint covers the plaintext.
-    let parsed = parse_csv_payload(state.keys.get(KeyName::Transport), multipart).await?;
-    let mut op = open_or_replay!(state, &caller.user_id, request, &parsed.csv_bytes);
+    // Open the sealed CSV first: the fingerprint covers the plaintext.
+    let csv_bytes = open_sealed_csv(
+        state.keys.get(KeyName::Transport),
+        &caller,
+        &request,
+        multipart,
+    )
+    .await?;
+    let mut op = open_or_replay!(state, &caller.user_id, request, &csv_bytes);
     let pool_pda = parse_pda(&pool_pda_str)?;
 
     // Fetch on-chain pool to verify it exists and get ownership.
@@ -107,12 +115,8 @@ pub async fn initialize_pool(
                 "pool is already initialized — use /issue to add credentials",
             ));
         }
-        let summary = validate_payload(
-            &doc.schema,
-            &pool_pda_str,
-            &parsed.csv_bytes,
-            doc.validation_mode,
-        )?;
+        let summary =
+            validate_payload(&doc.schema, &pool_pda_str, &csv_bytes, doc.validation_mode)?;
         if !summary.valid {
             return Err(validation_failed(summary.errors.len()));
         }
@@ -121,8 +125,8 @@ pub async fn initialize_pool(
     let upload = Upload {
         record_id: INITIAL.to_string(),
         upload_id,
-        sha256: sha256_hex(&parsed.csv_bytes),
-        rows: count_csv_rows(&parsed.csv_bytes),
+        sha256: sha256_hex(&csv_bytes),
+        rows: count_csv_rows(&csv_bytes),
         uploaded_by: caller.user_id.clone(),
         uploaded_at: Utc::now(),
         signature: None,
@@ -133,7 +137,7 @@ pub async fn initialize_pool(
         state
             .storage
             .pools()
-            .put_dataset(&pool_pda_str, &upload.upload_id, &parsed.csv_bytes)
+            .put_dataset(&pool_pda_str, &upload.upload_id, &csv_bytes)
             .await?;
         state
             .storage

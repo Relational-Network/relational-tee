@@ -29,9 +29,10 @@ use crate::blockchain::drt::{
 };
 use crate::chain::{self, Effect};
 use crate::error::ApiError;
-use crate::handlers::{parse_csv_payload, validate_payload};
+use crate::handlers::{open_sealed_csv, validate_payload};
 use crate::idempotency::Idempotent;
 use crate::ids;
+use crate::seal::SealedUploadForm;
 use crate::state::AppState;
 use crate::storage::pools::{PoolState, Upload};
 use crate::storage::staged::{Saga, Staged};
@@ -77,15 +78,16 @@ pub struct IssueCredentialsResponse {
     path = "/v1/drt/pools/{pool_pda}/issue",
     tag = "Credentials",
     summary = "Issue credentials",
-    description = "Issue credentials by redeeming an append DRT and storing the encrypted CSV data. Validates ownership, DRT balance and the CSV schema, stores the dataset, burns 1 append DRT, then records the upload in the pool's issuance log. Idempotent: retries with the same Idempotency-Key burn one DRT.",
+    description = "Issue credentials by redeeming an append DRT and storing the sealed CSV data. Validates ownership, DRT balance and the CSV schema, stores the dataset, burns 1 append DRT, then records the upload in the pool's issuance log. Idempotent: retries with the same Idempotency-Key burn one DRT. The CSV is sealed with HPKE to the transport key from `GET /v1/attestation`, with this request's AAD.",
     security(("bearer_auth" = [])),
     params(
         ("pool_pda" = String, Path, description = "Pool PDA address (base58)"),
         ("Idempotency-Key" = String, Header, description = "A UUID naming this user action; reuse it on every retry"),
     ),
+    request_body(content = SealedUploadForm, content_type = "multipart/form-data"),
     responses(
         (status = 200, description = "Credentials issued", body = IssueCredentialsResponse),
-        (status = 400, description = "Validation error, insufficient DRTs, or no Idempotency-Key"),
+        (status = 400, description = "Validation error, insufficient DRTs, no Idempotency-Key, or the sealed payload doesn't open (`sealed_payload_invalid`)"),
         (status = 401, description = "Unauthorized"),
         (status = 404, description = "Pool not found"),
         (status = 409, description = "The pool changed concurrently; retry"),
@@ -103,9 +105,15 @@ pub async fn issue_credentials(
     caller.require(Permission::PoolsWrite)?;
     // ── VALIDATION (reversible, cheap) ────────────────────────────
 
-    // Parse and decrypt the CSV payload; the fingerprint covers the plaintext.
-    let parsed = parse_csv_payload(state.keys.get(KeyName::Transport), multipart).await?;
-    let mut op = open_or_replay!(state, &caller.user_id, request, &parsed.csv_bytes);
+    // Open the sealed CSV first: the fingerprint covers the plaintext.
+    let csv_bytes = open_sealed_csv(
+        state.keys.get(KeyName::Transport),
+        &caller,
+        &request,
+        multipart,
+    )
+    .await?;
+    let mut op = open_or_replay!(state, &caller.user_id, request, &csv_bytes);
     let pool_pda = parse_pda(&pool_pda_str)?;
 
     // The pool must be ready.
@@ -191,17 +199,12 @@ pub async fn issue_credentials(
     }
 
     // Validate CSV against pool's schema.
-    let summary = validate_payload(
-        &doc.schema,
-        &pool_pda_str,
-        &parsed.csv_bytes,
-        doc.validation_mode,
-    )?;
+    let summary = validate_payload(&doc.schema, &pool_pda_str, &csv_bytes, doc.validation_mode)?;
     if !summary.valid {
         return Err(validation_failed(summary.errors.len()));
     }
 
-    let row_count = count_csv_rows(&parsed.csv_bytes);
+    let row_count = count_csv_rows(&csv_bytes);
 
     // ── STORE THE DATASET, STAGE THE UPLOAD ───────────────────────
 
@@ -209,7 +212,7 @@ pub async fn issue_credentials(
     state
         .storage
         .pools()
-        .put_dataset(&pool_pda_str, &record_id, &parsed.csv_bytes)
+        .put_dataset(&pool_pda_str, &record_id, &csv_bytes)
         .await?;
     let staged = state
         .storage
@@ -224,7 +227,7 @@ pub async fn issue_credentials(
                     upload: Upload {
                         record_id: record_id.clone(),
                         upload_id: record_id.clone(),
-                        sha256: sha256_hex(&parsed.csv_bytes),
+                        sha256: sha256_hex(&csv_bytes),
                         rows: row_count,
                         uploaded_by: caller.user_id.clone(),
                         uploaded_at: Utc::now(),

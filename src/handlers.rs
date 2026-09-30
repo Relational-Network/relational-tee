@@ -5,9 +5,8 @@
 //!
 //! This module contains handlers for:
 //! - Public key endpoint (for browser encryption)
-//! - Protected endpoints (require authentication)
 //! - Admin endpoints (require admin role)
-//! - Sealed CSV upload parsing and validation shared by the pool endpoints
+//! - Opening and validating the sealed CSV uploads of the pool endpoints
 
 use axum::{
     extract::{Multipart, State},
@@ -18,10 +17,11 @@ use tracing::{debug, info};
 use utoipa::ToSchema;
 
 use crate::auth::Caller;
-use crate::config::MAX_BODY_SIZE;
 use crate::crypto::{jwk_for_public_key, Jwk};
 use crate::data_validation::{validate_csv_bytes, FieldSchema, ValidationMode, ValidationSummary};
 use crate::error::ApiError;
+use crate::idempotency::Idempotent;
+use crate::seal::{self, SealedUpload};
 use crate::state::AppState;
 use crate::tee::{KeyName, ReleasedKey};
 
@@ -92,18 +92,25 @@ pub async fn admin_status(caller: Caller) -> Result<Json<AdminStatusResponse>, A
 }
 
 // ============================================================================
-// Data Endpoints
+// Sealed uploads
 // ============================================================================
 
-#[derive(Debug, Default)]
-pub(crate) struct MultipartCsvInput {
-    pub encrypted_data: Option<String>,
-    pub ephemeral_public_key: Option<String>,
-    pub nonce: Option<String>,
-}
-
-pub(crate) struct ParsedCsvPayload {
-    pub csv_bytes: Vec<u8>,
+/// Read and open the sealed CSV of `caller`'s upload `request`.
+pub(crate) async fn open_sealed_csv(
+    transport: &ReleasedKey,
+    caller: &Caller,
+    request: &Idempotent,
+    multipart: Multipart,
+) -> Result<Vec<u8>, ApiError> {
+    let upload = SealedUpload::read(multipart).await?;
+    let aad = seal::request_aad(
+        request.method().as_str(),
+        request.path(),
+        &request.key,
+        &upload.kid,
+        &caller.user_id,
+    );
+    Ok(seal::open_upload(transport, &upload, &aad)?)
 }
 
 /// Validate a CSV payload against the pool's schema.
@@ -124,152 +131,4 @@ pub(crate) fn validate_payload(
         )));
     }
     Ok(validate_csv_bytes(csv_bytes, schema, mode))
-}
-
-pub(crate) async fn parse_csv_payload(
-    transport: &ReleasedKey,
-    multipart: Multipart,
-) -> Result<ParsedCsvPayload, ApiError> {
-    let input = parse_multipart_fields(multipart).await?;
-    let (encrypted_data, ephemeral_key, nonce) = input.encrypted_parts()?;
-
-    let csv_bytes =
-        crate::crypto::decrypt_ecdh_payload(transport, &encrypted_data, &ephemeral_key, &nonce)
-            .map_err(ApiError::bad_request)?;
-
-    ensure_size_limit(&csv_bytes)?;
-
-    Ok(ParsedCsvPayload { csv_bytes })
-}
-
-impl MultipartCsvInput {
-    fn encrypted_parts(self) -> Result<(String, String, String), ApiError> {
-        let encrypted_data = self
-            .encrypted_data
-            .ok_or_else(|| ApiError::bad_request("missing encrypted_data field"))?;
-
-        let ephemeral_key = self.ephemeral_public_key.ok_or_else(|| {
-            ApiError::bad_request("ephemeral_public_key is required for encrypted uploads")
-        })?;
-        let nonce = self
-            .nonce
-            .ok_or_else(|| ApiError::bad_request("nonce is required for encrypted uploads"))?;
-
-        Ok((encrypted_data, ephemeral_key, nonce))
-    }
-}
-
-fn validate_csv_multipart_field_name(name: &str) -> Result<(), ApiError> {
-    match name {
-        "encrypted_data" | "ephemeral_public_key" | "nonce" => Ok(()),
-        "file" => Err(ApiError::bad_request(
-            "plaintext file uploads are not accepted — use encrypted_data with ephemeral_public_key and nonce",
-        )),
-        other => Err(ApiError::bad_request(format!(
-            "unsupported multipart field: {other}"
-        ))),
-    }
-}
-
-pub(crate) async fn parse_multipart_fields(
-    mut multipart: Multipart,
-) -> Result<MultipartCsvInput, ApiError> {
-    let mut input = MultipartCsvInput::default();
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|_| ApiError::bad_request("invalid multipart payload"))?
-    {
-        let Some(name) = field.name().map(str::to_owned) else {
-            continue;
-        };
-        validate_csv_multipart_field_name(&name)?;
-
-        match name.as_str() {
-            "encrypted_data" => {
-                let value = field
-                    .text()
-                    .await
-                    .map_err(|_| ApiError::bad_request("invalid encrypted_data field"))?;
-                if !value.trim().is_empty() {
-                    input.encrypted_data = Some(value.trim().to_string());
-                }
-            }
-            "ephemeral_public_key" => {
-                let value = field
-                    .text()
-                    .await
-                    .map_err(|_| ApiError::bad_request("invalid ephemeral_public_key field"))?;
-                if !value.trim().is_empty() {
-                    input.ephemeral_public_key = Some(value.trim().to_string());
-                }
-            }
-            "nonce" => {
-                let value = field
-                    .text()
-                    .await
-                    .map_err(|_| ApiError::bad_request("invalid nonce field"))?;
-                if !value.trim().is_empty() {
-                    input.nonce = Some(value.trim().to_string());
-                }
-            }
-            _ => unreachable!("validated unsupported multipart field"),
-        }
-    }
-    Ok(input)
-}
-
-pub(crate) fn ensure_size_limit(bytes: &[u8]) -> Result<(), ApiError> {
-    if bytes.len() > MAX_BODY_SIZE {
-        return Err(ApiError::bad_request(format!(
-            "payload exceeds maximum size of {} bytes",
-            MAX_BODY_SIZE
-        )));
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn encrypted_upload_parts_do_not_require_schema_id() {
-        let input = MultipartCsvInput {
-            encrypted_data: Some("ciphertext".to_string()),
-            ephemeral_public_key: Some("ephemeral-key".to_string()),
-            nonce: Some("nonce".to_string()),
-        };
-
-        let parts = input.encrypted_parts();
-        assert!(parts.is_ok());
-    }
-
-    #[test]
-    fn encrypted_upload_parts_require_encrypted_fields() {
-        let input = MultipartCsvInput {
-            encrypted_data: Some("ciphertext".to_string()),
-            ephemeral_public_key: None,
-            nonce: Some("nonce".to_string()),
-        };
-
-        assert!(input.encrypted_parts().is_err());
-    }
-
-    #[test]
-    fn credential_upload_rejects_schema_id_field() {
-        assert!(validate_csv_multipart_field_name("schema_id").is_err());
-    }
-
-    #[test]
-    fn credential_upload_rejects_plaintext_file_field() {
-        assert!(validate_csv_multipart_field_name("file").is_err());
-    }
-
-    #[test]
-    fn credential_upload_accepts_encrypted_fields() {
-        assert!(validate_csv_multipart_field_name("encrypted_data").is_ok());
-        assert!(validate_csv_multipart_field_name("ephemeral_public_key").is_ok());
-        assert!(validate_csv_multipart_field_name("nonce").is_ok());
-    }
 }

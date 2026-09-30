@@ -34,6 +34,7 @@ mod ids;
 mod reconciler;
 mod reference_values;
 mod request_id;
+mod seal;
 mod state;
 mod storage;
 mod store;
@@ -193,6 +194,7 @@ The `Admin` app role grants `pools:read`, `pools:create`, `pools:write`, `wallet
         api::credentials::schema::GetSchemaResponse,
         data_validation::FieldSchema,
         data_validation::FieldType,
+        seal::SealedUploadForm,
         api::credentials::initialize::InitializePoolResponse,
         api::credentials::issue::IssueCredentialsResponse,
         api::credentials::revoke::RevokeCredentialsRequest,

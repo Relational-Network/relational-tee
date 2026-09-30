@@ -81,6 +81,17 @@ impl<S: Send + Sync> FromRequestParts<S> for Idempotent {
     }
 }
 
+impl Idempotent {
+    pub fn method(&self) -> &Method {
+        &self.method
+    }
+
+    /// The concrete path, as the client sent it.
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+}
+
 #[cfg(test)]
 impl Idempotent {
     /// A `POST` as the extractor would read it.

@@ -26,6 +26,8 @@ pub const VALID_FOR: u64 = 150;
 #[derive(Default)]
 pub struct FakeChain {
     pub accounts: Mutex<Vec<Pubkey>>,
+    /// Accounts with data, which `getAccountInfo` returns.
+    pub data: Mutex<Vec<(Pubkey, Vec<u8>)>>,
     /// Finalized transactions, and whether each succeeded.
     pub landed: Mutex<Vec<(String, bool)>>,
     /// `getSignaturesForAddress`'s answer, newest first.
@@ -54,14 +56,24 @@ impl FakeChain {
         let context = |value: Value| json!({ "context": { "slot": 1 }, "value": value });
         match method {
             "getAccountInfo" => {
-                let exists = self
-                    .accounts
+                let address = params[0].as_str().unwrap();
+                let data = self
+                    .data
                     .lock()
                     .unwrap()
                     .iter()
-                    .any(|a| a.to_string() == params[0].as_str().unwrap());
+                    .find(|(a, _)| a.to_string() == address)
+                    .map(|(_, data)| data.clone());
+                let exists = data.is_some()
+                    || self
+                        .accounts
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|a| a.to_string() == address);
                 context(if exists {
-                    json!({ "lamports": 1, "data": ["", "base64"] })
+                    let data = BASE64.encode(data.unwrap_or_default());
+                    json!({ "lamports": 1, "data": [data, "base64"] })
                 } else {
                     Value::Null
                 })
