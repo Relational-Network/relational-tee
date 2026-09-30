@@ -30,6 +30,7 @@ use crate::blockchain::drt::{
     pda::{compute_commitment, derive_drt_config_pda, derive_grant_pda, derive_user_ata},
     types::APPEND_DRT_NAME,
 };
+use crate::blockchain::spl_token::token_account_amount;
 use crate::chain::{self, Effect};
 use crate::error::ApiError;
 use crate::handlers::{open_sealed_csv, validate_payload};
@@ -177,11 +178,14 @@ pub async fn issue_credentials(
         let user_balance = match state
             .solana_client
             .rpc()
-            .get_token_account_balance(&user_ata)
+            .get_account_data(&user_ata)
             .await
+            .map_err(|e| ApiError::rpc_unavailable(format!("Solana RPC error: {e}")))?
         {
-            Ok(b) => b.amount.parse::<u64>().unwrap_or(0),
-            Err(_) => 0,
+            Some(account) => token_account_amount(&account).ok_or_else(|| {
+                ApiError::internal("the append DRT account isn't a token account")
+            })?,
+            None => 0,
         };
         if user_balance < 1 {
             return Err(ApiError::bad_request(

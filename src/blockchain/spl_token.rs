@@ -136,3 +136,22 @@ impl SolanaClient {
         Ok(instructions)
     }
 }
+
+/// The amount an SPL token account holds: the little-endian `u64` after its
+/// mint and owner (bytes 64 to 72).
+pub fn token_account_amount(data: &[u8]) -> Option<u64> {
+    Some(u64::from_le_bytes(data.get(64..72)?.try_into().ok()?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_the_amount_after_the_mint_and_owner() {
+        let mut account = vec![0u8; 165];
+        account[64..72].copy_from_slice(&7u64.to_le_bytes());
+        assert_eq!(token_account_amount(&account), Some(7));
+        assert_eq!(token_account_amount(&account[..70]), None);
+    }
+}

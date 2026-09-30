@@ -37,12 +37,13 @@ fn strip_discriminator<'a>(
     Ok(payload)
 }
 
-/// Fetch and deserialise a Pool account from chain.
+/// Fetch and deserialise a Pool account from chain. A missing account is
+/// `404`; an RPC failure is `503 rpc_unavailable`, which a client retries.
 pub async fn fetch_pool(rpc: &JsonRpcClient, pool_pda: &Pubkey) -> Result<Pool, ApiError> {
     let data = rpc
         .get_account_data(pool_pda)
         .await
-        .map_err(|e| ApiError::not_found(format!("pool account {pool_pda} not found: {e}")))?
+        .map_err(|e| ApiError::rpc_unavailable(format!("reading pool account {pool_pda}: {e}")))?
         .ok_or_else(|| ApiError::not_found(format!("pool account {pool_pda} not found")))?;
     let payload = strip_discriminator(&data, &DISC_POOL_ACCOUNT, MAX_POOL_DATA, "pool")?;
     Pool::try_from_slice(payload)
@@ -57,7 +58,9 @@ pub async fn fetch_drt_config(
     let data = rpc
         .get_account_data(drt_config_pda)
         .await
-        .map_err(|e| ApiError::not_found(format!("drt_config {drt_config_pda} not found: {e}")))?
+        .map_err(|e| {
+            ApiError::rpc_unavailable(format!("reading drt_config {drt_config_pda}: {e}"))
+        })?
         .ok_or_else(|| ApiError::not_found(format!("drt_config {drt_config_pda} not found")))?;
     let payload = strip_discriminator(
         &data,
@@ -67,4 +70,30 @@ pub async fn fetch_drt_config(
     )?;
     DrtConfig::try_from_slice(payload)
         .map_err(|e| ApiError::internal(format!("failed to deserialise drt_config: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::blockchain::fake::{self, FakeChain};
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn a_missing_pool_is_not_found_and_an_rpc_failure_is_retryable() {
+        let solana = fake::start(Arc::new(FakeChain::default()));
+        let err = fetch_pool(solana.rpc(), &Pubkey::new_unique())
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, "not_found");
+
+        let unreachable = "http://127.0.0.1:9";
+        let solana = crate::blockchain::SolanaClient::new(
+            unreachable,
+            crate::blockchain::types::devnet_config(unreachable),
+        );
+        let err = fetch_pool(solana.rpc(), &Pubkey::new_unique())
+            .await
+            .unwrap_err();
+        assert_eq!((err.status.as_u16(), err.code), (503, "rpc_unavailable"));
+    }
 }

@@ -302,20 +302,6 @@ impl JsonRpcClient {
         }
     }
 
-    /// `getTokenAccountBalance` → token amount info.
-    pub async fn get_token_account_balance(
-        &self,
-        pubkey: &Pubkey,
-    ) -> Result<TokenAmountInfo, RpcError> {
-        let ctx: RpcContext<TokenAmountInfo> = self
-            .call_typed(
-                "getTokenAccountBalance",
-                json!([pubkey.to_string(), {"commitment": self.commitment}]),
-            )
-            .await?;
-        Ok(ctx.value)
-    }
-
     /// `getTokenSupply` → current circulating SPL supply for a mint.
     ///
     /// Returns the live, on-chain remaining supply (minted minus burned).
