@@ -18,6 +18,9 @@ use std::str::FromStr;
 use tracing::{info, warn};
 use utoipa::ToSchema;
 
+use super::{
+    count_csv_rows, decode_right_id, parse_pda, pool_not_found, sha256_hex, validation_failed,
+};
 use crate::api::pools::{load_pool, signed, verify_pool_ownership};
 use crate::audit;
 use crate::auth::{Caller, Permission};
@@ -37,11 +40,6 @@ use crate::state::AppState;
 use crate::storage::pools::{PoolState, Upload};
 use crate::storage::staged::{Saga, Staged};
 use crate::storage::Change;
-use crate::tee::KeyName;
-
-use super::{
-    count_csv_rows, decode_right_id, parse_pda, pool_not_found, sha256_hex, validation_failed,
-};
 
 // ============================================================================
 // Response types
@@ -106,13 +104,7 @@ pub async fn issue_credentials(
     // ── VALIDATION (reversible, cheap) ────────────────────────────
 
     // Open the sealed CSV first: the fingerprint covers the plaintext.
-    let csv_bytes = open_sealed_csv(
-        state.keys.get(KeyName::Transport),
-        &caller,
-        &request,
-        multipart,
-    )
-    .await?;
+    let csv_bytes = open_sealed_csv(&state.transport, &caller, &request, multipart).await?;
     let mut op = open_or_replay!(state, &caller.user_id, request, &csv_bytes);
     let pool_pda = parse_pda(&pool_pda_str)?;
 

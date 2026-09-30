@@ -249,6 +249,9 @@ pub struct HealthDetails {
     pub worker_id: String,
     pub uptime_seconds: u64,
     pub keys_held: Vec<String>,
+    /// The transport key versions (RFC 7638 thumbprints) uploads open with,
+    /// the current one first.
+    pub transport_kids: Vec<String>,
     pub certificate: CertificateDetails,
     pub storage_canary: CanaryDetails,
     /// Seconds since the token-signing keys were fetched, if they have been.
@@ -332,6 +335,7 @@ pub async fn health(State(state): State<AppState>) -> Json<HealthDetails> {
         worker_id: state.storage.worker_id().to_string(),
         uptime_seconds: h.started.elapsed().as_secs(),
         keys_held: h.keys_held.clone(),
+        transport_kids: state.transport.kids(),
         certificate,
         storage_canary: CanaryDetails {
             ok: readiness.storage_canary,

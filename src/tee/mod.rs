@@ -18,7 +18,6 @@ use std::time::Duration;
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use chrono::{DateTime, Utc};
 use p256::elliptic_curve::sec1::ToEncodedPoint;
 use p256::{PublicKey, SecretKey};
 use serde_json::Value;
@@ -113,7 +112,9 @@ impl fmt::Display for KeyError {
 impl std::error::Error for KeyError {}
 
 /// One version of a released EC P-256 private key. The scalar is zeroized
-/// when the key is dropped, and the key is never logged or persisted.
+/// when the key (and each clone) is dropped, and the key is never logged or
+/// persisted.
+#[derive(Clone)]
 pub struct EcKey {
     secret: SecretKey,
 }
@@ -184,22 +185,29 @@ impl EcKey {
     }
 }
 
-/// A released key: its current version and, while it rotates, the previous one.
+/// A released key's current version.
 pub struct ReleasedKey {
     pub current: EcKey,
-    pub previous: Option<PreviousKey>,
 }
 
-/// A key's previous version, and when the current version replaced it.
-pub struct PreviousKey {
-    pub key: EcKey,
-    pub replaced_at: DateTime<Utc>,
+/// Whether `version` can name a key version: 1 to 64 ASCII letters and
+/// digits, as Key Vault's versions are (and `previous`, dev keys' only one).
+pub fn valid_version(version: &str) -> bool {
+    (1..=64).contains(&version.len()) && version.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
 /// Releases the worker's keys.
 pub trait KeyProvider: Send + Sync {
-    /// Release the current version of a named key; rotating keys also return the previous version.
+    /// Release the current version of a named key.
     fn release(&self, key: KeyName) -> BoxFuture<'_, Result<ReleasedKey, KeyError>>;
+
+    /// Release one version of a named key: a Key Vault key version, or
+    /// `previous` for the previous version of a dev key.
+    fn release_version<'a>(
+        &'a self,
+        key: KeyName,
+        version: &'a str,
+    ) -> BoxFuture<'a, Result<EcKey, KeyError>>;
 }
 
 /// Why an attestation token couldn't be obtained.
@@ -236,10 +244,6 @@ impl WorkerKeys {
             let key = release_with_retry(provider, name).await?;
             if name == KeyName::Transport {
                 info!(key = %name, kid = %key.current.thumbprint(), "Key released");
-                if let Some(previous) = &key.previous {
-                    info!(key = %name, kid = %previous.key.thumbprint(),
-                        replaced_at = %previous.replaced_at.to_rfc3339(), "Previous version released");
-                }
             } else {
                 info!(key = %name, "Key released");
             }
@@ -318,16 +322,42 @@ pub(crate) mod tests {
             .enumerate()
             .map(|(i, name)| {
                 let current = fixed_key(i as u8 + 1);
-                (
-                    *name,
-                    ReleasedKey {
-                        current,
-                        previous: None,
-                    },
-                )
+                (*name, ReleasedKey { current })
             })
             .collect();
         WorkerKeys { keys }
+    }
+
+    /// A provider that releases only the versions it's given, as fixed keys.
+    pub(crate) struct Versions(pub BTreeMap<&'static str, u8>);
+
+    impl KeyProvider for Versions {
+        fn release(&self, _key: KeyName) -> BoxFuture<'_, Result<ReleasedKey, KeyError>> {
+            Box::pin(async { Err(KeyError::fatal("no current versions here")) })
+        }
+
+        fn release_version<'a>(
+            &'a self,
+            _key: KeyName,
+            version: &'a str,
+        ) -> BoxFuture<'a, Result<EcKey, KeyError>> {
+            Box::pin(async move {
+                self.0
+                    .get(version)
+                    .map(|seed| fixed_key(*seed))
+                    .ok_or_else(|| KeyError::retryable(format!("no version {version}")))
+            })
+        }
+    }
+
+    #[test]
+    fn versions_are_short_ascii_letters_and_digits() {
+        for ok in ["previous", "0123456789abcdef0123456789abcdef", "V1"] {
+            assert!(valid_version(ok), "{ok}");
+        }
+        for bad in ["", "../x", "a/b", "v 1", "é", &"a".repeat(65)] {
+            assert!(!valid_version(bad), "{bad}");
+        }
     }
 
     fn private_jwk(key: &EcKey) -> Value {
@@ -388,9 +418,16 @@ pub(crate) mod tests {
                 }
                 Ok(ReleasedKey {
                     current: fixed_key(1),
-                    previous: None,
                 })
             })
+        }
+
+        fn release_version<'a>(
+            &'a self,
+            _key: KeyName,
+            _version: &'a str,
+        ) -> BoxFuture<'a, Result<EcKey, KeyError>> {
+            Box::pin(async { Err(KeyError::fatal("no versions")) })
         }
     }
 

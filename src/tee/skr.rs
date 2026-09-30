@@ -21,7 +21,8 @@ use serde_json::{json, Value};
 use zeroize::Zeroizing;
 
 use super::{
-    AttestError, AttestationProvider, BoxFuture, EcKey, KeyError, KeyName, KeyProvider, ReleasedKey,
+    valid_version, AttestError, AttestationProvider, BoxFuture, EcKey, KeyError, KeyName,
+    KeyProvider, ReleasedKey,
 };
 use crate::http_client::HttpClient;
 
@@ -103,38 +104,58 @@ pub(crate) fn parse_release_response(body: &[u8]) -> Result<EcKey, KeyError> {
     }
 }
 
+impl SkrSidecar {
+    /// Release `kid`: a key name, or `name/version`.
+    async fn release_kid(&self, kid: &str) -> Result<EcKey, KeyError> {
+        let body = json!({
+            "maa_endpoint": self.config.maa_endpoint,
+            "akv_endpoint": self.config.akv_endpoint,
+            "kid": kid,
+        });
+        let response = self
+            .http
+            .post_json(&self.url("/key/release"), &body)
+            .await
+            .map_err(|e| KeyError::retryable(format!("SKR sidecar unreachable: {e}")))?;
+        let status = response.status();
+        let bytes = Zeroizing::new(
+            response
+                .into_text()
+                .map(String::into_bytes)
+                .unwrap_or_default(),
+        );
+        if !status.is_success() {
+            // 403 means the release policy didn't match. It stays
+            // retryable: a policy can be mid-update during a rollout.
+            return Err(KeyError::retryable(format!(
+                "SKR sidecar returned {status}: {}",
+                error_message(&bytes)
+            )));
+        }
+        parse_release_response(&bytes)
+    }
+}
+
 impl KeyProvider for SkrSidecar {
     fn release(&self, key: KeyName) -> BoxFuture<'_, Result<ReleasedKey, KeyError>> {
         Box::pin(async move {
-            let body = json!({
-                "maa_endpoint": self.config.maa_endpoint,
-                "akv_endpoint": self.config.akv_endpoint,
-                "kid": self.config.key_name(key),
-            });
-            let response = self
-                .http
-                .post_json(&self.url("/key/release"), &body)
-                .await
-                .map_err(|e| KeyError::retryable(format!("SKR sidecar unreachable: {e}")))?;
-            let status = response.status();
-            let bytes = Zeroizing::new(
-                response
-                    .into_text()
-                    .map(String::into_bytes)
-                    .unwrap_or_default(),
-            );
-            if !status.is_success() {
-                // 403 means the release policy didn't match. It stays
-                // retryable: a policy can be mid-update during a rollout.
-                return Err(KeyError::retryable(format!(
-                    "SKR sidecar returned {status}: {}",
-                    error_message(&bytes)
-                )));
-            }
             Ok(ReleasedKey {
-                current: parse_release_response(&bytes)?,
-                previous: None,
+                current: self.release_kid(self.config.key_name(key)).await?,
             })
+        })
+    }
+
+    fn release_version<'a>(
+        &'a self,
+        key: KeyName,
+        version: &'a str,
+    ) -> BoxFuture<'a, Result<EcKey, KeyError>> {
+        Box::pin(async move {
+            if !valid_version(version) {
+                return Err(KeyError::fatal(format!("{version:?} isn't a key version")));
+            }
+            self.release_kid(&format!("{}/{version}", self.config.key_name(key)))
+                .await
         })
     }
 }

@@ -254,6 +254,27 @@ pub(crate) mod tests {
             assert_eq!(released.current.public_key(), expected.public_key());
         }
 
+        // A version, as `name/version`: the fake knows `previous`.
+        assert!(sidecar
+            .release_version(KeyName::Transport, "previous")
+            .await
+            .is_err());
+        let old = read_key(&key_path(&dir, KeyName::Transport)).unwrap();
+        std::fs::copy(
+            key_path(&dir, KeyName::Transport),
+            previous_key_path(&dir, KeyName::Transport),
+        )
+        .unwrap();
+        let released = sidecar
+            .release_version(KeyName::Transport, "previous")
+            .await
+            .expect("the previous version");
+        assert_eq!(released.public_key(), old.public_key());
+        assert!(sidecar
+            .release_version(KeyName::Transport, "../storage-root")
+            .await
+            .is_err());
+
         let mut unknown = skr_config(&url);
         unknown.key_names[0] = "no-such-key".into();
         let err = match SkrSidecar::new(unknown).release(KeyName::Transport).await {

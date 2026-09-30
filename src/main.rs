@@ -454,11 +454,16 @@ async fn main() {
         std::process::exit(1);
     });
 
-    // The environment's signed manifest, served as it is.
+    // The environment's signed manifest, served as it is. It also lists the
+    // transport key versions besides the current one that uploads open with.
+    let transport = Arc::new(seal::TransportKeys::new(
+        keys.get(KeyName::Transport).current.clone(),
+        key_provider.clone(),
+    ));
     let reference_values = Arc::new(reference_values::ReferenceValues::new(
         public_stores.reference_values,
         &server_config.environment,
-        keys.get(KeyName::Transport).current.thumbprint(),
+        transport.clone(),
     ));
     reference_values.spawn();
 
@@ -516,7 +521,7 @@ async fn main() {
 
     // Create shared application state.
     let state = AppState {
-        keys: Arc::new(keys),
+        transport,
         attestation,
         reference_values,
         health,

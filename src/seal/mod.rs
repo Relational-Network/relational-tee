@@ -11,9 +11,9 @@
 //! ciphertext to one request (see [`request_aad`]), so it can't be replayed
 //! against another pool, route, `Idempotency-Key`, transport key or user.
 //! Uploads are opened after authentication and before the idempotency
-//! check, whose fingerprint covers the plaintext. While the transport key
-//! rotates, uploads sealed to its previous version still open for 24 hours
-//! after the current version replaced it.
+//! check, whose fingerprint covers the plaintext. They open with the current
+//! transport key version, or another version the manifest lists (see
+//! [`TransportKeys`]).
 //!
 //! Every failure is `400 sealed_payload_invalid`, with no detail; the
 //! worker logs the reason. A plaintext `file` part is refused as a bad
@@ -25,7 +25,6 @@ use axum::http::StatusCode;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use bytes::Bytes;
-use chrono::Utc;
 use hpke::aead::AesGcm256;
 use hpke::kdf::HkdfSha256;
 use hpke::kem::DhP256HkdfSha256;
@@ -35,10 +34,13 @@ use utoipa::ToSchema;
 use zeroize::Zeroizing;
 
 use crate::error::ApiError;
-use crate::tee::{EcKey, ReleasedKey};
+use crate::tee::EcKey;
 
+pub(crate) mod keys;
 #[cfg(test)]
 mod rfc9180;
+
+pub use keys::{Listed, TransportKeys};
 
 /// The HPKE `info` of every sealed request.
 pub const INFO: &[u8] = b"relational-tee/hpke/v1";
@@ -46,9 +48,6 @@ pub const INFO: &[u8] = b"relational-tee/hpke/v1";
 pub const REQUEST_AAD_LABEL: &str = "relational-tee/req/v1";
 /// The sealed format's version, the `v` part.
 pub const FORMAT_VERSION: &str = "1";
-/// How long the transport key's previous version still opens uploads after
-/// the current version replaced it.
-pub const PREVIOUS_KEY_WINDOW: chrono::Duration = chrono::Duration::hours(24);
 
 type Kem = DhP256HkdfSha256;
 
@@ -158,39 +157,17 @@ pub fn request_aad(
     .into_bytes()
 }
 
-/// Open `upload` with the transport key version its `kid` names: the
-/// current one, or the previous one within [`PREVIOUS_KEY_WINDOW`] of the
-/// switch.
+/// Open `upload` with the transport key version its `kid` names, if the
+/// worker accepts it.
 pub fn open_upload(
-    transport: &ReleasedKey,
+    transport: &TransportKeys,
     upload: &SealedUpload,
     aad: &[u8],
 ) -> Result<Vec<u8>, SealError> {
-    open(
-        recipient(transport, &upload.kid)?,
-        &upload.enc,
-        INFO,
-        &upload.ct,
-        aad,
-    )
-}
-
-fn recipient<'a>(transport: &'a ReleasedKey, kid: &str) -> Result<&'a EcKey, SealError> {
-    if transport.current.thumbprint() == kid {
-        return Ok(&transport.current);
-    }
-    match &transport.previous {
-        Some(previous) if previous.key.thumbprint() == kid => {
-            if Utc::now() < previous.replaced_at + PREVIOUS_KEY_WINDOW {
-                Ok(&previous.key)
-            } else {
-                Err(SealError(
-                    "kid names a transport key version retired over 24 hours ago",
-                ))
-            }
-        }
-        _ => Err(SealError("kid names no transport key this worker holds")),
-    }
+    let key = transport.get(&upload.kid).ok_or(SealError(
+        "kid names no transport key version this worker accepts",
+    ))?;
+    open(&key, &upload.enc, INFO, &upload.ct, aad)
 }
 
 /// Open a single-shot HPKE ciphertext sealed to `key`.
@@ -214,8 +191,7 @@ fn open(key: &EcKey, enc: &[u8], info: &[u8], ct: &[u8], aad: &[u8]) -> Result<V
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::tee::tests::fixed_key;
-    use crate::tee::PreviousKey;
+    use crate::tee::tests::{fixed_key, Versions};
     use axum::body::Body;
     use axum::extract::FromRequest;
     use axum::http::{header, Request};
@@ -223,6 +199,7 @@ pub(crate) mod tests {
     use p256::elliptic_curve::sec1::ToEncodedPoint;
     use rand_core::TryRngCore;
     use serde_json::Value;
+    use std::sync::Arc;
 
     /// Seal `plaintext` to `recipient` as a client does: the `enc` and `ct`
     /// parts.
@@ -369,24 +346,27 @@ pub(crate) mod tests {
     const KEY: &str = "2f6c1c1e-8d3a-4b1e-9f55-0a7c2b1d4e33";
     const USER: &str = "7a1d0e9c-5b39-4f7e-8f0a-3c2b1d4e5f60";
 
-    /// A transport key whose current version replaced the previous one
-    /// `hours_ago`.
-    fn rotated(hours_ago: i64) -> ReleasedKey {
-        ReleasedKey {
-            current: fixed_key(1),
-            previous: Some(PreviousKey {
-                key: fixed_key(2),
-                replaced_at: Utc::now() - chrono::Duration::hours(hours_ago),
-            }),
-        }
+    /// Test key 1 as the current transport key, and test key 2 as another
+    /// version the manifest lists.
+    async fn rotating() -> TransportKeys {
+        let keys = keys::tests::rotating();
+        let listed = [
+            keys::tests::listed(fixed_key(1).thumbprint(), None),
+            keys::tests::listed(fixed_key(2).thumbprint(), Some("v2")),
+        ];
+        keys.follow(&listed).await.unwrap();
+        keys
+    }
+
+    fn only(current: EcKey) -> TransportKeys {
+        TransportKeys::new(current, Arc::new(Versions(Default::default())))
     }
 
     #[tokio::test]
     async fn uploads_open_only_for_the_request_and_key_they_were_sealed_for() {
-        let transport = rotated(1);
+        let transport = rotating().await;
         let csv = b"name,score\nalice,1\n";
-        let previous = &transport.previous.as_ref().unwrap().key;
-        for version in [&transport.current, previous] {
+        for version in [&fixed_key(1), &fixed_key(2)] {
             let kid = version.thumbprint();
             let aad = request_aad("POST", PATH, KEY, &kid, USER);
             let upload = read(sealed_form(version, &aad, csv)).await.unwrap();
@@ -406,13 +386,13 @@ pub(crate) mod tests {
             }
         }
 
-        // A key this worker doesn't hold.
+        // A version the manifest doesn't list.
         let stranger = fixed_key(3);
         let aad = request_aad("POST", PATH, KEY, &stranger.thumbprint(), USER);
         let upload = read(sealed_form(&stranger, &aad, csv)).await.unwrap();
         assert_eq!(
             open_upload(&transport, &upload, &aad).unwrap_err().0,
-            "kid names no transport key this worker holds"
+            "kid names no transport key version this worker accepts"
         );
     }
 
@@ -442,10 +422,7 @@ pub(crate) mod tests {
         ]))
         .await
         .unwrap();
-        let transport = ReleasedKey {
-            current: recipient,
-            previous: None,
-        };
+        let transport = only(recipient);
 
         let aad = request_aad("POST", PATH, KEY, kid, USER);
         let csv = open_upload(&transport, &upload, &aad).unwrap();
@@ -456,23 +433,20 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn the_previous_transport_key_opens_uploads_for_24_hours_after_the_switch() {
-        for (hours_ago, previous_opens) in [(23, true), (25, false)] {
-            let transport = rotated(hours_ago);
-            let previous = &transport.previous.as_ref().unwrap().key;
-            for (key, opens) in [(&transport.current, true), (previous, previous_opens)] {
-                let aad = request_aad("POST", PATH, KEY, &key.thumbprint(), USER);
-                let upload = read(sealed_form(key, &aad, b"a\n")).await.unwrap();
-                let result = open_upload(&transport, &upload, &aad);
-                assert_eq!(result.is_ok(), opens, "{hours_ago} h: {result:?}");
-                if let Err(e) = result {
-                    assert_eq!(
-                        e.0,
-                        "kid names a transport key version retired over 24 hours ago"
-                    );
-                }
-            }
-        }
+    async fn another_version_opens_only_while_the_manifest_lists_it() {
+        let transport = rotating().await;
+        let previous = fixed_key(2);
+        let aad = request_aad("POST", PATH, KEY, &previous.thumbprint(), USER);
+        let upload = read(sealed_form(&previous, &aad, b"a\n")).await.unwrap();
+        assert_eq!(open_upload(&transport, &upload, &aad).unwrap(), b"a\n");
+
+        // The manifest that retires it.
+        let current = keys::tests::listed(fixed_key(1).thumbprint(), None);
+        transport.follow(&[current]).await.unwrap();
+        assert_eq!(
+            open_upload(&transport, &upload, &aad).unwrap_err().0,
+            "kid names no transport key version this worker accepts"
+        );
     }
 
     #[tokio::test]
@@ -515,13 +489,10 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn an_invalid_encapsulated_key_is_refused() {
-        let transport = ReleasedKey {
-            current: fixed_key(1),
-            previous: None,
-        };
-        let kid = transport.current.thumbprint();
+        let transport = only(fixed_key(1));
+        let kid = fixed_key(1).thumbprint();
         let aad = request_aad("POST", PATH, KEY, &kid, USER);
-        let (_, ct) = seal(&transport.current, &aad, b"a\n");
+        let (_, ct) = seal(&fixed_key(1), &aad, b"a\n");
         let not_a_point = URL_SAFE_NO_PAD.encode([4u8; 65]);
         let upload = read(form(&[
             ("v", &b"1"[..]),

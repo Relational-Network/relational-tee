@@ -10,8 +10,12 @@
 //! `{env}/latest.jws`. Workers serve the latest as it is: it's signed, so
 //! where it comes from doesn't matter, and clients verify it against the
 //! manifest key pinned in their build. Each worker looks for it every 10
-//! seconds until one loads, then every 5 minutes, and answers
+//! seconds until one loads and its listed transport key versions are
+//! released, then every 5 minutes, and answers
 //! `503 reference_values_unavailable` until the first one loads.
+//!
+//! The manifest also decides which transport key versions besides its
+//! current one a worker opens uploads with (see [`TransportKeys`]).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
@@ -28,6 +32,7 @@ use serde::Deserialize;
 use tracing::{info, warn};
 
 use crate::error::ApiError;
+use crate::seal::{Listed, TransportKeys};
 use crate::state::AppState;
 use crate::store::{ETag, Fetched, ObjectStore};
 
@@ -55,6 +60,9 @@ struct Keys {
 #[derive(Deserialize)]
 struct TransportKey {
     kid: String,
+    /// The Key Vault key version, which workers release it by.
+    #[serde(default)]
+    version: Option<String>,
 }
 
 /// The payload of a compact JWS, if `jws` is one and its payload is a
@@ -73,6 +81,8 @@ fn payload(jws: &[u8]) -> Option<Payload> {
 struct Served {
     jws: Bytes,
     etag: ETag,
+    /// The transport key versions it lists.
+    transport: Vec<Listed>,
 }
 
 /// The environment's manifest, refreshed in the background.
@@ -80,22 +90,29 @@ pub struct ReferenceValues {
     store: Arc<dyn ObjectStore>,
     /// `{env}/latest.jws`.
     path: String,
-    /// This worker's transport key ID, which the manifest should list.
-    kid: String,
+    /// The versions uploads open with; the manifest should list the current one.
+    transport: Arc<TransportKeys>,
     served: RwLock<Option<Served>>,
     missing_logged: AtomicBool,
+    /// Whether every listed transport key version was released.
+    followed: AtomicBool,
 }
 
 impl ReferenceValues {
     /// The manifest of `environment` in `store` (the `reference-values`
-    /// container), for a worker whose transport key ID is `kid`.
-    pub fn new(store: Arc<dyn ObjectStore>, environment: &str, kid: String) -> Self {
+    /// container), which decides the other versions `transport` accepts.
+    pub fn new(
+        store: Arc<dyn ObjectStore>,
+        environment: &str,
+        transport: Arc<TransportKeys>,
+    ) -> Self {
         Self {
             store,
             path: format!("{environment}/latest.jws"),
-            kid,
+            transport,
             served: RwLock::new(None),
             missing_logged: AtomicBool::new(false),
+            followed: AtomicBool::new(false),
         }
     }
 
@@ -104,7 +121,8 @@ impl ReferenceValues {
         self.served.read().ok()?.as_ref().map(|s| s.jws.clone())
     }
 
-    /// Look for the manifest once, and serve it if it changed.
+    /// Look for the manifest once, serve it if it changed, and accept the
+    /// transport key versions it lists.
     pub async fn refresh(&self) -> Result<(), String> {
         let cached = self
             .served
@@ -126,6 +144,16 @@ impl ReferenceValues {
             }
             Fetched::Found { body, etag } => self.load(body, etag)?,
         }
+        let listed = self
+            .served
+            .read()
+            .ok()
+            .and_then(|s| s.as_ref().map(|s| s.transport.clone()));
+        if let Some(listed) = listed {
+            let result = self.transport.follow(&listed).await;
+            self.followed.store(result.is_ok(), Ordering::Relaxed);
+            result?;
+        }
         Ok(())
     }
 
@@ -133,8 +161,9 @@ impl ReferenceValues {
         let jws = Bytes::copy_from_slice(body.trim_ascii());
         let manifest = payload(&jws)
             .ok_or_else(|| format!("{} isn't a compact JWS of a manifest", self.path))?;
-        if !manifest.keys.transport.iter().any(|k| k.kid == self.kid) {
-            warn!(alert = "reference_values_mismatch", kid = %self.kid, sequence = manifest.sequence,
+        let kid = self.transport.current_kid();
+        if !manifest.keys.transport.iter().any(|k| k.kid == kid) {
+            warn!(alert = "reference_values_mismatch", kid, sequence = manifest.sequence,
                 "The manifest doesn't list this worker's transport key, so clients won't seal uploads to it");
         }
         if manifest.not_after <= Utc::now() {
@@ -143,8 +172,21 @@ impl ReferenceValues {
         }
         info!(manifest = %self.path, sequence = manifest.sequence,
             not_after = %manifest.not_after.to_rfc3339(), "Serving a new reference-values manifest");
+        let transport = manifest
+            .keys
+            .transport
+            .into_iter()
+            .map(|k| Listed {
+                kid: k.kid,
+                version: k.version,
+            })
+            .collect();
         if let Ok(mut served) = self.served.write() {
-            *served = Some(Served { jws, etag });
+            *served = Some(Served {
+                jws,
+                etag,
+                transport,
+            });
         }
         Ok(())
     }
@@ -157,8 +199,9 @@ impl ReferenceValues {
                 if let Err(e) = this.refresh().await {
                     warn!(error = %e, "Reference-values check failed");
                 }
-                let loaded = this.served.read().is_ok_and(|s| s.is_some());
-                tokio::time::sleep(if loaded { POLL } else { FIRST_POLL }).await;
+                let settled = this.served.read().is_ok_and(|s| s.is_some())
+                    && this.followed.load(Ordering::Relaxed);
+                tokio::time::sleep(if settled { POLL } else { FIRST_POLL }).await;
             }
         });
     }
@@ -211,10 +254,18 @@ pub(crate) mod tests {
         }))
     }
 
+    fn values(store: Arc<LocalFiles>) -> (ReferenceValues, Arc<TransportKeys>) {
+        let transport = Arc::new(crate::seal::keys::tests::rotating());
+        (
+            ReferenceValues::new(store, "dev", transport.clone()),
+            transport,
+        )
+    }
+
     #[tokio::test]
     async fn serves_the_latest_manifest_and_follows_its_replacements() {
         let store = Arc::new(LocalFiles::temporary());
-        let values = ReferenceValues::new(store.clone(), "dev", "kid-1".into());
+        let (values, _) = values(store.clone());
         values.refresh().await.expect("nothing there yet is fine");
         assert!(values.current().is_none());
 
@@ -252,6 +303,42 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn the_manifest_decides_which_other_transport_key_versions_open() {
+        use crate::tee::tests::fixed_key;
+        let store = Arc::new(LocalFiles::temporary());
+        let (values, transport) = values(store.clone());
+        let (one, two) = (fixed_key(1).thumbprint(), fixed_key(2).thumbprint());
+        let manifest = |transport: serde_json::Value| {
+            unsigned_jws(&serde_json::json!({
+                "sequence": 1, "not_after": "2099-01-01T00:00:00Z",
+                "keys": { "transport": transport },
+            }))
+        };
+
+        let rotating = manifest(serde_json::json!([
+            { "kid": one }, { "kid": two, "version": "v2" },
+        ]));
+        let Created::New(etag) = store
+            .put_if_absent("dev/latest.jws", rotating.into())
+            .await
+            .unwrap()
+        else {
+            panic!("created");
+        };
+        values.refresh().await.unwrap();
+        assert_eq!(transport.kids(), [one.clone(), two.clone()]);
+
+        let retired = manifest(serde_json::json!([{ "kid": one }]));
+        store
+            .put_if_match("dev/latest.jws", retired.into(), &etag)
+            .await
+            .unwrap();
+        values.refresh().await.unwrap();
+        assert_eq!(transport.kids(), [one]);
+        assert!(transport.get(&two).is_none());
+    }
+
+    #[tokio::test]
     async fn the_route_serves_the_jws_to_the_dashboard_as_application_jose() {
         use axum::body::{to_bytes, Body};
         use axum::http::{Request, StatusCode};
@@ -259,12 +346,12 @@ pub(crate) mod tests {
 
         let store = Arc::new(LocalFiles::temporary());
         let mut state = AppState::for_tests();
-        let kid = state
-            .keys
-            .get(crate::tee::KeyName::Transport)
-            .current
-            .thumbprint();
-        state.reference_values = Arc::new(ReferenceValues::new(store.clone(), "dev", kid.clone()));
+        let kid = state.transport.current_kid().to_string();
+        state.reference_values = Arc::new(ReferenceValues::new(
+            store.clone(),
+            "dev",
+            state.transport.clone(),
+        ));
         let jws = manifest(3, &kid);
         store
             .put_if_absent("dev/latest.jws", jws.clone().into())

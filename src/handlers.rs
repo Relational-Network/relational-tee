@@ -16,8 +16,7 @@ use crate::auth::Caller;
 use crate::data_validation::{validate_csv_bytes, FieldSchema, ValidationMode, ValidationSummary};
 use crate::error::ApiError;
 use crate::idempotency::Idempotent;
-use crate::seal::{self, SealedUpload};
-use crate::tee::ReleasedKey;
+use crate::seal::{self, SealedUpload, TransportKeys};
 
 // ============================================================================
 // Admin Endpoints
@@ -67,7 +66,7 @@ pub async fn admin_status(caller: Caller) -> Result<Json<AdminStatusResponse>, A
 
 /// Read and open the sealed CSV of `caller`'s upload `request`.
 pub(crate) async fn open_sealed_csv(
-    transport: &ReleasedKey,
+    transport: &TransportKeys,
     caller: &Caller,
     request: &Idempotent,
     multipart: Multipart,

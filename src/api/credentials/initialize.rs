@@ -15,6 +15,7 @@ use serde::Serialize;
 use tracing::info;
 use utoipa::ToSchema;
 
+use super::{count_csv_rows, parse_pda, pool_not_found, sha256_hex, validation_failed};
 use crate::api::pools::{load_pool, verify_pool_ownership};
 use crate::audit;
 use crate::auth::{Caller, Permission};
@@ -27,9 +28,6 @@ use crate::seal::SealedUploadForm;
 use crate::state::AppState;
 use crate::storage::pools::{PoolState, Upload, INITIAL};
 use crate::storage::Change;
-use crate::tee::KeyName;
-
-use super::{count_csv_rows, parse_pda, pool_not_found, sha256_hex, validation_failed};
 
 // ============================================================================
 // Response types
@@ -88,13 +86,7 @@ pub async fn initialize_pool(
 ) -> Result<Response, ApiError> {
     caller.require(Permission::PoolsWrite)?;
     // Open the sealed CSV first: the fingerprint covers the plaintext.
-    let csv_bytes = open_sealed_csv(
-        state.keys.get(KeyName::Transport),
-        &caller,
-        &request,
-        multipart,
-    )
-    .await?;
+    let csv_bytes = open_sealed_csv(&state.transport, &caller, &request, multipart).await?;
     let mut op = open_or_replay!(state, &caller.user_id, request, &csv_bytes);
     let pool_pda = parse_pda(&pool_pda_str)?;
 

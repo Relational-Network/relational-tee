@@ -28,6 +28,7 @@ use p256::SecretKey;
 use serde_json::{json, Value};
 
 use crate::config::StorageConfig;
+use crate::seal::Listed;
 use crate::store::{Created, Fetched, ObjectStore, Replaced, REFERENCE_VALUES};
 use crate::tee::dev_keys::{key_path, previous_key_path, private_jwk, read_key, write_private};
 use crate::tee::{dev_maa, EcKey, KeyName};
@@ -83,8 +84,9 @@ pub struct Manifest {
     pub not_before: DateTime<Utc>,
     pub not_after: DateTime<Utc>,
     pub claim_sets: Vec<Value>,
-    /// RFC 7638 thumbprints of the approved transport key versions.
-    pub transport_kids: Vec<String>,
+    /// The approved transport key versions: RFC 7638 thumbprints, and the
+    /// version workers release each by.
+    pub transport: Vec<Listed>,
     /// SHA-256 of each approved `tls-key` version's SubjectPublicKeyInfo.
     pub tls_spki_sha256: Vec<[u8; 32]>,
     pub commit: String,
@@ -106,10 +108,16 @@ impl Manifest {
         now: DateTime<Utc>,
     ) -> Result<Self, String> {
         let read = |path: PathBuf| read_key(&path).map_err(|e| e.to_string());
-        let mut transport_kids = vec![read(key_path(keys_dir, KeyName::Transport))?.thumbprint()];
+        let mut transport = vec![Listed {
+            kid: read(key_path(keys_dir, KeyName::Transport))?.thumbprint(),
+            version: None,
+        }];
         let previous = previous_key_path(keys_dir, KeyName::Transport);
         if previous.exists() {
-            transport_kids.push(read(previous)?.thumbprint());
+            transport.push(Listed {
+                kid: read(previous)?.thumbprint(),
+                version: Some("previous".into()),
+            });
         }
         let tls = read(key_path(keys_dir, KeyName::Tls))?;
         Ok(Self {
@@ -118,7 +126,7 @@ impl Manifest {
             not_before: now,
             not_after: now + Duration::days(VALIDITY_DAYS),
             claim_sets: vec![dev_maa::claim_set(authority)],
-            transport_kids,
+            transport,
             tls_spki_sha256: vec![crate::tls::spki_sha256(&tls)?],
             commit: commit.into(),
         })
@@ -126,9 +134,12 @@ impl Manifest {
 
     pub fn payload(&self) -> Value {
         let transport: Vec<Value> = self
-            .transport_kids
+            .transport
             .iter()
-            .map(|kid| json!({ "kid": kid }))
+            .map(|listed| match &listed.version {
+                Some(version) => json!({ "kid": listed.kid, "version": version }),
+                None => json!({ "kid": listed.kid }),
+            })
             .collect();
         let tls: Vec<Value> = self
             .tls_spki_sha256
@@ -290,7 +301,12 @@ impl Bad {
                     set["x-ms-sevsnpvm-hostdata"] = json!(["00".repeat(32)]);
                 }
             }
-            Self::TransportKey => manifest.transport_kids = vec![unknown_key()],
+            Self::TransportKey => {
+                manifest.transport = vec![Listed {
+                    kid: unknown_key(),
+                    version: None,
+                }]
+            }
             Self::Signature => {}
         }
     }
@@ -431,10 +447,12 @@ mod tests {
     use super::*;
     use crate::attestation::Attestation;
     use crate::reference_values::ReferenceValues;
+    use crate::seal::TransportKeys;
     use crate::state::AppState;
     use crate::store::files::LocalFiles;
     use crate::tee::dev_keys::generate_missing as generate_dev_keys;
     use crate::tee::local::LocalDev;
+    use crate::tee::KeyProvider;
     use crate::tee::WorkerKeys;
     use aws_lc_rs::signature::{UnparsedPublicKey, ECDSA_P256_SHA256_FIXED};
     use axum::body::{to_bytes, Body};
@@ -485,6 +503,10 @@ mod tests {
         let transport_kid = keys.get(KeyName::Transport).current.thumbprint();
         let attestation = Attestation::new(&keys.get(KeyName::Transport).current);
         attestation.refresh(&provider).await.expect("dev token");
+        let transport = Arc::new(TransportKeys::new(
+            keys.get(KeyName::Transport).current.clone(),
+            Arc::new(LocalDev::new(dir.clone())),
+        ));
 
         let store = Arc::new(LocalFiles::temporary());
         let now = Utc::now();
@@ -502,11 +524,11 @@ mod tests {
         state.reference_values = Arc::new(ReferenceValues::new(
             store.clone(),
             "dev",
-            transport_kid.clone(),
+            transport.clone(),
         ));
         state.reference_values.refresh().await.unwrap();
+        state.transport = transport;
         state.attestation = Arc::new(attestation);
-        state.keys = Arc::new(keys);
         let app = crate::router(state);
 
         // What a dashboard checks, in order: the manifest's signature and window...
@@ -615,19 +637,46 @@ mod tests {
             spoiled(Bad::HostData).claim_sets[0]["x-ms-sevsnpvm-hostdata"],
             good.claim_sets[0]["x-ms-sevsnpvm-hostdata"]
         );
-        assert!(!spoiled(Bad::TransportKey)
-            .transport_kids
-            .contains(&good.transport_kids[0]));
+        let current = &good.transport[0].kid;
+        assert!(spoiled(Bad::TransportKey)
+            .transport
+            .iter()
+            .all(|listed| &listed.kid != current));
         assert_eq!(spoiled(Bad::Signature).payload(), good.payload());
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
-        // A previous transport key version is approved too.
-        let previous = previous_key_path(&dir, KeyName::Transport);
-        std::fs::copy(key_path(&dir, KeyName::StorageRoot), &previous).unwrap();
-        let rotating = Manifest::for_dev_keys(&dir, "dev", "x", "c", 5, now).unwrap();
-        assert_eq!(rotating.transport_kids.len(), 2);
+    #[tokio::test]
+    async fn a_listed_previous_transport_key_version_opens_on_a_dev_worker() {
+        let dir = temp_keys();
+        let previous_path = previous_key_path(&dir, KeyName::Transport);
+        std::fs::copy(key_path(&dir, KeyName::StorageRoot), &previous_path).unwrap();
+        let previous = read_key(&previous_path).unwrap();
+        let manifest = Manifest::for_dev_keys(&dir, "dev", "x", "c", 5, Utc::now()).unwrap();
         assert_eq!(
-            rotating.transport_kids[1],
-            read_key(&previous).unwrap().thumbprint()
+            manifest.payload()["keys"]["transport"][1],
+            json!({ "kid": previous.thumbprint(), "version": "previous" })
+        );
+
+        let provider = Arc::new(LocalDev::new(dir.clone()));
+        let current = provider.release(KeyName::Transport).await.unwrap().current;
+        let transport = Arc::new(TransportKeys::new(current, provider));
+        assert!(transport.get(&previous.thumbprint()).is_none());
+        let store = Arc::new(LocalFiles::temporary());
+        let jws = sign(
+            &read_key(&dir.join(SIGNING_KEY_FILE)).unwrap(),
+            &manifest.payload(),
+        );
+        publish(store.as_ref(), "dev", 5, &jws.unwrap())
+            .await
+            .unwrap();
+        ReferenceValues::new(store, "dev", transport.clone())
+            .refresh()
+            .await
+            .unwrap();
+        assert_eq!(
+            transport.get(&previous.thumbprint()).unwrap().public_key(),
+            previous.public_key()
         );
         let _ = std::fs::remove_dir_all(dir);
     }

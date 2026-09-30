@@ -12,14 +12,14 @@ use crate::edge::Limiter;
 use crate::health::Health;
 use crate::history::History;
 use crate::reference_values::ReferenceValues;
+use crate::seal::TransportKeys;
 use crate::storage::Storage;
-use crate::tee::WorkerKeys;
 
 /// Shared application state passed to every handler via Axum's `State` extractor.
 #[derive(Clone)]
 pub struct AppState {
-    /// The worker's released keys.
-    pub keys: Arc<WorkerKeys>,
+    /// The transport key versions sealed uploads open with.
+    pub transport: Arc<TransportKeys>,
     /// The cached attestation token for the transport key.
     pub attestation: Arc<Attestation>,
     /// The environment's signed manifest of approved workloads.
@@ -56,19 +56,23 @@ impl AppState {
         use crate::health::Certificate;
         use crate::tee::KeyName;
 
-        let keys = Arc::new(crate::tee::tests::test_keys());
-        let transport = &keys.get(KeyName::Transport).current;
-        let attestation = Arc::new(Attestation::new(transport));
+        let keys = crate::tee::tests::test_keys();
+        let current = &keys.get(KeyName::Transport).current;
+        let attestation = Arc::new(Attestation::new(current));
+        let transport = Arc::new(TransportKeys::new(
+            current.clone(),
+            Arc::new(crate::tee::tests::Versions(Default::default())),
+        ));
         let reference_values = Arc::new(ReferenceValues::new(
             Arc::new(crate::store::files::LocalFiles::temporary()),
             "dev",
-            transport.thumbprint(),
+            transport.clone(),
         ));
         let certificate = Certificate::TlsKey(crate::tls::tests::serving());
         let health = Arc::new(Health::new(&keys, certificate));
         let unreachable = "http://127.0.0.1:9";
         Self {
-            keys,
+            transport,
             attestation,
             reference_values,
             health,

@@ -85,7 +85,6 @@ mod tests {
     use crate::seal::tests::{form, sealed_form, BOUNDARY};
     use crate::state::AppState;
     use crate::storage::pools::{PoolDoc, PoolKind};
-    use crate::tee::KeyName;
 
     fn admin_token(oid: &str) -> String {
         let mut spec = Spec::valid(&config());
@@ -122,7 +121,8 @@ mod tests {
         let chain = Arc::new(FakeChain::default());
         let mut state = AppState::for_tests();
         state.solana_client = Arc::new(fake::start(chain.clone()));
-        let (keys, storage) = (state.keys.clone(), state.storage.clone());
+        let transport = state.transport.get(state.transport.current_kid()).unwrap();
+        let storage = state.storage.clone();
         let app = crate::router(state);
 
         // The caller learns their user ID, as the dashboard does, and has a wallet.
@@ -178,7 +178,7 @@ mod tests {
             .await
             .unwrap();
 
-        let transport = &keys.get(KeyName::Transport).current;
+        let transport = transport.as_ref();
         let kid = transport.thumbprint();
         let path = format!("/v1/drt/pools/{pool_pda}/initialize");
         let key = uuid::Uuid::new_v4().to_string();
