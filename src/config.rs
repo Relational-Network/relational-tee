@@ -141,11 +141,8 @@ pub struct ServerConfig {
     pub storage: StorageConfig,
     pub entra: EntraConfig,
     /// The one origin CORS allows: the environment's dashboard.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "CORS allows only the dashboard origin")
-    )]
     pub dashboard_origin: String,
+    pub rate_limits: RateLimits,
     /// The dev token signing key, whose public half dev builds also trust.
     #[cfg(feature = "dev")]
     pub dev_token_key: PathBuf,
@@ -207,8 +204,39 @@ impl ServerConfig {
             storage: storage_from_lookup(&lookup)?,
             entra: entra_from_lookup(&lookup)?,
             dashboard_origin: dashboard_origin_from_lookup(&lookup)?,
+            rate_limits: RateLimits::from_lookup(&lookup)?,
             #[cfg(feature = "dev")]
             dev_token_key: dev_token_key_from_lookup(&lookup),
+        })
+    }
+}
+
+/// Per-worker request rate limits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RateLimits {
+    /// `RATE_LIMIT_IP_PER_SECOND`: sustained requests per client IP.
+    pub ip_per_second: u32,
+    /// `RATE_LIMIT_IP_BURST`: requests a client IP may make at once.
+    pub ip_burst: u32,
+    /// `RATE_LIMIT_USER_MUTATIONS_PER_SECOND`: POST, PUT, PATCH and DELETE
+    /// requests per user.
+    pub user_mutations_per_second: u32,
+}
+
+impl RateLimits {
+    fn from_lookup(lookup: &impl Fn(&str) -> Option<String>) -> Result<Self, String> {
+        let read = |name: &str, default: u32| match lookup(name) {
+            None => Ok(default),
+            Some(v) => v
+                .parse::<u32>()
+                .ok()
+                .filter(|n| *n > 0)
+                .ok_or_else(|| format!("{name} {v:?} isn't a positive whole number")),
+        };
+        Ok(Self {
+            ip_per_second: read("RATE_LIMIT_IP_PER_SECOND", 20)?,
+            ip_burst: read("RATE_LIMIT_IP_BURST", 40)?,
+            user_mutations_per_second: read("RATE_LIMIT_USER_MUTATIONS_PER_SECOND", 10)?,
         })
     }
 }
@@ -724,6 +752,23 @@ mod tests {
         assert!(config_from(&[("TLS_KEY_PATH", "key.pem")]).is_err());
         assert!(complete(&[("PORT", "http")]).is_err());
         assert!(complete(&[("BIND_ADDR", "localhost")]).is_err());
+        assert!(complete(&[("RATE_LIMIT_IP_BURST", "0")]).is_err());
+        assert!(complete(&[("RATE_LIMIT_IP_PER_SECOND", "lots")]).is_err());
+    }
+
+    #[test]
+    fn rate_limits_have_defaults_and_can_be_tuned() {
+        let config = complete(&[]).unwrap();
+        assert_eq!(
+            config.rate_limits,
+            RateLimits {
+                ip_per_second: 20,
+                ip_burst: 40,
+                user_mutations_per_second: 10,
+            }
+        );
+        let config = complete(&[("RATE_LIMIT_USER_MUTATIONS_PER_SECOND", "3")]).unwrap();
+        assert_eq!(config.rate_limits.user_mutations_per_second, 3);
     }
 
     #[cfg(feature = "dev")]

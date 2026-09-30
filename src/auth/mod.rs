@@ -148,6 +148,7 @@ impl FromRequestParts<AppState> for Caller {
             })
             .await?;
         crate::audit::caller(&identity.user_id);
+        state.limiter.check_user(&parts.method, &identity.user_id)?;
 
         Ok(Caller {
             permissions: permissions(&claims.roles),

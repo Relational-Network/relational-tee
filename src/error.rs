@@ -48,6 +48,8 @@ pub struct ApiError {
     pub status: StatusCode,
     pub code: &'static str,
     pub message: String,
+    /// Seconds for `Retry-After`.
+    pub retry_after: Option<u64>,
 }
 
 impl ApiError {
@@ -57,6 +59,7 @@ impl ApiError {
             status,
             code,
             message: msg.into(),
+            retry_after: None,
         }
     }
 
@@ -98,6 +101,17 @@ impl ApiError {
             "unprocessable_entity",
             msg,
         )
+    }
+
+    /// 429 `rate_limited`, with `Retry-After` rounded up to whole seconds.
+    pub fn rate_limited(wait: std::time::Duration) -> Self {
+        let mut e = Self::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limited",
+            "too many requests; retry later",
+        );
+        e.retry_after = Some((wait.as_secs() + u64::from(wait.subsec_nanos() > 0)).max(1));
+        e
     }
 
     /// 500 `internal_error` — unexpected failure.
@@ -152,6 +166,11 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let body = serde_json::json!({ "error": self.message, "code": self.code });
         let mut response = (self.status, Json(body)).into_response();
+        if let Some(secs) = self.retry_after {
+            response
+                .headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, secs.into());
+        }
         response.extensions_mut().insert(ErrorInfo {
             code: self.code,
             message: self.message,

@@ -23,6 +23,7 @@ mod chain;
 mod config;
 mod crypto;
 mod data_validation;
+mod edge;
 mod error;
 mod handlers;
 mod health;
@@ -474,6 +475,8 @@ async fn main() {
         attestation,
         health,
         auth: Arc::new(verifier),
+        dashboard_origin: server_config.dashboard_origin.as_str().into(),
+        limiter: Arc::new(edge::Limiter::new(&server_config.rate_limits)),
         storage: Arc::new(storage),
         solana_client: Arc::new(solana_client),
         history,
@@ -482,6 +485,7 @@ async fn main() {
     state.health.spawn_canary(state.storage.clone());
     state.health.spawn_rpc_check(state.solana_client.clone());
     reconciler::spawn(state.storage.clone(), state.solana_client.clone());
+    state.limiter.spawn_cleanup();
     let health = state.health.clone();
     let app = router(state);
 
@@ -509,7 +513,7 @@ async fn main() {
             info!(%addr, cert = %cert_path.display(), "Serving HTTPS");
             axum_server::bind_rustls(addr, tls_config)
                 .handle(handle)
-                .serve(app.into_make_service())
+                .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
                 .await
                 .expect("server error");
         }
@@ -522,7 +526,7 @@ async fn main() {
             }
             axum_server::bind(addr)
                 .handle(handle)
-                .serve(app.into_make_service())
+                .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
                 .await
                 .expect("server error");
         }
@@ -530,9 +534,12 @@ async fn main() {
 }
 
 /// Every route, with the middleware every response passes through. The
-/// request context is outermost, so every response, the fallback's
-/// included, carries `X-Request-Id` and the error body.
+/// request context is outermost, so every response, the fallback's and
+/// CORS preflights included, carries `X-Request-Id` and the error body;
+/// CORS comes next, so rate-limited responses carry its headers too.
 fn router(state: AppState) -> Router {
+    let cors = edge::cors(&state.dashboard_origin);
+    let limiter = state.limiter.clone();
     let app = Router::new()
         // Health endpoints (unversioned for k8s probes).
         .route("/health", get(health))
@@ -584,6 +591,19 @@ fn router(state: AppState) -> Router {
             header::CACHE_CONTROL,
             HeaderValue::from_static("no-store"),
         ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::STRICT_TRANSPORT_SECURITY,
+            HeaderValue::from_static("max-age=63072000; includeSubDomains"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::REFERRER_POLICY,
+            HeaderValue::from_static("strict-origin-when-cross-origin"),
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            limiter,
+            edge::limit_ip,
+        ))
+        .layer(cors)
         .layer(axum::middleware::from_fn(request_id::request_context))
 }
 
@@ -651,6 +671,40 @@ mod tests {
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert_eq!(body["code"], "unauthorized");
         assert!(uuid::Uuid::parse_str(body["request_id"].as_str().unwrap()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn every_response_carries_the_security_and_cors_headers() {
+        let app = router(AppState::for_tests());
+        for path in ["/health/live", "/v1/wallets", "/nowhere"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .header(header::ORIGIN, "http://localhost:5173")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let h = response.headers();
+            for (name, value) in [
+                (
+                    "strict-transport-security",
+                    "max-age=63072000; includeSubDomains",
+                ),
+                ("x-content-type-options", "nosniff"),
+                ("x-frame-options", "DENY"),
+                ("referrer-policy", "strict-origin-when-cross-origin"),
+                ("cache-control", "no-store"),
+                ("access-control-allow-origin", "http://localhost:5173"),
+            ] {
+                assert_eq!(h[name], value, "{path}: {name}");
+            }
+            assert!(h.contains_key("x-request-id"), "{path}");
+            assert!(!h.contains_key(header::SERVER), "{path}");
+        }
     }
 
     async fn get_as(app: &Router, token: &str, path: &str) -> (StatusCode, serde_json::Value) {

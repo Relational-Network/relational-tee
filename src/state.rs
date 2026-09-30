@@ -8,6 +8,7 @@ use std::sync::Arc;
 use crate::attestation::Attestation;
 use crate::auth::entra::Verifier;
 use crate::blockchain::SolanaClient;
+use crate::edge::Limiter;
 use crate::health::Health;
 use crate::history::History;
 use crate::storage::Storage;
@@ -26,6 +27,12 @@ pub struct AppState {
     // ── Auth ────────────────────────────────────────────────────
     /// Validates Entra ID access tokens.
     pub auth: Arc<Verifier>,
+
+    // ── Edge ────────────────────────────────────────────────────
+    /// The one origin CORS allows.
+    pub dashboard_origin: Arc<str>,
+    /// Per-IP and per-user rate limits.
+    pub limiter: Arc<Limiter>,
 
     // ── Storage ─────────────────────────────────────────────────
     /// Sealed documents in Blob storage.
@@ -58,6 +65,12 @@ impl AppState {
             attestation,
             health,
             auth: Arc::new(crate::auth::entra::tests::verifier()),
+            dashboard_origin: "http://localhost:5173".into(),
+            limiter: Arc::new(Limiter::new(&crate::config::RateLimits {
+                ip_per_second: 1000,
+                ip_burst: 1000,
+                user_mutations_per_second: 1000,
+            })),
             storage: Arc::new(crate::storage::tests::files_storage()),
             solana_client: Arc::new(SolanaClient::new(
                 unreachable,

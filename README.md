@@ -97,6 +97,9 @@ Never print, log or commit a real token.
 | `ENTRA_API_CLIENT_ID` | the dev API `aa827d93-…` | required | The API app registration: tokens' `aud` |
 | `ENTRA_ALLOWED_CLIENT_IDS` | the dev dashboard `e2d026c4-…` and the Azure CLI | required; the Azure CLI is refused | Comma-separated client IDs allowed as `azp` |
 | `DEV_TOKEN_KEY` | `{DEV_KEYS_DIR}/entra-signing-key.pem`, trusted if it exists | refused | The dev token signing key |
+| `DASHBOARD_ORIGIN` | `http://localhost:5173` (Vite) | required, `https://` | The one origin CORS allows |
+| `RATE_LIMIT_IP_PER_SECOND`, `RATE_LIMIT_IP_BURST` | `20`, `40` | same | Requests per client IP, per worker |
+| `RATE_LIMIT_USER_MUTATIONS_PER_SECOND` | `10` | same | POST, PUT, PATCH and DELETE requests per user, per worker |
 | `RUST_LOG` | `info` | `info` | Log filter |
 
 Dev builds are the ones with the `dev` Cargo feature (`just dev`, or `cargo run --features dev`).
@@ -128,6 +131,9 @@ CI (`.github/workflows/ci.yml`) runs `just check` in the dev shell, `nix flake c
 
 ## API conventions
 
+- **Headers.** Every response carries `Strict-Transport-Security: max-age=63072000; includeSubDomains`, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: strict-origin-when-cross-origin` and `Cache-Control: no-store`, and no `Server` header.
+- **CORS.** Only `DASHBOARD_ORIGIN`, with methods GET, POST, PUT, PATCH and DELETE, request headers `Authorization`, `Content-Type` and `Idempotency-Key`, exposed headers `Idempotent-Replayed`, `Retry-After` and `X-Request-Id`, and a preflight max age of a day. No credentials: the dashboard sends a bearer token.
+- **Rate limits.** In memory per worker, so the effective limits grow with the worker count: per client IP on every request (the peer address; the load balancer keeps the client's), and per user on mutations once the token is validated. Excess requests get `429 rate_limited` with `Retry-After`.
 - **Request IDs.** Every response carries `X-Request-Id`: the client's value if it's a valid UUID, otherwise a new one. The same ID is on the request's log lines and on its audit event.
 - **Audit events.** Every mutation, failed mutation and admin read logs exactly one event with target `audit` when it completes, for operators to query in Azure Monitor. An event carries only `event` (for example `credential_issued`), `outcome` (`success` or `failure`), `code` on failure, `request_id`, `user_id`, and where relevant `pool`, `record_id`, `wallet_id`, `rows` and `signature`; never CSV content, emails, free-text reasons, keys or client IP addresses. The output leaves the TEE through the host, so these events are diagnostics: the pool's own records and the chain are the audit trail users rely on.
 - **Errors.** Every error, including unknown routes and malformed bodies, has one body shape: `{ "error": "<message>", "code": "<snake_case code>", "request_id": "<id>" }`. Clients branch on `code`; `error` is for people. Codes by status: `bad_request`, `unauthorized`, `forbidden`, `not_found`, `method_not_allowed`, `request_timeout`, `conflict`, `payload_too_large`, `unsupported_media_type`, `unprocessable_entity`, `rate_limited`, `internal_error`, `service_unavailable`. More specific codes: `idempotency_key_required`, `invalid_cursor` and `validation_failed` (400), `wallet_exists` (409), `idempotency_mismatch` (422), `integrity_error` (500), `storage_unavailable`, `rpc_unavailable` and `attestation_unavailable` (503). A lost compare-and-swap, or an initialisation another upload beat, is a plain `conflict` (409).
