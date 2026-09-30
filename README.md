@@ -53,6 +53,7 @@ Dev builds include `relational-tee fake-skr`, a stand-in for Microsoft's SKR sid
 | `FAKE_SKR_ADDR` | `127.0.0.1:9000` | Listening address |
 | `FAKE_MAA_ISSUER` | `http://localhost:{port}` | The tokens' `iss`, and where `/certs` is served |
 | `FAKE_MAA_TOKEN_SECS` | `28800` (8 hours) | Token lifetime |
+| `FAKE_MAA_DEBUGGABLE` | `off` | `on` makes tokens say the workload is debuggable, which clients must refuse |
 | `DEV_KEYS_DIR` | `dev/keys` | Dev keys to release and sign with |
 
 Not there yet: a debug-mode sandbox on Azure.

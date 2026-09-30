@@ -41,12 +41,16 @@ pub struct FakeSkrConfig {
     /// The `iss` of its tokens, and the base URL of `/certs`.
     pub issuer: String,
     pub token_lifetime: Duration,
+    /// Whether its tokens say the workload is debuggable, for checking that
+    /// clients refuse them.
+    pub debuggable: bool,
 }
 
 impl FakeSkrConfig {
     /// Read `FAKE_SKR_ADDR` (default `127.0.0.1:9000`), `DEV_KEYS_DIR`,
-    /// `FAKE_MAA_ISSUER` (default `http://localhost:{port}`) and
-    /// `FAKE_MAA_TOKEN_SECS` (default 8 hours).
+    /// `FAKE_MAA_ISSUER` (default `http://localhost:{port}`),
+    /// `FAKE_MAA_TOKEN_SECS` (default 8 hours) and `FAKE_MAA_DEBUGGABLE`
+    /// (`on` or `off`, the default).
     pub fn from_env() -> Result<Self, String> {
         let var = |key: &str| std::env::var(key).ok().filter(|v| !v.is_empty());
         let addr: SocketAddr = var("FAKE_SKR_ADDR")
@@ -68,6 +72,13 @@ impl FakeSkrConfig {
             issuer: var("FAKE_MAA_ISSUER")
                 .unwrap_or_else(|| format!("http://localhost:{}", addr.port())),
             token_lifetime,
+            debuggable: match var("FAKE_MAA_DEBUGGABLE").as_deref() {
+                None | Some("off") => false,
+                Some("on") => true,
+                Some(other) => {
+                    return Err(format!("FAKE_MAA_DEBUGGABLE {other:?} must be on or off"))
+                }
+            },
         })
     }
 }
@@ -83,7 +94,8 @@ impl FakeSkr {
         Ok(Self {
             keys_dir: config.keys_dir.clone(),
             maa: DevMaa::load(&config.keys_dir, config.issuer.clone())?
-                .with_lifetime(config.token_lifetime),
+                .with_lifetime(config.token_lifetime)
+                .debuggable(config.debuggable),
         })
     }
 }
@@ -93,6 +105,9 @@ pub async fn serve(config: FakeSkrConfig) -> Result<(), String> {
     let fake = FakeSkr::load(&config)?;
     info!(addr = %config.addr, issuer = %config.issuer, keys = %config.keys_dir.display(),
         "Fake SKR sidecar listening (dev only)");
+    if config.debuggable {
+        warn!("FAKE_MAA_DEBUGGABLE=on: tokens say the workload is debuggable, so clients must refuse them");
+    }
     axum_server::bind(config.addr)
         .serve(router(Arc::new(fake)).into_make_service())
         .await
@@ -228,6 +243,7 @@ pub(crate) mod tests {
             keys_dir: dir.clone(),
             issuer: format!("http://{addr}"),
             token_lifetime: DEFAULT_TOKEN_LIFETIME,
+            debuggable: false,
         };
         let fake = Arc::new(FakeSkr::load(&config).expect("load fake"));
         let server = axum_server::from_tcp(listener).expect("server");

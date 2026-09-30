@@ -52,6 +52,7 @@ pub struct DevMaa {
     signer: RsaSigner,
     issuer: String,
     lifetime: Duration,
+    debuggable: bool,
 }
 
 impl DevMaa {
@@ -61,11 +62,19 @@ impl DevMaa {
             signer: RsaSigner::load(&dir.join(SIGNING_KEY_FILE))?,
             issuer: issuer.into(),
             lifetime: DEFAULT_TOKEN_LIFETIME,
+            debuggable: false,
         })
     }
 
     pub fn with_lifetime(mut self, lifetime: Duration) -> Self {
         self.lifetime = lifetime;
+        self
+    }
+
+    /// Tokens that say the workload is debuggable, which clients must
+    /// refuse.
+    pub fn debuggable(mut self, debuggable: bool) -> Self {
+        self.debuggable = debuggable;
         self
     }
 
@@ -75,7 +84,8 @@ impl DevMaa {
     }
 
     /// A token whose `x-ms-runtime` claim is `runtime`, with the claims MAA
-    /// sets for a compliant, non-debuggable SEV-SNP container group.
+    /// sets for a compliant, non-debuggable SEV-SNP container group (unless
+    /// it was made [`debuggable`](Self::debuggable)).
     pub fn token(&self, runtime: &Value) -> Result<String, String> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -94,7 +104,7 @@ impl DevMaa {
             "x-ms-compliance-status": COMPLIANCE_STATUS,
             "x-ms-runtime": runtime,
             "x-ms-sevsnpvm-hostdata": DEV_HOST_DATA,
-            "x-ms-sevsnpvm-is-debuggable": false,
+            "x-ms-sevsnpvm-is-debuggable": self.debuggable,
             "x-ms-sevsnpvm-vmpl": 0,
             "x-ms-ver": "1.0",
         });
@@ -148,10 +158,15 @@ pub(crate) mod tests {
         let maa = DevMaa::load(&dir, "http://localhost:9000").expect("load");
         let runtime = json!({ "keys": [{ "kty": "EC", "kid": "abc" }] });
         let token = maa.token(&runtime).expect("sign");
-        let claims = verify(&token, &maa.jwks(), "http://localhost:9000");
+        let jwks = maa.jwks();
+        let claims = verify(&token, &jwks, "http://localhost:9000");
         assert_eq!(claims["x-ms-runtime"], runtime);
         assert_eq!(claims["x-ms-sevsnpvm-hostdata"], DEV_HOST_DATA);
         assert_eq!(claims["x-ms-sevsnpvm-is-debuggable"], false);
+
+        let debuggable = maa.debuggable(true).token(&runtime).expect("sign");
+        let claims = verify(&debuggable, &jwks, "http://localhost:9000");
+        assert_eq!(claims["x-ms-sevsnpvm-is-debuggable"], true);
         let _ = std::fs::remove_dir_all(dir);
     }
 }
