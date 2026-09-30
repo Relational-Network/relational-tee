@@ -277,6 +277,28 @@ pub(crate) fn environment_from_lookup(
     Ok(name)
 }
 
+/// How log lines are written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogFormat {
+    /// One JSON object per line, for Azure Monitor.
+    Json,
+    /// Human-readable lines, for a terminal.
+    Text,
+}
+
+/// Read `LOG_FORMAT`: `json` or `text`. Release builds default to `json`,
+/// dev builds to `text`.
+pub fn log_format_from_lookup(
+    lookup: &impl Fn(&str) -> Option<String>,
+) -> Result<LogFormat, String> {
+    match lookup("LOG_FORMAT").as_deref() {
+        None if cfg!(feature = "dev") => Ok(LogFormat::Text),
+        None | Some("json") => Ok(LogFormat::Json),
+        Some("text") => Ok(LogFormat::Text),
+        Some(other) => Err(format!("LOG_FORMAT {other:?} must be json or text")),
+    }
+}
+
 /// Read `TRANSPORT` and `API_HOSTNAME`. Release builds serve only HTTPS and
 /// require the hostname; dev builds default to plain HTTP, and to
 /// `localhost` for `TRANSPORT=https`.
@@ -721,6 +743,26 @@ mod tests {
         assert!(!is_loopback_http_url(
             "http://example.com:8080/path?host=127.0.0.1"
         ));
+    }
+
+    #[test]
+    fn logs_are_json_in_release_builds_and_text_in_dev_builds_unless_set() {
+        let format = |value: Option<&str>| {
+            log_format_from_lookup(&|key: &str| {
+                (key == "LOG_FORMAT")
+                    .then(|| value.map(String::from))
+                    .flatten()
+            })
+        };
+        let default = if cfg!(feature = "dev") {
+            LogFormat::Text
+        } else {
+            LogFormat::Json
+        };
+        assert_eq!(format(None), Ok(default));
+        assert_eq!(format(Some("json")), Ok(LogFormat::Json));
+        assert_eq!(format(Some("text")), Ok(LogFormat::Text));
+        assert!(format(Some("JSON")).is_err());
     }
 
     fn config_from(vars: &[(&str, &str)]) -> Result<ServerConfig, String> {

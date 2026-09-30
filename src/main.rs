@@ -33,6 +33,7 @@ mod history;
 mod http_client;
 mod idempotency;
 mod ids;
+mod logs;
 mod reconciler;
 mod reference_values;
 mod request_id;
@@ -51,9 +52,8 @@ use axum::{
 use std::sync::Arc;
 use std::time::Instant;
 use tower_http::set_header::SetResponseHeaderLayer;
-use tower_http::trace::{DefaultOnRequest, DefaultOnResponse, TraceLayer};
+use tower_http::trace::{DefaultOnRequest, TraceLayer};
 use tracing::{info, warn, Level};
-use tracing_subscriber::EnvFilter;
 use utoipa::{openapi::security::SecurityScheme, Modify, OpenApi};
 #[cfg(feature = "swagger-ui")]
 use utoipa_swagger_ui::SwaggerUi;
@@ -403,13 +403,13 @@ async fn open_storage(
 /// Service entrypoint: read configuration, build the router, and serve.
 #[tokio::main]
 async fn main() {
-    // Initialize tracing with environment filter (RUST_LOG).
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .with_target(true)
-        .init();
+    let log_format =
+        config::log_format_from_lookup(&|key| std::env::var(key).ok().filter(|v| !v.is_empty()))
+            .unwrap_or_else(|e| {
+                eprintln!("Invalid configuration: {e}");
+                std::process::exit(2);
+            });
+    logs::init(log_format);
 
     #[cfg(feature = "dev")]
     if let Some(code) = run_dev_command(&std::env::args().collect::<Vec<_>>()).await {
@@ -627,7 +627,8 @@ fn router(state: AppState) -> Router {
         .apply(routes)
         .merge(edge::UPLOADS.apply(api::upload_router()))
         .fallback(request_id::not_found)
-        .layer(axum::middleware::from_fn(audit::record));
+        .layer(axum::middleware::from_fn(audit::record))
+        .layer(axum::middleware::from_fn(logs::name_route));
     #[cfg(feature = "dev")]
     let app = app.layer(axum::middleware::from_fn(fault::middleware));
     let app = app.with_state(state);
@@ -639,17 +640,9 @@ fn router(state: AppState) -> Router {
     let app = app.route("/api-doc/openapi.json", get(openapi_json));
 
     let trace = TraceLayer::new_for_http()
-        .make_span_with(|request: &axum::http::Request<axum::body::Body>| {
-            let id = request
-                .extensions()
-                .get::<request_id::RequestId>()
-                .map(|id| id.0.as_str())
-                .unwrap_or("-");
-            tracing::info_span!("request", method = %request.method(),
-                path = %request.uri().path(), request_id = %id)
-        })
+        .make_span_with(logs::request_span)
         .on_request(DefaultOnRequest::new().level(Level::INFO))
-        .on_response(DefaultOnResponse::new().level(Level::INFO));
+        .on_response(logs::finished);
     app.layer(trace)
         .layer(SetResponseHeaderLayer::if_not_present(
             header::HeaderName::from_static("x-content-type-options"),

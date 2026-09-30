@@ -148,6 +148,7 @@ impl FromRequestParts<AppState> for Caller {
             })
             .await?;
         crate::audit::caller(&identity.user_id);
+        tracing::Span::current().record("user_id", identity.user_id.as_str());
         state.limiter.check_user(&parts.method, &identity.user_id)?;
 
         Ok(Caller {

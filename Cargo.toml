@@ -73,7 +73,7 @@ webpki-roots = { version = "1", default-features = false }
 
 # ── Observability ──────────────────────────────────────────────────
 tracing = { version = "0.1", default-features = false }
-tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "json"] }
 
 # ── Utilities ──────────────────────────────────────────────────────
 uuid = { version = "1.16", default-features = false, features = ["v4", "v5"] }
