@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use chrono::{DateTime, Utc};
 use p256::elliptic_curve::sec1::ToEncodedPoint;
 use p256::{PublicKey, SecretKey};
 use serde_json::Value;
@@ -186,14 +187,13 @@ impl EcKey {
 /// A released key: its current version and, while it rotates, the previous one.
 pub struct ReleasedKey {
     pub current: EcKey,
-    pub previous: Option<EcKey>,
+    pub previous: Option<PreviousKey>,
 }
 
-impl ReleasedKey {
-    /// The current version first, then the previous one.
-    pub fn versions(&self) -> impl Iterator<Item = &EcKey> {
-        std::iter::once(&self.current).chain(self.previous.as_ref())
-    }
+/// A key's previous version, and when the current version replaced it.
+pub struct PreviousKey {
+    pub key: EcKey,
+    pub replaced_at: DateTime<Utc>,
 }
 
 /// Releases the worker's keys.
@@ -236,6 +236,10 @@ impl WorkerKeys {
             let key = release_with_retry(provider, name).await?;
             if name == KeyName::Transport {
                 info!(key = %name, kid = %key.current.thumbprint(), "Key released");
+                if let Some(previous) = &key.previous {
+                    info!(key = %name, kid = %previous.key.thumbprint(),
+                        replaced_at = %previous.replaced_at.to_rfc3339(), "Previous version released");
+                }
             } else {
                 info!(key = %name, "Key released");
             }

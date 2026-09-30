@@ -5,17 +5,22 @@
 //! instead of the SKR sidecar, and attestation tokens are signed with the dev
 //! MAA key.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use super::dev_keys::{key_path, previous_key_path, read_key};
 use super::dev_maa::{DevMaa, DEFAULT_ISSUER};
 use super::{
-    AttestError, AttestationProvider, BoxFuture, KeyError, KeyName, KeyProvider, ReleasedKey,
+    AttestError, AttestationProvider, BoxFuture, KeyError, KeyName, KeyProvider, PreviousKey,
+    ReleasedKey,
 };
 
 /// Reads `{dir}/{name}.jwk`, and `{dir}/{name}.previous.jwk` if present.
+/// The current version replaced the previous one when `{name}.jwk` was last
+/// written, so rotating a dev key means moving `{name}.jwk` to
+/// `{name}.previous.jwk` and creating a new `{name}.jwk`.
 pub struct LocalDev {
     dir: PathBuf,
 }
@@ -26,13 +31,30 @@ impl LocalDev {
     }
 }
 
+/// When `path` was last written.
+fn modified(path: &Path) -> Result<DateTime<Utc>, KeyError> {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .map(DateTime::<Utc>::from)
+        .map_err(|e| {
+            KeyError::fatal(format!(
+                "dev key {} has no modification time: {e}",
+                path.display()
+            ))
+        })
+}
+
 impl KeyProvider for LocalDev {
     fn release(&self, key: KeyName) -> BoxFuture<'_, Result<ReleasedKey, KeyError>> {
         Box::pin(async move {
-            let current = read_key(&key_path(&self.dir, key))?;
+            let current_path = key_path(&self.dir, key);
+            let current = read_key(&current_path)?;
             let previous_path = previous_key_path(&self.dir, key);
             let previous = if previous_path.exists() {
-                Some(read_key(&previous_path)?)
+                Some(PreviousKey {
+                    key: read_key(&previous_path)?,
+                    replaced_at: modified(&current_path)?,
+                })
             } else {
                 None
             };
@@ -77,6 +99,23 @@ mod tests {
             .await
             .expect("release");
         assert!(key.previous.is_none());
+
+        // A rotation: the old version moves aside and a new one is written.
+        let current = key_path(&dir, KeyName::Transport);
+        let old = read_key(&current).unwrap();
+        std::fs::rename(&current, previous_key_path(&dir, KeyName::Transport)).unwrap();
+        generate_missing(&dir).expect("a new version");
+        let switched = chrono::Utc::now() - chrono::Duration::hours(3);
+        std::fs::File::options()
+            .write(true)
+            .open(&current)
+            .and_then(|f| f.set_modified(switched.into()))
+            .unwrap();
+        let rotated = provider.release(KeyName::Transport).await.expect("both");
+        let previous = rotated.previous.expect("the previous version");
+        assert_eq!(previous.key.public_key(), old.public_key());
+        assert_ne!(rotated.current.public_key(), old.public_key());
+        assert!((previous.replaced_at - switched).num_seconds().abs() <= 1);
 
         let runtime = serde_json::json!({ "keys": [key.current.public_jwk()] });
         let token = provider.attest(&runtime).await.expect("token");
