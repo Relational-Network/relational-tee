@@ -8,6 +8,7 @@
 
 use std::env;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+#[cfg(feature = "dev")]
 use std::path::PathBuf;
 
 use crate::store::azure::{AzureConfig, CredentialConfig};
@@ -83,11 +84,9 @@ pub const MAX_BODY_SIZE: usize = 50 * 1024 * 1024;
 /// How the server speaks to clients.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Transport {
-    /// HTTPS with a PEM certificate chain and private key read from disk.
-    Tls {
-        cert_path: PathBuf,
-        key_path: PathBuf,
-    },
+    /// HTTPS with `tls-key`, for `hostname`, with the certificate chain from
+    /// the `tls` container.
+    Https { hostname: String },
     /// Plain HTTP. Not compiled into release builds.
     #[cfg(feature = "dev")]
     PlainHttp,
@@ -149,7 +148,7 @@ pub struct ServerConfig {
 }
 
 impl ServerConfig {
-    /// Read `BIND_ADDR`, `PORT`, `TLS_CERT_PATH`, `TLS_KEY_PATH`,
+    /// Read `BIND_ADDR`, `PORT`, `TRANSPORT`, `API_HOSTNAME`,
     /// and the key provider and storage settings (see
     /// [`key_provider_from_lookup`] and [`storage_from_lookup`]).
     pub fn from_env() -> Result<Self, String> {
@@ -170,25 +169,7 @@ impl ServerConfig {
             None => DEFAULT_PORT,
         };
 
-        let transport = match (lookup("TLS_CERT_PATH"), lookup("TLS_KEY_PATH")) {
-            (Some(cert), Some(key)) => Transport::Tls {
-                cert_path: cert.into(),
-                key_path: key.into(),
-            },
-            (None, None) => {
-                #[cfg(feature = "dev")]
-                {
-                    Transport::PlainHttp
-                }
-                #[cfg(not(feature = "dev"))]
-                {
-                    return Err("TLS_CERT_PATH and TLS_KEY_PATH are required: \
-                                release builds never serve plain HTTP"
-                        .into());
-                }
-            }
-            _ => return Err("set both TLS_CERT_PATH and TLS_KEY_PATH, or neither".into()),
-        };
+        let transport = transport_from_lookup(&lookup)?;
 
         #[cfg(not(feature = "dev"))]
         if lookup("DEV_TOKEN_KEY").is_some() {
@@ -208,6 +189,46 @@ impl ServerConfig {
             #[cfg(feature = "dev")]
             dev_token_key: dev_token_key_from_lookup(&lookup),
         })
+    }
+}
+
+/// Read `TRANSPORT` and `API_HOSTNAME`. Release builds serve only HTTPS and
+/// require the hostname; dev builds default to plain HTTP, and to
+/// `localhost` for `TRANSPORT=https`.
+fn transport_from_lookup(lookup: &impl Fn(&str) -> Option<String>) -> Result<Transport, String> {
+    if lookup("TLS_CERT_PATH").is_some() || lookup("TLS_KEY_PATH").is_some() {
+        return Err(
+            "TLS_CERT_PATH and TLS_KEY_PATH are no longer read: the worker serves \
+                    tls-key with the chain for it in the tls container"
+                .into(),
+        );
+    }
+    #[cfg(feature = "dev")]
+    let default = "http";
+    #[cfg(not(feature = "dev"))]
+    let default = "https";
+    match lookup("TRANSPORT").as_deref().unwrap_or(default) {
+        "https" => {
+            #[cfg(feature = "dev")]
+            let hostname = lookup("API_HOSTNAME").unwrap_or_else(|| "localhost".into());
+            #[cfg(not(feature = "dev"))]
+            let hostname = lookup("API_HOSTNAME").ok_or("API_HOSTNAME is required")?;
+            let valid = !hostname.is_empty()
+                && hostname.bytes().all(|b| {
+                    b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'.')
+                });
+            if !valid {
+                return Err(format!(
+                    "API_HOSTNAME {hostname:?} must be a lowercase DNS name"
+                ));
+            }
+            Ok(Transport::Https { hostname })
+        }
+        #[cfg(feature = "dev")]
+        "http" => Ok(Transport::PlainHttp),
+        #[cfg(not(feature = "dev"))]
+        "http" => Err("TRANSPORT=http isn't available: release builds serve only HTTPS".into()),
+        other => Err(format!("TRANSPORT {other:?} must be https or http")),
     }
 }
 
@@ -628,9 +649,8 @@ mod tests {
     const DASHBOARD: &str = "33333333-3333-3333-3333-333333333333";
 
     /// Settings a release build requires.
-    const RELEASE_BASE: [(&str, &str); 8] = [
-        ("TLS_CERT_PATH", "c"),
-        ("TLS_KEY_PATH", "k"),
+    const RELEASE_BASE: [(&str, &str); 7] = [
+        ("API_HOSTNAME", "api.pilot.example"),
         ("KEY_VAULT_URL", "kv.vault.azure.net"),
         ("STORAGE_BLOB_URL", "https://acct.blob.core.windows.net"),
         ("ENTRA_TENANT_ID", TENANT),
@@ -732,24 +752,29 @@ mod tests {
         let config = complete(&[
             ("BIND_ADDR", "::1"),
             ("PORT", "9443"),
-            ("TLS_CERT_PATH", "cert.pem"),
-            ("TLS_KEY_PATH", "key.pem"),
+            ("TRANSPORT", "https"),
         ])
         .expect("valid config");
         assert_eq!(config.addr, "[::1]:9443".parse().unwrap());
         assert_eq!(
             config.transport,
-            Transport::Tls {
-                cert_path: "cert.pem".into(),
-                key_path: "key.pem".into(),
+            Transport::Https {
+                hostname: "api.pilot.example".into()
             }
         );
     }
 
     #[test]
-    fn server_config_rejects_half_a_tls_pair_and_bad_values() {
-        assert!(config_from(&[("TLS_CERT_PATH", "cert.pem")]).is_err());
-        assert!(config_from(&[("TLS_KEY_PATH", "key.pem")]).is_err());
+    fn server_config_rejects_certificate_files_and_bad_values() {
+        let err = complete(&[("TLS_CERT_PATH", "cert.pem")]).unwrap_err();
+        assert!(err.contains("tls-key"), "{err}");
+        assert!(complete(&[("TLS_KEY_PATH", "key.pem")]).is_err());
+        assert!(complete(&[("TRANSPORT", "quic")]).is_err());
+        assert!(complete(&[
+            ("TRANSPORT", "https"),
+            ("API_HOSTNAME", "https://api.example")
+        ])
+        .is_err());
         assert!(complete(&[("PORT", "http")]).is_err());
         assert!(complete(&[("BIND_ADDR", "localhost")]).is_err());
         assert!(complete(&[("RATE_LIMIT_IP_BURST", "0")]).is_err());
@@ -777,14 +802,24 @@ mod tests {
         let config = config_from(&[]).expect("dev defaults");
         assert_eq!(config.addr, "127.0.0.1:8443".parse().unwrap());
         assert_eq!(config.transport, Transport::PlainHttp);
+        let config = config_from(&[("TRANSPORT", "https")]).unwrap();
+        assert_eq!(
+            config.transport,
+            Transport::Https {
+                hostname: "localhost".into()
+            }
+        );
     }
 
     #[cfg(not(feature = "dev"))]
     #[test]
-    fn release_build_requires_tls() {
-        assert!(config_from(&base_without(&["TLS_CERT_PATH", "TLS_KEY_PATH"])).is_err());
-        let config = complete(&[]).expect("release config with TLS");
+    fn release_build_serves_only_https_for_its_hostname() {
+        assert!(config_from(&base_without(&["API_HOSTNAME"])).is_err());
+        let err = complete(&[("TRANSPORT", "http")]).unwrap_err();
+        assert!(err.contains("only HTTPS"), "{err}");
+        let config = complete(&[]).expect("release config");
         assert_eq!(config.addr, "0.0.0.0:8443".parse().unwrap());
+        assert!(matches!(config.transport, Transport::Https { .. }));
     }
 
     #[test]

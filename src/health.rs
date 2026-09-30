@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::{extract::State, http::StatusCode, Json};
-use chrono::{DateTime, Utc};
+use chrono::DateTime;
 use serde::Serialize;
 use tokio::time::Instant;
 use tracing::{info, warn};
@@ -31,6 +31,7 @@ use crate::blockchain::SolanaClient;
 use crate::state::AppState;
 use crate::storage::Storage;
 use crate::tee::WorkerKeys;
+use crate::tls::Certificates;
 
 /// How often the storage canary runs.
 pub const CANARY_INTERVAL: Duration = Duration::from_secs(20);
@@ -47,8 +48,8 @@ pub const DRAIN_GRACE: Duration = Duration::from_secs(40);
 /// The certificate the worker serves.
 #[derive(Debug, Clone)]
 pub enum Certificate {
-    /// A PEM certificate chain read at startup.
-    File { not_after: Option<DateTime<Utc>> },
+    /// `tls-key` with the chain from the `tls` container, once there is one.
+    TlsKey(Arc<Certificates>),
     /// No certificate: plain HTTP. Dev builds only.
     #[cfg(feature = "dev")]
     PlainHttp,
@@ -103,7 +104,7 @@ impl Health {
 
     fn certificate_ok(&self) -> bool {
         match &self.certificate {
-            Certificate::File { not_after } => not_after.is_none_or(|t| t > Utc::now()),
+            Certificate::TlsKey(certificates) => certificates.valid(),
             #[cfg(feature = "dev")]
             Certificate::PlainHttp => true,
         }
@@ -206,8 +207,14 @@ pub struct ReadinessResponse {
 /// The served certificate.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct CertificateDetails {
-    /// `file`, or `none` for plain HTTP in dev builds.
+    /// `tls-key`, or `none` for plain HTTP in dev builds.
     pub source: String,
+    /// The hex SHA-256 of `tls-key`'s SubjectPublicKeyInfo, which names its
+    /// chain and CSR in the `tls` container.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spki_sha256: Option<String>,
+    /// A chain for `tls-key` is loaded.
+    pub loaded: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub not_after: Option<String>,
 }
@@ -301,13 +308,20 @@ pub async fn health(State(state): State<AppState>) -> Json<HealthDetails> {
     let jwks_cache_age_seconds = state.auth.keys_age().await.map(|age| age.as_secs());
     let token = state.attestation.token();
     let certificate = match &h.certificate {
-        Certificate::File { not_after } => CertificateDetails {
-            source: "file".into(),
-            not_after: not_after.map(|t| t.to_rfc3339()),
-        },
+        Certificate::TlsKey(certificates) => {
+            let status = certificates.status();
+            CertificateDetails {
+                source: "tls-key".into(),
+                spki_sha256: Some(status.spki_sha256),
+                loaded: status.loaded,
+                not_after: status.not_after.map(|t| t.to_rfc3339()),
+            }
+        }
         #[cfg(feature = "dev")]
         Certificate::PlainHttp => CertificateDetails {
             source: "none".into(),
+            spki_sha256: None,
+            loaded: false,
             not_after: None,
         },
     };
@@ -440,10 +454,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn ready_only_with_a_fresh_canary_a_valid_certificate_and_no_drain() {
-        let valid = Certificate::File {
-            not_after: Some(Utc::now() + chrono::Duration::days(30)),
-        };
-        let h = health(valid);
+        let h = health(Certificate::TlsKey(crate::tls::tests::serving()));
         assert_eq!(h.readiness().status, "not_ready", "no canary yet");
 
         h.record_canary(Ok(()));
@@ -465,10 +476,14 @@ mod tests {
     }
 
     #[test]
-    fn an_expired_certificate_is_not_ready() {
-        let h = health(Certificate::File {
-            not_after: Some(Utc::now() - chrono::Duration::minutes(1)),
-        });
+    fn no_chain_is_not_ready() {
+        let certificates = crate::tls::Certificates::new(
+            &crate::tee::tests::fixed_key(3),
+            "localhost",
+            Arc::new(crate::store::files::LocalFiles::temporary()),
+        )
+        .unwrap();
+        let h = health(Certificate::TlsKey(Arc::new(certificates)));
         h.record_canary(Ok(()));
         assert!(!h.readiness().certificate);
         assert_eq!(h.readiness().status, "not_ready");

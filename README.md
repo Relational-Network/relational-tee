@@ -6,7 +6,7 @@ The worker behind IOB MicRes: an Axum server that runs Use Case 1 credential poo
 
 ## What works today, and what's interim
 
-- **Transport.** Dev builds serve plain HTTP on `127.0.0.1:8443`, or HTTPS with a local mkcert certificate. Release builds have no plain HTTP path: they read a PEM certificate and key from `TLS_CERT_PATH` and `TLS_KEY_PATH`, and refuse to start without them.
+- **Transport.** The worker serves HTTPS (TLS 1.3, rustls with aws-lc-rs) with `tls-key`, which is released only to attested workers and never written anywhere. Its certificate chain is `{spki_sha256}/chain.pem` in the public `tls` container, where `spki_sha256` is the hex SHA-256 of the key's SubjectPublicKeyInfo, so clients can pin the key across renewals. While there's no chain, any worker writes a CSR for `API_HOSTNAME`, signed with `tls-key`, to `{spki_sha256}/csr.pem`, create-only, for the certificate job to sign; workers look for the chain every 10 seconds until they have one, then every 5 minutes, and swap renewals in without a restart. A chain whose leaf isn't `tls-key`'s is ignored and logged with `alert = "tls_chain_mismatch"`. Readiness requires a loaded, unexpired chain. Release builds have no plain HTTP path; dev builds serve plain HTTP on `127.0.0.1:8443` unless `TRANSPORT=https`, and `just dev-cert` is their certificate job.
 - **Keys.** At startup the worker obtains four P-256 keys, `transport-key`, `storage-root`, `tls-key` and `commitment-key`, and keeps them in memory only. Release builds get them from Microsoft's SKR sidecar on localhost (`KEY_PROVIDER=skr`), which releases a key only to a confidential container group whose attested policy matches the key's release policy. Dev builds default to `KEY_PROVIDER=local`, which reads dev keys from `dev/keys/` (`just dev-keys` creates them); release builds don't contain that provider and refuse `KEY_PROVIDER=local`. Uploads are sealed to `transport-key`, which every worker shares.
 - **Storage.** All durable state lives in Azure Blob Storage as documents sealed inside the worker with a key derived from `storage-root` (see [Storage](#storage)); workers keep nothing on local disk. Dev builds default to the same sealed objects in local files under `./data`.
 - **Auth.** Protected endpoints take Entra ID access tokens for the worker's API app registration. A token must be RS256, signed by a key from the pinned tenant's JWKS (`https://login.microsoftonline.com/{tid}/discovery/v2.0/keys`, cached for 24 hours, fetched by one request at a time, and refetched for an unknown `kid` at most once a minute), with that tenant's exact `iss` and `tid`, the API's client ID as `aud`, an allowed client as `azp`, and `access_as_user` in `scp`; `exp` and `nbf` allow 60 seconds of skew. jsonwebtoken verifies RS256 through aws-lc-rs, so the `rsa` crate stays out. A caller's `(tid, oid)` maps to an internal `user_id`, created at their first sign-in; every stored reference to a person uses it. The `Admin` app role grants the permissions `pools:read`, `pools:create`, `pools:write`, `wallets:read` and `users:read`, and is itself required for wallet creation, deletion and sends and for `/v1/admin/…`; a caller with no role can call only `/v1/users/me` and the pool list. Pool writes also need pool ownership, and wallet routes wallet ownership.
@@ -29,7 +29,7 @@ just            # list the recipes
 | `just dev-keys` | Create any missing dev keys in `dev/keys/`: one private JWK per key, the dev MAA signing key and the dev token signing key; existing keys are kept |
 | `just dev-token` | Print a token signed with the dev token signing key: `Admin` by default; `--roles`, `--oid`, `--tid`, `--email`, `--name` and `--azp` change it, and `--bad expired\|not-yet-valid\|audience\|tenant\|client\|scope` makes one the worker must refuse |
 | `just skr` | Run the fake SKR sidecar on `127.0.0.1:9000`; start the worker with `KEY_PROVIDER=skr` to use it |
-| `just cert` | Create a locally trusted mkcert certificate in `dev/certs/`; `just dev` then serves HTTPS |
+| `just dev-cert` | The local certificate job: sign each pending CSR in `data/tls/` with mkcert's local CA (`TRANSPORT=https just dev` writes one; run `mkcert -install` once so browsers trust it) |
 | `just test` | Run the tests with cargo-nextest, in the release and dev configurations; storage tests use local files in temporary directories |
 | `just azurite` | Start Azurite's Blob service, the Azure Storage emulator, in Docker on `127.0.0.1:10000`, data in memory; `just azurite-stop` stops it |
 | `just test-azurite` | Run the store conformance tests against Azurite, starting it first if needed |
@@ -80,7 +80,8 @@ Never print, log or commit a real token.
 |---|---|---|---|
 | `BIND_ADDR` | `127.0.0.1` | `0.0.0.0` | Listening IP address |
 | `PORT` | `8443` | `8443` | Listening port |
-| `TLS_CERT_PATH`, `TLS_KEY_PATH` | unset: plain HTTP | required | PEM certificate chain and private key |
+| `TRANSPORT` | `http` | `https` (the only one) | `https` serves `tls-key` with its chain from the `tls` container |
+| `API_HOSTNAME` | `localhost` | required | The name the CSR asks for (`localhost` also gets `127.0.0.1` and `::1`) |
 | `KEY_PROVIDER` | `local` | `skr` (the only one) | Where keys come from: the SKR sidecar, or dev key files |
 | `DEV_KEYS_DIR` | `dev/keys` | n/a | Dev key files for `KEY_PROVIDER=local` |
 | `SKR_ENDPOINT` | `http://localhost:9000` | same, loopback only | SKR sidecar address |

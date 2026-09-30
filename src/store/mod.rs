@@ -28,10 +28,12 @@ pub mod sealed;
 /// The sealed container holding every document and dataset.
 pub const STATE: &str = "state";
 
+/// The public container of certificate chains and CSRs.
+pub const TLS: &str = "tls";
+
 /// Every container the worker creates at startup: `state`, and the public
-/// `tls` (certificate chains and CSRs) and `reference-values` (signed
-/// manifests) that CD writes.
-pub const CONTAINERS: [&str; 3] = [STATE, "tls", "reference-values"];
+/// `tls` and `reference-values` (signed manifests) that CD writes.
+pub const CONTAINERS: [&str; 3] = [STATE, TLS, "reference-values"];
 
 /// An opaque version tag for compare-and-swap writes, in quoted form.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]

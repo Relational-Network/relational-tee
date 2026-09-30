@@ -347,14 +347,14 @@ fn token_verifier(config: &ServerConfig) -> auth::entra::Verifier {
     verifier
 }
 
-/// Open the sealed `state` container. On Azure, any missing container is
-/// created first.
+/// Open the sealed `state` container, and the public `tls` container. On
+/// Azure, any missing container is created first.
 async fn open_storage(
     config: &StorageConfig,
     keys: storage::StorageKeys,
     worker_id: String,
-) -> Result<storage::Storage, String> {
-    let state: Arc<dyn store::ObjectStore> = match config {
+) -> Result<(storage::Storage, Arc<dyn store::ObjectStore>), String> {
+    let (state, tls): (Arc<dyn store::ObjectStore>, Arc<dyn store::ObjectStore>) = match config {
         StorageConfig::Azure(azure) => {
             let state = store::azure::AzureBlob::new(azure, store::STATE)?;
             for name in store::CONTAINERS {
@@ -365,15 +365,19 @@ async fn open_storage(
                     .map_err(|e| format!("preparing storage at {}: {e}", azure.blob_url))?;
             }
             info!(blob = %azure.blob_url, "Storage ready");
-            Arc::new(state)
+            let tls = state.container(store::TLS);
+            (Arc::new(state), Arc::new(tls))
         }
         #[cfg(feature = "dev")]
         StorageConfig::Files { dir } => {
             warn!(dir = %dir.display(), "STORAGE_BACKEND=files: sealed objects in local files (dev builds only)");
-            Arc::new(store::files::LocalFiles::new(dir.join(store::STATE)))
+            (
+                Arc::new(store::files::LocalFiles::new(dir.join(store::STATE))),
+                Arc::new(store::files::LocalFiles::new(dir.join(store::TLS))),
+            )
         }
     };
-    Ok(storage::Storage::new(state, keys, worker_id))
+    Ok((storage::Storage::new(state, keys, worker_id), tls))
 }
 
 /// Service entrypoint: read configuration, build the router, and serve.
@@ -423,7 +427,7 @@ async fn main() {
     // Sealed Blob storage, with keys derived from storage-root.
     let worker_id = uuid::Uuid::new_v4().to_string();
     info!(worker_id = %worker_id, "Worker identity for this process");
-    let storage = open_storage(
+    let (storage, tls_store) = open_storage(
         &server_config.storage,
         storage::StorageKeys::derive(&keys.get(KeyName::StorageRoot).current),
         worker_id,
@@ -459,15 +463,29 @@ async fn main() {
 
     // What readiness reports, kept current in the background.
     let certificate = match &server_config.transport {
-        Transport::Tls { cert_path, .. } => Certificate::File {
-            not_after: std::fs::read(cert_path)
-                .ok()
-                .and_then(|pem| tls::leaf_not_after(&pem)),
-        },
+        Transport::Https { hostname } => {
+            let certificates =
+                tls::Certificates::new(&keys.get(KeyName::Tls).current, hostname, tls_store)
+                    .unwrap_or_else(|e| {
+                        tracing::error!("TLS setup failed: {e}");
+                        std::process::exit(1);
+                    });
+            info!(
+                hostname,
+                spki_sha256 = certificates.spki_sha256(),
+                "Serving tls-key"
+            );
+            let certificates = Arc::new(certificates);
+            certificates.spawn();
+            Certificate::TlsKey(certificates)
+        }
         #[cfg(feature = "dev")]
-        Transport::PlainHttp => Certificate::PlainHttp,
+        Transport::PlainHttp => {
+            drop(tls_store);
+            Certificate::PlainHttp
+        }
     };
-    let health = Arc::new(health::Health::new(&keys, certificate));
+    let health = Arc::new(health::Health::new(&keys, certificate.clone()));
 
     // Create shared application state.
     let state = AppState {
@@ -495,22 +513,11 @@ async fn main() {
     let handle = axum_server::Handle::new();
     health::spawn_drain(health, handle.clone());
 
-    match server_config.transport {
-        Transport::Tls {
-            cert_path,
-            key_path,
-        } => {
+    match certificate {
+        Certificate::TlsKey(certificates) => {
             let tls_config =
-                axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert_path, &key_path)
-                    .await
-                    .unwrap_or_else(|e| {
-                        panic!(
-                            "failed to load TLS certificate {} and key {}: {e}",
-                            cert_path.display(),
-                            key_path.display()
-                        )
-                    });
-            info!(%addr, cert = %cert_path.display(), "Serving HTTPS");
+                axum_server::tls_rustls::RustlsConfig::from_config(certificates.server_config());
+            info!(%addr, "Serving HTTPS");
             axum_server::bind_rustls(addr, tls_config)
                 .handle(handle)
                 .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
@@ -518,7 +525,7 @@ async fn main() {
                 .expect("server error");
         }
         #[cfg(feature = "dev")]
-        Transport::PlainHttp => {
+        Certificate::PlainHttp => {
             if addr.ip().is_loopback() {
                 warn!(%addr, "Serving plain HTTP (dev build)");
             } else {

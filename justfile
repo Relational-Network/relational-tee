@@ -25,15 +25,10 @@ nix_config := "experimental-features = nix-command flakes\nsandbox = false\nfilt
 default:
     @just --list
 
-# Run the dev build natively on 127.0.0.1:8443 (HTTPS once `just cert` has run).
+# Run the dev build natively on 127.0.0.1:8443: plain HTTP, or with
+# TRANSPORT=https, tls-key once `just dev-cert` has signed its CSR.
 dev *args: dev-keys
-    #!/usr/bin/env bash
-    set -euo pipefail
-    if [[ -f dev/certs/cert.pem && -f dev/certs/key.pem ]]; then
-        export TLS_CERT_PATH="${TLS_CERT_PATH:-dev/certs/cert.pem}"
-        export TLS_KEY_PATH="${TLS_KEY_PATH:-dev/certs/key.pem}"
-    fi
-    exec cargo run --features dev,swagger-ui -- {{ args }}
+    cargo run --features dev,swagger-ui -- {{ args }}
 
 # Create any missing dev keys in dev/keys/; existing keys are kept.
 dev-keys:
@@ -49,11 +44,24 @@ dev-token *args:
 skr: dev-keys
     cargo run --features dev -- fake-skr
 
-# Create a locally trusted certificate for localhost with mkcert.
-cert:
-    mkdir -p dev/certs
-    mkcert -install
-    mkcert -cert-file dev/certs/cert.pem -key-file dev/certs/key.pem localhost 127.0.0.1 ::1
+# The local certificate job: sign each CSR in the files store's tls
+# container that has no chain yet with mkcert's local CA, writing chain.pem
+# beside it. The worker picks the chain up within 10 seconds. Run
+# `mkcert -install` once so browsers trust the CA.
+dev-cert:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    dir="${DATA_DIR:-./data}/tls"
+    shopt -s nullglob
+    signed=0
+    for csr in "$dir"/*/csr.pem; do
+        chain="$(dirname "$csr")/chain.pem"
+        [[ -e "$chain" ]] && continue
+        mkcert -csr "$csr" -cert-file "$chain.tmp"
+        mv "$chain.tmp" "$chain"
+        signed=$((signed + 1))
+    done
+    echo "Signed $signed CSR(s) in $dir"
 
 # Run the tests in the release and dev configurations.
 test *args:

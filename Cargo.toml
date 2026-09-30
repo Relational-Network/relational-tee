@@ -39,7 +39,8 @@ rustls = { version = "0.23.36", default-features = false, features = ["aws-lc-rs
 # The rsa crate has unfixed vulnerability RUSTSEC-2023-0071 (Marvin Attack)
 # aws_lc_rs provides CryptoProvider without the vulnerable rsa crate (uses AWS-LC/BoringSSL)
 jsonwebtoken = { version = "10.3.0", default-features = false, features = [ "p256", "aws_lc_rs"] }
-p256 = { version = "0.13.2", default-features = false , features = ["ecdh"]}
+p256 = { version = "0.13.2", default-features = false , features = ["ecdh", "pkcs8"]}
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 sha2 = { version = "0.10.9", default-features = false }
 hmac = { version = "0.12", default-features = false }
 base64 = { version = "0.22.1", default-features = false }

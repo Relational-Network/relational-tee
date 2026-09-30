@@ -55,9 +55,7 @@ impl AppState {
 
         let keys = Arc::new(crate::tee::tests::test_keys());
         let attestation = Arc::new(Attestation::new(&keys.get(KeyName::Transport).current));
-        let certificate = Certificate::File {
-            not_after: Some(chrono::Utc::now() + chrono::Duration::days(30)),
-        };
+        let certificate = Certificate::TlsKey(crate::tls::tests::serving());
         let health = Arc::new(Health::new(&keys, certificate));
         let unreachable = "http://127.0.0.1:9";
         Self {

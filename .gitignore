@@ -9,8 +9,5 @@ drt-examples/mean/target
 
 SPRINT*
 
-# Local mkcert certificates (just cert)
-/dev/certs/
-
 # Dev keys (just dev-keys); only dev builds read them
 /dev/keys/
