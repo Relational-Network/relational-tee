@@ -252,8 +252,9 @@ async fn openapi_json() -> axum::Json<utoipa::openapi::OpenApi> {
 
 /// Dev-only commands: `relational-tee dev-keys [DIR]` creates any missing dev
 /// key files, `relational-tee dev-token …` prints a token signed with the dev
-/// token signing key, and `relational-tee fake-skr` runs the fake SKR sidecar.
-/// Returns the exit code when the arguments name a command.
+/// token signing key, `relational-tee dev-manifest …` signs and stores a dev
+/// reference-values manifest, and `relational-tee fake-skr` runs the fake
+/// SKR sidecar. Returns the exit code when the arguments name a command.
 #[cfg(feature = "dev")]
 async fn run_dev_command(args: &[String]) -> Option<i32> {
     let command = args.get(1)?;
@@ -294,9 +295,11 @@ async fn run_dev_command(args: &[String]) -> Option<i32> {
             }
         }
         "dev-token" => Some(auth::dev_token::run(&args[2..])),
+        "dev-manifest" => Some(reference_values::dev::run(&args[2..]).await),
         other => {
             eprintln!(
-                "error: unknown command {other:?} (dev commands: dev-keys, dev-token, fake-skr)"
+                "error: unknown command {other:?} (dev commands: dev-keys, dev-token, \
+                 dev-manifest, fake-skr)"
             );
             Some(2)
         }

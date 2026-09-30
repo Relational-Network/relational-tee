@@ -42,6 +42,15 @@ dev-token *args:
     @cargo run --quiet --features dev -- dev-keys dev/keys >&2
     @cargo run --quiet --features dev -- dev-token "$@"
 
+# Sign a dev reference-values manifest that approves the dev keys and the fake
+# MAA, store it where dev workers serve it, and print the public key a
+# dashboard pins (`just dev-manifest --help` lists the options, including
+# deliberately bad manifests).
+[positional-arguments]
+dev-manifest *args:
+    @cargo run --quiet --features dev -- dev-keys dev/keys >&2
+    @cargo run --quiet --features dev -- dev-manifest --commit "$(git rev-parse HEAD 2>/dev/null || echo dev)" "$@"
+
 # Run the fake SKR sidecar on 127.0.0.1:9000 (use KEY_PROVIDER=skr in the worker).
 skr: dev-keys
     cargo run --features dev -- fake-skr

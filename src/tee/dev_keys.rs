@@ -2,8 +2,8 @@
 // Copyright (C) 2026 Relational Network
 
 //! Dev key files (dev builds only): one private JWK per worker key, in the
-//! format the SKR sidecar releases, the dev MAA signing key and the dev
-//! token signing key, under `dev/keys/` by default.
+//! format the SKR sidecar releases, the dev MAA signing key, the dev token
+//! signing key and the dev manifest key, under `dev/keys/` by default.
 //!
 //! These keys stand in for Key Vault. They are never used outside dev builds,
 //! and the directory is gitignored.
@@ -54,9 +54,9 @@ pub fn read_key(path: &Path) -> Result<EcKey, KeyError> {
     EcKey::from_jwk(&jwk)
 }
 
-/// Create any missing dev key files in `dir`: the four worker keys and the
-/// dev MAA signing key. Existing files are never overwritten. Returns the
-/// paths it created.
+/// Create any missing dev key files in `dir`: the four worker keys, the dev
+/// MAA signing key, the dev token signing key and the dev manifest key.
+/// Existing files are never overwritten. Returns the paths it created.
 pub fn generate_missing(dir: &Path) -> io::Result<Vec<PathBuf>> {
     fs::create_dir_all(dir)?;
     let mut created = Vec::new();
@@ -71,6 +71,7 @@ pub fn generate_missing(dir: &Path) -> io::Result<Vec<PathBuf>> {
     }
     created.extend(super::dev_maa::generate_missing(dir)?);
     created.extend(crate::auth::dev_token::generate_missing(dir)?);
+    created.extend(crate::reference_values::dev::generate_missing(dir)?);
     Ok(created)
 }
 
@@ -104,7 +105,7 @@ mod tests {
     fn generates_each_key_once_and_reads_it_back() {
         let dir = temp_dir("dev-keys");
         let created = generate_missing(&dir).expect("generate");
-        assert_eq!(created.len(), KeyName::ALL.len() + 2);
+        assert_eq!(created.len(), KeyName::ALL.len() + 3);
         let first = read_key(&key_path(&dir, KeyName::Transport)).expect("read");
 
         assert!(generate_missing(&dir).expect("second run").is_empty());

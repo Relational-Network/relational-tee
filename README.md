@@ -11,6 +11,7 @@ The worker behind IOB MicRes: an Axum server that runs Use Case 1 credential poo
 - **Storage.** All durable state lives in Azure Blob Storage as documents sealed inside the worker with a key derived from `storage-root` (see [Storage](#storage)); workers keep nothing on local disk. Dev builds default to the same sealed objects in local files under `./data`.
 - **Auth.** Protected endpoints take Entra ID access tokens for the worker's API app registration. A token must be RS256, signed by a key from the pinned tenant's JWKS (`https://login.microsoftonline.com/{tid}/discovery/v2.0/keys`, cached for 24 hours, fetched by one request at a time, and refetched for an unknown `kid` at most once a minute), with that tenant's exact `iss` and `tid`, the API's client ID as `aud`, an allowed client as `azp`, and `access_as_user` in `scp`; `exp` and `nbf` allow 60 seconds of skew. jsonwebtoken verifies RS256 through aws-lc-rs, so the `rsa` crate stays out. A caller's `(tid, oid)` maps to an internal `user_id`, created at their first sign-in; every stored reference to a person uses it. The `Admin` app role grants the permissions `pools:read`, `pools:create`, `pools:write`, `wallets:read` and `users:read`, and is itself required for wallet creation, deletion and sends and for `/v1/admin/…`; a caller with no role can call only `/v1/users/me` and the pool list. Pool writes also need pool ownership, and wallet routes wallet ownership.
 - **Dev tokens.** Dev builds also trust one more key, the dev token signing key `dev/keys/entra-signing-key.pem` (`just dev-keys` creates it), so tests, scripts and CI can call the API offline: `just dev-token` prints a token for it (see [Running it locally](#running-it-locally)). Release builds contain none of this code and refuse `DEV_TOKEN_KEY`.
+- **Dev manifest.** Dev builds can sign a dev reference-values manifest with the dev manifest key `dev/keys/manifest-signing-key.jwk` (`just dev-keys` creates it), so a dashboard that pins that key verifies local workers as it verifies real ones (see [The dev manifest](#the-dev-manifest)). Release builds contain no signing code; their manifests come from CD.
 - **Solana.** The public devnet RPC by default. It is rate-limited and has no SLA, and the server warns about it at startup.
 
 ## Develop locally
@@ -26,8 +27,9 @@ just            # list the recipes
 | Recipe | What it does |
 |---|---|
 | `just dev` | Run the dev build natively on `127.0.0.1:8443`, with Swagger UI at `/docs` (creates missing dev keys first) |
-| `just dev-keys` | Create any missing dev keys in `dev/keys/`: one private JWK per key, the dev MAA signing key and the dev token signing key; existing keys are kept |
+| `just dev-keys` | Create any missing dev keys in `dev/keys/`: one private JWK per key, the dev MAA signing key, the dev token signing key and the dev manifest key; existing keys are kept |
 | `just dev-token` | Print a token signed with the dev token signing key: `Admin` by default; `--roles`, `--oid`, `--tid`, `--email`, `--name` and `--azp` change it, and `--bad expired\|not-yet-valid\|audience\|tenant\|client\|scope` makes one the worker must refuse |
+| `just dev-manifest` | Sign a dev reference-values manifest and store it where dev workers serve it (see [The dev manifest](#the-dev-manifest)); `--public-key` prints the key a dashboard pins, `--sequence` and `--days` change the manifest, and `--bad expired\|host-data\|transport-key\|signature` makes one a dashboard must refuse |
 | `just skr` | Run the fake SKR sidecar on `127.0.0.1:9000`; start the worker with `KEY_PROVIDER=skr` to use it |
 | `just dev-cert` | The local certificate job: sign each pending CSR in `data/tls/` with mkcert's local CA (`TRANSPORT=https just dev` writes one; run `mkcert -install` once so browsers trust it) |
 | `just test` | Run the tests with cargo-nextest, in the release and dev configurations; storage tests use local files in temporary directories |
@@ -53,6 +55,12 @@ Dev builds include `relational-tee fake-skr`, a stand-in for Microsoft's SKR sid
 | `DEV_KEYS_DIR` | `dev/keys` | Dev keys to release and sign with |
 
 Not there yet: a fault-injection suite for the idempotency work, and a debug-mode sandbox on Azure.
+
+### The dev manifest
+
+`just dev-manifest` signs a reference-values manifest (ES256) with the dev manifest key and stores it as `reference-values/{ENVIRONMENT}/{sequence}.jws` and `latest.jws` in the storage the environment names (`STORAGE_BACKEND`, `DATA_DIR`; by default `./data/reference-values/dev/`), where dev workers pick it up within 10 seconds. It approves what dev workers present: the fake MAA's claim set (attestation type `sevsnpvm`, compliance status `azure-compliant-uvm`, not debuggable, VMPL 0, the fixed dev host data) with `FAKE_MAA_ISSUER` (default `http://localhost:9000`) as its authority, the dev transport key's thumbprint (and the previous version's, if `transport-key.previous.jwk` exists), and the SHA-256 of the dev `tls-key`'s SPKI. It is valid for 30 days, its commit is the checkout's, and its sequence is the current Unix time, or one more than the latest manifest's, so a browser that remembers the highest sequence it saw keeps accepting new ones. It prints `VITE_MANIFEST_PUBLIC_KEY=…`, the public key a dashboard's dev build pins.
+
+To run the dashboard's attestation checks against a local worker: `just skr` (it serves the fake MAA's keys at `http://localhost:9000/certs`), `just dev-manifest`, `just dev`, then `just spa` with `VITE_MANIFEST_PUBLIC_KEY` set to the printed key and `VITE_MAA_AUTHORITY=http://localhost:9000`. Sign a new manifest after 30 days, after deleting `./data`, or after changing the dev keys.
 
 ### Running it locally
 

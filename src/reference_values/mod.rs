@@ -31,6 +31,9 @@ use crate::error::ApiError;
 use crate::state::AppState;
 use crate::store::{ETag, Fetched, ObjectStore};
 
+#[cfg(feature = "dev")]
+pub mod dev;
+
 /// How often to look for a manifest before the first one loads.
 const FIRST_POLL: Duration = Duration::from_secs(10);
 /// How often to look for a newer manifest.

@@ -23,6 +23,24 @@ pub const SIGNING_KEY_FILE: &str = "maa-signing-key.pem";
 /// container group's CCE policy.
 pub const DEV_HOST_DATA: &str = "dededededededededededededededededededededededededededededededede";
 
+/// What MAA reports for a confidential container group on a compliant
+/// utility VM.
+pub const ATTESTATION_TYPE: &str = "sevsnpvm";
+pub const COMPLIANCE_STATUS: &str = "azure-compliant-uvm";
+
+/// The reference-values claim set that approves the tokens `issuer` signs:
+/// the claims every dev token carries.
+pub fn claim_set(issuer: &str) -> Value {
+    json!({
+        "authority": issuer,
+        "x-ms-attestation-type": ATTESTATION_TYPE,
+        "x-ms-compliance-status": COMPLIANCE_STATUS,
+        "x-ms-sevsnpvm-is-debuggable": false,
+        "x-ms-sevsnpvm-vmpl": 0,
+        "x-ms-sevsnpvm-hostdata": [DEV_HOST_DATA],
+    })
+}
+
 /// Default issuer: the fake SKR sidecar's default address.
 pub const DEFAULT_ISSUER: &str = "http://localhost:9000";
 
@@ -72,8 +90,8 @@ impl DevMaa {
             "nbf": now,
             "exp": now + self.lifetime.as_secs(),
             "jti": uuid::Uuid::new_v4().to_string(),
-            "x-ms-attestation-type": "sevsnpvm",
-            "x-ms-compliance-status": "azure-compliant-uvm",
+            "x-ms-attestation-type": ATTESTATION_TYPE,
+            "x-ms-compliance-status": COMPLIANCE_STATUS,
             "x-ms-runtime": runtime,
             "x-ms-sevsnpvm-hostdata": DEV_HOST_DATA,
             "x-ms-sevsnpvm-is-debuggable": false,

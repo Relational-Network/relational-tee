@@ -72,6 +72,18 @@ pub struct Status {
     pub not_after: Option<DateTime<Utc>>,
 }
 
+/// The SHA-256 of `key`'s SubjectPublicKeyInfo: in hex it names the key's
+/// chain and CSR, and the reference values pin it.
+pub fn spki_sha256(key: &EcKey) -> Result<[u8; 32], String> {
+    let pkcs8 = key
+        .secret()
+        .to_pkcs8_der()
+        .map_err(|e| format!("encoding the key: {e}"))?;
+    let key_pair = KeyPair::try_from(&PrivatePkcs8KeyDer::from(pkcs8.as_bytes()))
+        .map_err(|e| format!("loading the key: {e}"))?;
+    Ok(Sha256::digest(key_pair.subject_public_key_info()).into())
+}
+
 /// The names a CSR asks for: the API hostname and, for `localhost`, the
 /// loopback addresses too.
 fn csr_names(hostname: &str) -> Vec<String> {
@@ -99,7 +111,7 @@ impl Certificates {
             rustls::crypto::aws_lc_rs::sign::any_ecdsa_type(&PrivateKeyDer::Pkcs8(der.clone_key()))
                 .map_err(|e| format!("loading tls-key: {e}"))?;
         let key_pair = KeyPair::try_from(&der).map_err(|e| format!("loading tls-key: {e}"))?;
-        let spki_sha256 = hex::encode(Sha256::digest(key_pair.subject_public_key_info()));
+        let spki_sha256 = hex::encode(spki_sha256(tls_key)?);
 
         let mut params =
             CertificateParams::new(csr_names(hostname)).map_err(|e| format!("CSR names: {e}"))?;

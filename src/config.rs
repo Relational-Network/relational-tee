@@ -400,7 +400,9 @@ fn dashboard_origin_from_lookup(
 /// (Azurite's dev account, its default endpoint on localhost) and `files`,
 /// their default, under `DATA_DIR`; release builds have only `azure`, and
 /// require an HTTPS endpoint.
-fn storage_from_lookup(lookup: &impl Fn(&str) -> Option<String>) -> Result<StorageConfig, String> {
+pub(crate) fn storage_from_lookup(
+    lookup: &impl Fn(&str) -> Option<String>,
+) -> Result<StorageConfig, String> {
     #[cfg(feature = "dev")]
     let default = "files";
     #[cfg(not(feature = "dev"))]
