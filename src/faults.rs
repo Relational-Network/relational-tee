@@ -143,16 +143,19 @@ impl Api {
     }
 
     /// Send until a worker gives a final answer, as a client retries: after
-    /// a dropped connection, a 502 or 503, or a lost compare-and-swap.
+    /// a dropped connection, a 502 or 503, or a lost compare-and-swap. The
+    /// wait grows, because devnet's public RPC rate-limits bursts.
     async fn settle(&self, call: &Call) -> Result<Reply, String> {
         let mut last = String::new();
-        for _ in 0..60 {
+        let mut wait = Duration::from_millis(1500);
+        for _ in 0..40 {
             match self.send(call, None).await {
                 Outcome::Reply(r) if !retryable(&r) => return Ok(r),
                 Outcome::Reply(r) => last = format!("{} {}", r.status, r.body),
                 Outcome::Dropped(e) => last = e,
             }
-            tokio::time::sleep(Duration::from_millis(1500)).await;
+            tokio::time::sleep(wait).await;
+            wait = (wait * 3 / 2).min(Duration::from_secs(10));
         }
         Err(format!(
             "{} {} never settled: {last}",
