@@ -530,6 +530,9 @@ async fn main() {
         }
     };
     let health = Arc::new(health::Health::new(&keys, certificate.clone()));
+    let commitments = Arc::new(blockchain::drt::pda::Commitments::derive(
+        &keys.get(KeyName::Commitment).current,
+    ));
 
     // Create shared application state.
     let state = AppState {
@@ -542,6 +545,7 @@ async fn main() {
         limiter: Arc::new(edge::Limiter::new(&server_config.rate_limits)),
         storage: Arc::new(storage),
         solana_client: Arc::new(solana_client),
+        commitments,
         history,
     };
 

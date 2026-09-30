@@ -27,7 +27,7 @@ use crate::auth::{Caller, Permission};
 use crate::blockchain::drt::{
     accounts::fetch_pool,
     instructions::build_grant_right,
-    pda::{compute_commitment, derive_drt_config_pda, derive_grant_pda, derive_user_ata},
+    pda::{derive_drt_config_pda, derive_grant_pda, derive_user_ata},
     types::APPEND_DRT_NAME,
 };
 use crate::blockchain::spl_token::token_account_amount;
@@ -160,9 +160,12 @@ pub async fn issue_credentials(
     let pool = fetch_pool(state.solana_client.rpc(), &pool_pda).await?;
     verify_pool_ownership(&pool, &caller_wallet)?;
 
-    // The commitment is unique per upload (record_id || pool_uuid ||
-    // append_right_id), and its Grant PDA is the on-chain receipt.
-    let commitment = compute_commitment(&record_id, &pool_uuid, &append_right_id);
+    // The commitment is unique per upload (record_id, pool_uuid and
+    // append_right_id, under the commitment key), and its Grant PDA is the
+    // on-chain receipt.
+    let commitment = state
+        .commitments
+        .commitment(&record_id, &pool_uuid, &append_right_id);
     let (grant_pda, _) = derive_grant_pda(&commitment);
     let burned = state
         .solana_client
@@ -239,6 +242,11 @@ pub async fn issue_credentials(
             "another saga is staged under this upload",
         ));
     };
+    // The staged saga is authoritative, so the burn is under its commitment.
+    let commitment = upload
+        .commitment_bytes()
+        .ok_or_else(|| ApiError::internal("a staged issuance has no commitment"))?;
+    let (grant_pda, _) = derive_grant_pda(&commitment);
     audit::upload(&record_id, row_count);
     crate::fault::point("staged");
 

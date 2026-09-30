@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use crate::attestation::Attestation;
 use crate::auth::entra::Verifier;
+use crate::blockchain::drt::pda::Commitments;
 use crate::blockchain::SolanaClient;
 use crate::edge::Limiter;
 use crate::health::Health;
@@ -44,6 +45,8 @@ pub struct AppState {
     // ── Chain ───────────────────────────────────────────────────
     /// Solana RPC client.
     pub solana_client: Arc<SolanaClient>,
+    /// Grant commitments, under the environment's `commitment-key`.
+    pub commitments: Arc<Commitments>,
     /// Wallet history pages and parsed transactions, read from the chain.
     pub history: Arc<History>,
 }
@@ -88,6 +91,7 @@ impl AppState {
                 unreachable,
                 crate::blockchain::types::devnet_config(unreachable),
             )),
+            commitments: Arc::new(Commitments::derive(&keys.get(KeyName::Commitment).current)),
             history: Arc::new(History::new(8, std::time::Duration::from_secs(30), 8)),
         }
     }

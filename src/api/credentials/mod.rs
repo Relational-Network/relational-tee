@@ -77,14 +77,23 @@ mod tests {
     use super::*;
     use crate::auth::entra::mint::Spec;
     use crate::auth::entra::tests::{config, entra_key};
-    use crate::blockchain::drt::types::{Pool, DISC_POOL_ACCOUNT};
+    use crate::blockchain::drt::pda::{derive_grant_pda, derive_user_ata, Commitments};
+    use crate::blockchain::drt::types::{Pool, APPEND_DRT_NAME, DISC_POOL_ACCOUNT};
     use crate::blockchain::fake::{self, FakeChain};
     use crate::data_validation::ValidationMode;
     use crate::idempotency::{KEY_HEADER, REPLAYED_HEADER};
     use crate::seal::request_aad;
     use crate::seal::tests::{form, sealed_form, BOUNDARY};
     use crate::state::AppState;
-    use crate::storage::pools::{PoolDoc, PoolKind};
+    use crate::storage::pools::{DrtMetadata, PoolDoc, PoolKind, Upload, INITIAL};
+    use crate::storage::staged::{Saga, Staged};
+    use crate::storage::Storage;
+    use crate::tee::tests::fixed_key;
+    use crate::tee::EcKey;
+
+    const POOL_UUID: [u8; 16] = [7; 16];
+    const APPEND_RIGHT_ID: [u8; 16] = [8; 16];
+    const CSV: &[u8] = b"name,score\nalice,1\nbob,2\n";
 
     fn admin_token(oid: &str) -> String {
         let mut spec = Spec::valid(&config());
@@ -116,75 +125,156 @@ mod tests {
             .unwrap()
     }
 
-    #[tokio::test]
-    async fn a_sealed_upload_opens_only_for_the_request_it_was_sealed_for() {
+    /// A worker on a fake chain.
+    struct Worker {
+        app: Router,
+        chain: Arc<FakeChain>,
+        storage: Arc<Storage>,
+        transport: Arc<EcKey>,
+    }
+
+    /// An admin who has signed in and has a wallet.
+    struct Admin {
+        token: String,
+        user_id: String,
+        wallet_id: String,
+        address: Pubkey,
+    }
+
+    fn worker() -> Worker {
         let chain = Arc::new(FakeChain::default());
         let mut state = AppState::for_tests();
         state.solana_client = Arc::new(fake::start(chain.clone()));
         let transport = state.transport.get(state.transport.current_kid()).unwrap();
         let storage = state.storage.clone();
-        let app = crate::router(state);
+        Worker {
+            app: crate::router(state),
+            chain,
+            storage,
+            transport,
+        }
+    }
 
-        // The caller learns their user ID, as the dashboard does, and has a wallet.
-        let admin = admin_token("oid-admin");
-        let me = Request::get("/v1/users/me")
-            .header(header::AUTHORIZATION, format!("Bearer {admin}"))
-            .body(Body::empty())
-            .unwrap();
-        let (_, _, me) = send(&app, me).await;
-        let user_id = me["user_id"].as_str().unwrap().to_string();
-        let create_wallet = Request::post("/v1/wallets")
-            .header(header::AUTHORIZATION, format!("Bearer {admin}"))
-            .header(&KEY_HEADER, uuid::Uuid::new_v4().to_string())
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from("{}"))
-            .unwrap();
-        let (status, _, wallet) = send(&app, create_wallet).await;
-        assert_eq!(status, StatusCode::CREATED, "{wallet}");
-        let wallet = &wallet["wallet"];
-        let owner = Pubkey::from_str(wallet["public_address"].as_str().unwrap()).unwrap();
+    impl Worker {
+        /// An admin who learns their user ID, as the dashboard does, and
+        /// creates a wallet.
+        async fn admin(&self, oid: &str) -> Admin {
+            let token = admin_token(oid);
+            let me = Request::get("/v1/users/me")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap();
+            let (_, _, me) = send(&self.app, me).await;
+            let create_wallet = Request::post("/v1/wallets")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .header(&KEY_HEADER, uuid::Uuid::new_v4().to_string())
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))
+                .unwrap();
+            let (status, _, wallet) = send(&self.app, create_wallet).await;
+            assert_eq!(status, StatusCode::CREATED, "{wallet}");
+            let wallet = &wallet["wallet"];
+            Admin {
+                token,
+                user_id: me["user_id"].as_str().unwrap().into(),
+                wallet_id: wallet["wallet_id"].as_str().unwrap().into(),
+                address: Pubkey::from_str(wallet["public_address"].as_str().unwrap()).unwrap(),
+            }
+        }
 
-        // A pool of theirs, on chain and in storage, waiting for its first upload.
-        let pool_pda = Pubkey::new_unique();
-        let account = Pool {
-            uuid: [7; 16],
-            owner,
-            created_at: 0,
-            sealed: true,
-            bump: 255,
-        };
-        let data = [&DISC_POOL_ACCOUNT[..], &borsh::to_vec(&account).unwrap()].concat();
-        chain.data.lock().unwrap().push((pool_pda, data));
-        storage
-            .pools()
-            .create(&PoolDoc {
-                pool_pda: pool_pda.to_string(),
-                pool_name: "Sealed".into(),
-                kind: PoolKind::Malta,
-                pool_uuid_hex: hex::encode([7; 16]),
-                drts: BTreeMap::new(),
-                owner_wallet_id: wallet["wallet_id"].as_str().unwrap().into(),
-                owner_pubkey: owner.to_string(),
-                schema_id: "s".into(),
-                schema: Vec::new(),
-                validation_mode: ValidationMode::None,
-                created_by: user_id.clone(),
-                created_at: chrono::Utc::now(),
-                creation_signature: "sig".into(),
-                initial: None,
-                issuances: Vec::new(),
-                revocations: Vec::new(),
-            })
-            .await
-            .unwrap();
+        /// A pool of `owner`'s, on chain and in storage, with an append DRT
+        /// whose mint is `append_mint`, and `initial` as its first upload.
+        async fn pool(&self, owner: &Admin, initial: Option<Upload>) -> Pubkey {
+            let pool_pda = Pubkey::new_unique();
+            let account = Pool {
+                uuid: POOL_UUID,
+                owner: owner.address,
+                created_at: 0,
+                sealed: true,
+                bump: 255,
+            };
+            let data = [&DISC_POOL_ACCOUNT[..], &borsh::to_vec(&account).unwrap()].concat();
+            self.chain.data.lock().unwrap().push((pool_pda, data));
+            let append = DrtMetadata {
+                right_id_hex: hex::encode(APPEND_RIGHT_ID),
+                mint: append_mint(&pool_pda).to_string(),
+                supply: 5,
+                code_repo_url: String::new(),
+                code_hash_hex: hex::encode([0; 32]),
+            };
+            self.storage
+                .pools()
+                .create(&PoolDoc {
+                    pool_pda: pool_pda.to_string(),
+                    pool_name: "Sealed".into(),
+                    kind: PoolKind::Malta,
+                    pool_uuid_hex: hex::encode(POOL_UUID),
+                    drts: BTreeMap::from([(APPEND_DRT_NAME.to_string(), append)]),
+                    owner_wallet_id: owner.wallet_id.clone(),
+                    owner_pubkey: owner.address.to_string(),
+                    schema_id: "s".into(),
+                    schema: Vec::new(),
+                    validation_mode: ValidationMode::None,
+                    created_by: owner.user_id.clone(),
+                    created_at: chrono::Utc::now(),
+                    creation_signature: "sig".into(),
+                    initial,
+                    issuances: Vec::new(),
+                    revocations: Vec::new(),
+                })
+                .await
+                .unwrap();
+            pool_pda
+        }
 
-        let transport = transport.as_ref();
-        let kid = transport.thumbprint();
+        /// `holder` owns `amount` of the pool's append DRT.
+        fn holds_append_drts(&self, holder: &Admin, pool_pda: &Pubkey, amount: u64) {
+            let mut account = vec![0u8; 165];
+            account[64..72].copy_from_slice(&amount.to_le_bytes());
+            let ata = derive_user_ata(&holder.address, &append_mint(pool_pda));
+            self.chain.data.lock().unwrap().push((ata, account));
+        }
+
+        /// `csv`, sealed for `admin`'s `POST` of `path` with `key`.
+        fn sealed(&self, admin: &Admin, path: &str, key: &str, csv: &[u8]) -> Vec<u8> {
+            let transport = self.transport.as_ref();
+            let aad = request_aad("POST", path, key, &transport.thumbprint(), &admin.user_id);
+            sealed_form(transport, &aad, csv)
+        }
+    }
+
+    /// A pool's append mint, which only needs to be stable per pool here.
+    fn append_mint(pool_pda: &Pubkey) -> Pubkey {
+        Pubkey::find_program_address(&[b"append", pool_pda.as_ref()], &Pubkey::default()).0
+    }
+
+    fn initial_upload(uploaded_by: &str) -> Upload {
+        Upload {
+            record_id: INITIAL.into(),
+            upload_id: "first".into(),
+            sha256: sha256_hex(CSV),
+            rows: 2,
+            uploaded_by: uploaded_by.into(),
+            uploaded_at: chrono::Utc::now(),
+            signature: None,
+            commitment: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sealed_upload_opens_only_for_the_request_it_was_sealed_for() {
+        let worker = worker();
+        let owner = worker.admin("oid-admin").await;
+        let pool_pda = worker.pool(&owner, None).await;
+        let (app, storage) = (worker.app.clone(), worker.storage.clone());
+
         let path = format!("/v1/drt/pools/{pool_pda}/initialize");
         let key = uuid::Uuid::new_v4().to_string();
-        let csv = b"name,score\nalice,1\nbob,2\n";
-        let aad = request_aad("POST", &path, &key, &kid, &user_id);
-        let sealed = sealed_form(transport, &aad, csv);
+        let csv = CSV;
+        let sealed = worker.sealed(&owner, &path, &key, csv);
+        let transport = worker.transport.as_ref();
+        let aad = request_aad("POST", &path, &key, &transport.thumbprint(), &owner.user_id);
+        let (admin, user_id) = (owner.token.clone(), owner.user_id.clone());
 
         // The same ciphertext for another pool, route, key or user doesn't open.
         let other_pool = format!("/v1/drt/pools/{}/initialize", Pubkey::new_unique());
@@ -223,7 +313,7 @@ mod tests {
             .read_dataset(&pool_pda.to_string(), &upload_id)
             .await
             .unwrap();
-        assert_eq!(stored.as_deref(), Some(&csv[..]));
+        assert_eq!(stored.as_deref(), Some(csv));
 
         // A retry sealed afresh replays: the fingerprint covers the plaintext.
         let resealed = sealed_form(transport, &aad, csv);
@@ -234,7 +324,7 @@ mod tests {
 
         // Plaintext uploads, and the parts of the construction HPKE replaced, are refused.
         let fresh = uuid::Uuid::new_v4().to_string();
-        let plaintext = form(&[("file", &csv[..])]);
+        let plaintext = form(&[("file", csv)]);
         let (status, _, err) = send(&app, upload(&path, &fresh, &admin, plaintext)).await;
         assert_eq!(
             (status, err["code"].as_str()),
@@ -248,5 +338,73 @@ mod tests {
         let (status, _, err) = send(&app, upload(&path, &fresh, &admin, old)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(err["code"], "sealed_payload_invalid");
+    }
+
+    #[tokio::test]
+    async fn a_retried_issuance_burns_under_the_commitment_it_staged() {
+        let worker = worker();
+        let admin = worker.admin("oid-admin").await;
+        let pool_pda = worker
+            .pool(&admin, Some(initial_upload(&admin.user_id)))
+            .await;
+        worker.holds_append_drts(&admin, &pool_pda, 1);
+        let path = format!("/v1/drt/pools/{pool_pda}/issue");
+        let key = uuid::Uuid::new_v4().to_string();
+        let record_id = crate::ids::upload_id(&admin.user_id, &pool_pda.to_string(), &key);
+
+        // An earlier attempt staged this issuance under another commitment
+        // key, and its burn landed.
+        let earlier = Commitments::derive(&fixed_key(99)).commitment(
+            &record_id,
+            &POOL_UUID,
+            &APPEND_RIGHT_ID,
+        );
+        let staged = Staged {
+            record: "idempotency/earlier.json".into(),
+            staged_at: chrono::Utc::now(),
+            saga: Saga::Issue {
+                pool_pda: pool_pda.to_string(),
+                upload: Upload {
+                    record_id: record_id.clone(),
+                    upload_id: record_id.clone(),
+                    sha256: sha256_hex(CSV),
+                    rows: 2,
+                    uploaded_by: admin.user_id.clone(),
+                    uploaded_at: chrono::Utc::now(),
+                    signature: None,
+                    commitment: Some(hex::encode(earlier)),
+                },
+            },
+        };
+        worker
+            .storage
+            .sagas()
+            .stage(&format!("issue-{record_id}"), staged)
+            .await
+            .unwrap();
+        let chain = &worker.chain;
+        chain
+            .accounts
+            .lock()
+            .unwrap()
+            .push(derive_grant_pda(&earlier).0);
+        *chain.history.lock().unwrap() = vec![json!({ "signature": "sig-earlier", "err": null })];
+        chain.lands.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let sealed = worker.sealed(&admin, &path, &key, CSV);
+        let (status, _, issued) =
+            send(&worker.app, upload(&path, &key, &admin.token, sealed)).await;
+        assert_eq!(status, StatusCode::OK, "{issued}");
+        assert_eq!(issued["redeem_signature"], "sig-earlier");
+        assert!(chain.sent().is_empty(), "no second burn");
+        let doc = worker
+            .storage
+            .pools()
+            .get(&pool_pda.to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        let entry = doc.upload(&record_id).expect("the issuance is recorded");
+        assert_eq!(entry.commitment_bytes(), Some(earlier));
     }
 }

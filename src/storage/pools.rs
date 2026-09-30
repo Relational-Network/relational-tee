@@ -95,6 +95,16 @@ pub struct Upload {
     pub commitment: Option<String>,
 }
 
+impl Upload {
+    /// The grant commitment, if it has a well-formed one.
+    pub fn commitment_bytes(&self) -> Option<[u8; 32]> {
+        hex::decode(self.commitment.as_deref()?)
+            .ok()?
+            .try_into()
+            .ok()
+    }
+}
+
 /// A revoked credential.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Revocation {

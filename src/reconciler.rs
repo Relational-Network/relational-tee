@@ -124,11 +124,8 @@ async fn finish(
             if doc.upload(&upload.record_id).is_some() {
                 return Ok(false);
             }
-            let commitment: [u8; 32] = upload
-                .commitment
-                .as_deref()
-                .and_then(|c| hex::decode(c).ok())
-                .and_then(|c| c.try_into().ok())
+            let commitment = upload
+                .commitment_bytes()
                 .ok_or_else(|| ApiError::internal("a staged issuance has no commitment"))?;
             let (grant_pda, _) = derive_grant_pda(&commitment);
             let Some(signature) =
