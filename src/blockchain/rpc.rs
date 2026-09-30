@@ -25,11 +25,21 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[derive(Debug)]
 pub struct RpcError {
     pub message: String,
+    /// The JSON-RPC error's code and data, when the node answered with one.
+    pub code: Option<i64>,
+    pub data: Option<Value>,
 }
+
+/// The JSON-RPC error a node answers `sendTransaction` with when the
+/// transaction's preflight simulation fails.
+const SIMULATION_FAILED: i64 = -32002;
 
 impl std::fmt::Display for RpcError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
+        match self.code {
+            Some(code) => write!(f, "RPC error {code}: {}", self.message),
+            None => f.write_str(&self.message),
+        }
     }
 }
 
@@ -39,7 +49,21 @@ impl RpcError {
     pub fn new(msg: impl Into<String>) -> Self {
         Self {
             message: msg.into(),
+            code: None,
+            data: None,
         }
+    }
+
+    /// Why the node refused to send a transaction, if its preflight
+    /// simulation failed for a reason a resend can't cure. A blockhash the
+    /// node doesn't know (it's behind, or the blockhash expired) or a
+    /// transaction it already processed isn't such a reason.
+    pub fn rejection(&self) -> Option<&Value> {
+        if self.code != Some(SIMULATION_FAILED) {
+            return None;
+        }
+        let err = self.data.as_ref()?.get("err").filter(|e| !e.is_null())?;
+        (*err != "BlockhashNotFound" && *err != "AlreadyProcessed").then_some(err)
     }
 }
 
@@ -59,6 +83,8 @@ struct RpcResponse<T> {
 struct RpcErrorObject {
     code: i64,
     message: String,
+    #[serde(default)]
+    data: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -125,10 +151,11 @@ impl JsonRpcClient {
             serde_json::from_str(&text).map_err(|e| RpcError::new(format!("JSON parse: {e}")))?;
 
         if let Some(err) = rpc_resp.error {
-            return Err(RpcError::new(format!(
-                "RPC error {}: {}",
-                err.code, err.message
-            )));
+            return Err(RpcError {
+                message: err.message,
+                code: Some(err.code),
+                data: err.data,
+            });
         }
 
         rpc_resp

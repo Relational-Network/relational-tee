@@ -183,7 +183,7 @@ pub async fn estimate_fee(
     request_body = SendTransactionRequest,
     responses(
         (status = 200, description = "Transaction sent", body = SendTransactionResponse),
-        (status = 400, description = "Invalid request, or no Idempotency-Key"),
+        (status = 400, description = "Invalid request, no Idempotency-Key, or Solana refused the transaction (`transaction_rejected`)"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden"),
         (status = 404, description = "Wallet not found"),

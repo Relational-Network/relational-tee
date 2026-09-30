@@ -21,7 +21,9 @@ use base64::Engine;
 use solana_hash::Hash;
 use solana_pubkey::Pubkey;
 use solana_transaction::Transaction;
+use tracing::warn;
 
+use crate::blockchain::rpc::RpcError;
 use crate::blockchain::transactions::reached;
 use crate::blockchain::SolanaClient;
 use crate::error::ApiError;
@@ -35,8 +37,25 @@ pub enum Effect {
     Transfer,
 }
 
-fn rpc_error(what: &str) -> impl FnOnce(crate::blockchain::rpc::RpcError) -> ApiError + '_ {
+fn rpc_error(what: &str) -> impl FnOnce(RpcError) -> ApiError + '_ {
     move |e| ApiError::rpc_unavailable(format!("{what}: {e}"))
+}
+
+/// A send's failure. When the node's preflight simulation fails for a
+/// lasting reason, such as a wallet short of SOL for the fee or rent, the
+/// request is at fault; a retry with the same key still sends the stored
+/// transaction, and succeeds once the reason is gone.
+fn send_failed(e: RpcError) -> ApiError {
+    let Some(reason) = e.rejection() else {
+        return ApiError::rpc_unavailable(format!("transaction send failed: {e}"));
+    };
+    warn!(%reason, "Solana refused a transaction in preflight");
+    let message = e
+        .message
+        .strip_prefix("Transaction simulation failed: ")
+        .unwrap_or(&e.message);
+    ApiError::bad_request(format!("Solana refused the transaction: {message}"))
+        .with_code("transaction_rejected")
 }
 
 /// Sign a fresh transaction with the latest blockhash.
@@ -175,7 +194,7 @@ pub async fn run(
     crate::fault::point("tx_stored");
     rpc.send_encoded_transaction(&to_send.transaction)
         .await
-        .map_err(rpc_error("transaction send failed"))?;
+        .map_err(send_failed)?;
     crate::fault::point("tx_sent");
     solana
         .await_confirmation(&to_send.signature, commitment)
@@ -193,6 +212,8 @@ mod tests {
     use crate::idempotency::{Idempotent, Opened};
     use crate::storage::tests::files_storage;
     use crate::storage::Storage;
+    use axum::http::StatusCode;
+    use serde_json::json;
     use solana_instruction::Instruction;
     use solana_keypair::Keypair;
     use solana_signer::Signer;
@@ -312,5 +333,41 @@ mod tests {
         let (signature, stored) = s.retry(&Effect::Transfer, "confirmed").await;
         assert_ne!(signature, first.signature);
         assert_eq!(s.chain.sent(), [stored.transaction]);
+    }
+
+    #[tokio::test]
+    async fn a_send_the_preflight_refuses_is_rejected_and_a_retry_resends_it() {
+        let s = setup();
+        let attempt = || async {
+            let mut op = s.open().await;
+            let build = signed(&s.keypair, &s.transfer);
+            run(&s.solana, &mut op, &Effect::Transfer, "confirmed", build).await
+        };
+
+        let rent = json!({ "InsufficientFundsForRent": { "account_index": 0 } });
+        *s.chain.preflight.lock().unwrap() = Some(rent.clone());
+        let refused = attempt().await.unwrap_err();
+        assert_eq!(
+            (refused.status, refused.code),
+            (StatusCode::BAD_REQUEST, "transaction_rejected")
+        );
+        assert_eq!(
+            refused.message,
+            format!("Solana refused the transaction: {rent}")
+        );
+
+        // A node that doesn't know the blockhash may just be behind.
+        *s.chain.preflight.lock().unwrap() = Some(json!("BlockhashNotFound"));
+        let behind = attempt().await.unwrap_err();
+        assert_eq!(
+            (behind.status, behind.code),
+            (StatusCode::SERVICE_UNAVAILABLE, "rpc_unavailable")
+        );
+
+        *s.chain.preflight.lock().unwrap() = None;
+        s.chain.lands.store(true, SeqCst);
+        let (signature, stored) = s.retry(&Effect::Transfer, "confirmed").await;
+        assert_eq!(signature, stored.signature);
+        assert_eq!(s.chain.sent(), vec![stored.transaction; 3]);
     }
 }

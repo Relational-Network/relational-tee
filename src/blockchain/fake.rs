@@ -37,6 +37,8 @@ pub struct FakeChain {
     pub sent: Mutex<Vec<String>>,
     /// Whether a sent transaction lands, successfully, at once.
     pub lands: AtomicBool,
+    /// The error a send's preflight simulation fails with, if any.
+    pub preflight: Mutex<Option<Value>>,
     blockhashes: AtomicU8,
 }
 
@@ -52,9 +54,10 @@ impl FakeChain {
         self.sent.lock().unwrap().clone()
     }
 
-    fn answer(&self, method: &str, params: &Value) -> Value {
+    /// The call's result, or its JSON-RPC error.
+    fn answer(&self, method: &str, params: &Value) -> Result<Value, Value> {
         let context = |value: Value| json!({ "context": { "slot": 1 }, "value": value });
-        match method {
+        Ok(match method {
             "getAccountInfo" => {
                 let address = params[0].as_str().unwrap();
                 let data = self
@@ -106,6 +109,13 @@ impl FakeChain {
             "sendTransaction" => {
                 let encoded = params[0].as_str().unwrap();
                 self.sent.lock().unwrap().push(encoded.into());
+                if let Some(err) = self.preflight.lock().unwrap().clone() {
+                    return Err(json!({
+                        "code": -32002,
+                        "message": format!("Transaction simulation failed: {err}"),
+                        "data": { "err": err, "logs": [] },
+                    }));
+                }
                 let bytes = BASE64.decode(encoded).unwrap();
                 let tx: Transaction = bincode::deserialize(&bytes).unwrap();
                 let signature = tx.signatures[0].to_string();
@@ -115,13 +125,17 @@ impl FakeChain {
                 json!(signature)
             }
             other => panic!("unexpected RPC call {other}"),
-        }
+        })
     }
 }
 
 async fn rpc(State(chain): State<Arc<FakeChain>>, Json(req): Json<Value>) -> Json<Value> {
-    let result = chain.answer(req["method"].as_str().unwrap(), &req["params"]);
-    Json(json!({ "jsonrpc": "2.0", "id": req["id"], "result": result }))
+    Json(
+        match chain.answer(req["method"].as_str().unwrap(), &req["params"]) {
+            Ok(result) => json!({ "jsonrpc": "2.0", "id": req["id"], "result": result }),
+            Err(error) => json!({ "jsonrpc": "2.0", "id": req["id"], "error": error }),
+        },
+    )
 }
 
 /// Serve `chain` on an ephemeral port, and a client for it.

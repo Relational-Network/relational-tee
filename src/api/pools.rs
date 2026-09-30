@@ -200,7 +200,7 @@ fn pool_instructions(
     request_body = CreateMaltaPoolRequest,
     responses(
         (status = 201, description = "Pool created", body = CreatePoolResponse),
-        (status = 400, description = "Validation error, or no Idempotency-Key"),
+        (status = 400, description = "Validation error, no Idempotency-Key, or Solana refused the transaction (`transaction_rejected`)"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden"),
         (status = 422, description = "The Idempotency-Key was used for a different request"),

@@ -86,7 +86,7 @@ pub struct IssueCredentialsResponse {
     request_body(content = SealedUploadForm, content_type = "multipart/form-data"),
     responses(
         (status = 200, description = "Credentials issued", body = IssueCredentialsResponse),
-        (status = 400, description = "Validation error, insufficient DRTs, no Idempotency-Key, or the sealed payload doesn't open (`sealed_payload_invalid`)"),
+        (status = 400, description = "Validation error, insufficient DRTs, no Idempotency-Key, the sealed payload doesn't open (`sealed_payload_invalid`), or Solana refused the burn (`transaction_rejected`)"),
         (status = 401, description = "Unauthorized"),
         (status = 404, description = "Pool not found"),
         (status = 409, description = "The pool changed concurrently; retry"),
