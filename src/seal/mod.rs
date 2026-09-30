@@ -416,6 +416,45 @@ pub(crate) mod tests {
         );
     }
 
+    /// A CSV the dashboard's `sealUpload()` sealed to a throwaway transport
+    /// key, for a request with the AAD fields above.
+    #[tokio::test]
+    async fn an_upload_sealed_by_the_dashboard_opens() {
+        let recipient = EcKey::from_jwk(&serde_json::json!({
+            "kty": "EC",
+            "crv": "P-256",
+            "x": "k094fYqq5_F4N6aNsU7UGwG06HIPWDN5AvdB_GRf5pA",
+            "y": "RVfJCauMmkv9_qKnWzh30wzNzYQLC0qrH2VSOx1oPRg",
+            "d": "3BD3jjiT7ensa5czL23S7UYvPUoi3YnBKNdbZzN4uLI",
+        }))
+        .unwrap();
+        let kid = "CTxdXno6cJWKqceMSKStFUo7kEjnkXWNXeFIRbLUklE";
+        assert_eq!(recipient.thumbprint(), kid);
+        let enc = "BMXnzzQx-kAfRgegnnDeOnS7gFlHVIvlPn2FAWndsQE3arZ3EaL8Vu8HRvSUtOiFONautOPlpac7gEFPnoHc8_0";
+        let ct = URL_SAFE_NO_PAD
+            .decode("18ykp6oFtph-QXAv09_IwzfoQ6o7f-JvRAg4_vmdIL4AU4gMNWqFqH0")
+            .unwrap();
+        let upload = read(form(&[
+            ("v", &b"1"[..]),
+            ("kid", kid.as_bytes()),
+            ("enc", enc.as_bytes()),
+            ("ct", &ct),
+        ]))
+        .await
+        .unwrap();
+        let transport = ReleasedKey {
+            current: recipient,
+            previous: None,
+        };
+
+        let aad = request_aad("POST", PATH, KEY, kid, USER);
+        let csv = open_upload(&transport, &upload, &aad).unwrap();
+        assert_eq!(csv, b"name,score\nalice,1\nbob,2\n");
+        let initialize = PATH.replace("/issue", "/initialize");
+        let elsewhere = request_aad("POST", &initialize, KEY, kid, USER);
+        assert!(open_upload(&transport, &upload, &elsewhere).is_err());
+    }
+
     #[tokio::test]
     async fn the_previous_transport_key_opens_uploads_for_24_hours_after_the_switch() {
         for (hours_ago, previous_opens) in [(23, true), (25, false)] {
