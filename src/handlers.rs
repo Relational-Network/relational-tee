@@ -4,50 +4,20 @@
 //! HTTP request handlers for the enclave API.
 //!
 //! This module contains handlers for:
-//! - Public key endpoint (for browser encryption)
 //! - Admin endpoints (require admin role)
 //! - Opening and validating the sealed CSV uploads of the pool endpoints
 
-use axum::{
-    extract::{Multipart, State},
-    Json,
-};
+use axum::{extract::Multipart, Json};
 use serde::Serialize;
-use tracing::{debug, info};
+use tracing::info;
 use utoipa::ToSchema;
 
 use crate::auth::Caller;
-use crate::crypto::{jwk_for_public_key, Jwk};
 use crate::data_validation::{validate_csv_bytes, FieldSchema, ValidationMode, ValidationSummary};
 use crate::error::ApiError;
 use crate::idempotency::Idempotent;
 use crate::seal::{self, SealedUpload};
-use crate::state::AppState;
-use crate::tee::{KeyName, ReleasedKey};
-
-// ============================================================================
-// Public Key Endpoint
-// ============================================================================
-
-/// Get the transport public key that uploads are sealed to.
-///
-/// Every worker holds the same transport key, released at startup, so an
-/// upload sealed on one worker's answer opens on any worker.
-#[utoipa::path(
-    get,
-    path = "/v1/attestation/public-key",
-    tag = "Attestation",
-    summary = "Get the transport public key",
-    description = "Returns the current P-256 transport public key in JWK format for browser encryption.",
-    responses(
-        (status = 200, description = "Public key returned", body = Jwk)
-    )
-)]
-pub async fn get_public_key(State(state): State<AppState>) -> Json<Jwk> {
-    debug!("Serving the transport public key");
-    let transport = state.keys.get(KeyName::Transport);
-    Json(jwk_for_public_key(&transport.current.public_key()))
-}
+use crate::tee::ReleasedKey;
 
 // ============================================================================
 // Admin Endpoints

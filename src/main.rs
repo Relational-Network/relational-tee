@@ -21,7 +21,6 @@ mod auth;
 mod blockchain;
 mod chain;
 mod config;
-mod crypto;
 mod data_validation;
 mod edge;
 mod error;
@@ -59,7 +58,7 @@ use utoipa_swagger_ui::SwaggerUi;
 
 use config::{KeyProviderConfig, ServerConfig, StorageConfig, Transport, MAX_BODY_SIZE};
 
-use handlers::{admin_status, get_public_key, AdminStatusResponse};
+use handlers::{admin_status, AdminStatusResponse};
 use health::{
     health, liveness, readiness, CanaryDetails, Certificate, CertificateDetails, HealthDetails,
     HealthResponse, ReadinessResponse, RpcDetails,
@@ -105,7 +104,6 @@ The `Admin` app role grants `pools:read`, `pools:create`, `pools:write`, `wallet
         health::readiness,
         attestation::get_attestation,
         reference_values::get_reference_values,
-        handlers::get_public_key,
         handlers::admin_status,
         // Wallet API
         api::users::get_me,
@@ -151,7 +149,6 @@ The `Admin` app role grants `pools:read`, `pools:create`, `pools:write`, `wallet
         attestation::AttestationResponse,
         data_validation::ValidationError,
         data_validation::ValidationMode,
-        crypto::Jwk,
         // Wallet schemas
         api::users::UserMeResponse,
         api::users::UsersResponse,
@@ -214,7 +211,7 @@ The `Admin` app role grants `pools:read`, `pools:create`, `pools:write`, `wallet
     modifiers(&SecurityAddon),
     tags(
         (name = "Health", description = "Health check endpoints"),
-        (name = "Attestation", description = "Enclave attestation and public key"),
+        (name = "Attestation", description = "Attestation and reference values"),
         (name = "Protected", description = "JWT-protected endpoints"),
         (name = "Admin", description = "Admin-only endpoints"),
         (name = "Users", description = "User identity endpoints"),
@@ -589,7 +586,6 @@ fn router(state: AppState) -> Router {
             "/v1/reference-values",
             get(reference_values::get_reference_values),
         )
-        .route("/v1/attestation/public-key", get(get_public_key))
         .route("/v1/admin/status", get(admin_status))
         // Wallet service routes.
         .merge(api::wallet_router())
@@ -709,8 +705,12 @@ mod tests {
         assert_eq!(body["code"], "reference_values_unavailable");
 
         let (status, body) = get(&app, "/v1/attestation/public-key").await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["crv"], "P-256");
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "sealing uses /v1/attestation"
+        );
+        assert_eq!(body["code"], "not_found");
 
         let (status, body) = get(&app, "/v1/wallets").await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
