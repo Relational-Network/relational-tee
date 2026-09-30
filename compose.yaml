@@ -9,7 +9,10 @@
 #
 # From the host: the proxy on 127.0.0.1:8443 (plain HTTP), and the fake
 # sidecar on 127.0.0.1:9000, whose /certs a dashboard can use as its
-# attestation authority. Data lives in memory and goes with `just stack-down`.
+# attestation authority. `just stack-up` then signs a dev reference-values
+# manifest into the stack's storage, so a dashboard pinning the dev manifest
+# key verifies the workers. Data lives in memory and goes with
+# `just stack-down`.
 
 name: relational-tee
 
@@ -48,6 +51,23 @@ services:
       - ./dev/keys:/keys:ro
     ports:
       - 127.0.0.1:9000:9000
+
+  # One-shot: `just stack-up` runs it once the stack is up
+  # (`docker compose run --rm manifest`), so `up --wait` doesn't wait on it.
+  manifest:
+    image: relational-tee:dev
+    profiles: [manifest]
+    command: ["dev-manifest", "--commit", "${STACK_COMMIT:-dev}"]
+    depends_on: [azurite]
+    # The dev key files are readable by their owner only.
+    user: "${STACK_UID:-0}:${STACK_GID:-0}"
+    environment:
+      STORAGE_BACKEND: azurite
+      STORAGE_BLOB_URL: http://azurite:10000/devstoreaccount1
+      DEV_KEYS_DIR: /keys
+      FAKE_MAA_ISSUER: http://localhost:9000
+    volumes:
+      - ./dev/keys:/keys:ro
 
   worker1: *worker
   worker2: *worker

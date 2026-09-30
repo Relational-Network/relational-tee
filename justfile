@@ -135,10 +135,20 @@ spa:
     cd {{ pilot }} && pnpm install --frozen-lockfile && pnpm dev
 
 # Start the local stack: Azurite, the fake SKR sidecar, three workers and a
-# round-robin proxy on 127.0.0.1:8443. Needs `just image-dev` first.
+# round-robin proxy on 127.0.0.1:8443, then sign a dev reference-values
+# manifest into its storage. Needs `just image-dev` first.
 stack-up: dev-keys
-    STACK_UID=$(id -u) STACK_GID=$(id -g) docker compose up -d --wait
-    @echo "workers: http://127.0.0.1:8443 (round robin)  fake SKR and MAA keys: http://127.0.0.1:9000"
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export STACK_UID=$(id -u) STACK_GID=$(id -g) STACK_COMMIT=$(git rev-parse HEAD)
+    docker compose up -d --wait
+    # Azurite can take a moment to listen after it starts.
+    for attempt in 1 2 3 4 5; do
+        docker compose run --rm manifest && break
+        [[ $attempt == 5 ]] && { echo "error: couldn't sign the stack's manifest" >&2; exit 1; }
+        sleep 2
+    done
+    echo "workers: http://127.0.0.1:8443 (round robin)  fake SKR and MAA keys: http://127.0.0.1:9000"
 
 # Stop the local stack; its data is in memory and goes with it.
 stack-down:

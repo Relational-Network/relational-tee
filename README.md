@@ -83,7 +83,7 @@ To rehearse a transport key rotation: move `dev/keys/transport-key.jwk` to `tran
 
 - **Fastest:** `just dev` uses dev keys (`KEY_PROVIDER=local`) and sealed local files under `./data` (`STORAGE_BACKEND=files`), which survive restarts, and needs nothing else running.
 - **Production code paths:** `just skr` and `just azurite` in other terminals, then `KEY_PROVIDER=skr STORAGE_BACKEND=azurite just dev`. The worker then releases keys and attests through the SKR client, and stores everything in Azurite through the Azure client, signing with Azurite's well-known Shared Key.
-- **Several workers:** `just image-dev` once, then `just stack-up` ([`compose.yaml`](compose.yaml)). Three workers share Azurite and one fake SKR sidecar behind HAProxy on `127.0.0.1:8443`, which round-robins at layer 4 and probes `/health/ready` like the Azure load balancer. The fake sidecar's `/certs` is on `127.0.0.1:9000`.
+- **Several workers:** `just image-dev` once, then `just stack-up` ([`compose.yaml`](compose.yaml)). Three workers share Azurite and one fake SKR sidecar behind HAProxy on `127.0.0.1:8443`, which round-robins at layer 4 and probes `/health/ready` like the Azure load balancer. The fake sidecar's `/certs` is on `127.0.0.1:9000`. Once the stack is up, `just stack-up` signs a dev manifest into its storage (the one-shot `manifest` service), so a dashboard with the usual dev `.env.local` verifies the stack's workers and seals uploads to them.
 
 **Calling the API.** Dev builds accept tokens from the dev app registrations in Relational's tenant, and from the dev token signing key:
 
