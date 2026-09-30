@@ -27,8 +27,9 @@ default:
 
 # Run the dev build natively on 127.0.0.1:8443: plain HTTP, or with
 # TRANSPORT=https, tls-key once `just dev-cert` has signed its CSR.
+[positional-arguments]
 dev *args: dev-keys
-    cargo run --features dev,swagger-ui -- {{ args }}
+    cargo run --features dev,swagger-ui -- "$@"
 
 # Create any missing dev keys in dev/keys/; existing keys are kept.
 dev-keys:
@@ -36,9 +37,10 @@ dev-keys:
 
 # Print a token signed with the dev token signing key, which dev builds trust
 # (`just dev-token --help` lists the options, including deliberately bad tokens).
+[positional-arguments]
 dev-token *args:
     @cargo run --quiet --features dev -- dev-keys dev/keys >&2
-    @cargo run --quiet --features dev -- dev-token {{ args }}
+    @cargo run --quiet --features dev -- dev-token "$@"
 
 # Run the fake SKR sidecar on 127.0.0.1:9000 (use KEY_PROVIDER=skr in the worker).
 skr: dev-keys
