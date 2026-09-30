@@ -222,39 +222,42 @@ pub fn drt_router() -> Router<AppState> {
         // ── Schema upload ────────────────────────────────────────
         .route(
             "/v1/drt/pools/{pool_pda}/schema",
-            post(credentials::upload_schema).get(credentials::get_schema),
+            post(credentials::schema::upload_schema).get(credentials::schema::get_schema),
         )
         // ── Credential issuance ─────────────────────────────────
         .route(
             "/v1/drt/pools/{pool_pda}/initialize",
-            post(credentials::initialize_pool),
+            post(credentials::initialize::initialize_pool),
         )
         .route(
             "/v1/drt/pools/{pool_pda}/issue",
-            post(credentials::issue_credentials),
+            post(credentials::issue::issue_credentials),
         )
         .route(
             "/v1/drt/pools/{pool_pda}/revoke",
-            post(credentials::revoke_credentials),
+            post(credentials::revoke::revoke_credentials),
         )
         .route(
             "/v1/drt/pools/{pool_pda}/revocations",
-            get(credentials::list_revocations),
+            get(credentials::reads::list_revocations),
         )
         .route(
             "/v1/drt/pools/{pool_pda}/summary",
-            get(credentials::pool_summary),
+            get(credentials::reads::pool_summary),
         )
         .route(
             "/v1/drt/pools/{pool_pda}/issuance-log",
-            get(credentials::get_issuance_log),
+            get(credentials::reads::get_issuance_log),
         )
         .route(
             "/v1/drt/pools/by-wallet/{wallet_id}",
-            get(credentials::list_pools_by_wallet),
+            get(credentials::reads::list_pools_by_wallet),
         )
         // ── Marketplace discovery ────────────────────────────────
-        .route("/v1/drt/pools/list", get(credentials::list_all_pools))
+        .route(
+            "/v1/drt/pools/list",
+            get(credentials::reads::list_all_pools),
+        )
 }
 
 #[cfg(test)]

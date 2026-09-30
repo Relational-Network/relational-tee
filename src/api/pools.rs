@@ -46,7 +46,7 @@ use crate::storage::wallets::WalletMetadata;
 use crate::store::Created;
 
 // ============================================================================
-// Shared helpers (also used by api/credentials.rs and api/admin.rs)
+// Shared helpers (also used by api/credentials/ and api/transactions.rs)
 // ============================================================================
 
 /// Load a wallet keypair, verifying ownership and active status.
