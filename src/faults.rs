@@ -293,16 +293,32 @@ impl Suite {
         )
     }
 
+    /// The pool's unburned append DRTs, read from Solana: the summary's
+    /// `remaining_supply` falls back to the original supply when its RPC
+    /// call fails.
     async fn remaining(&self, pool: &str) -> Result<u64, String> {
         let summary = self
             .api
             .get(&format!("/v1/drt/pools/{pool}/summary"), &self.owner.token)
             .await?;
-        summary["drts"]
+        let mint = summary["drts"]
             .as_array()
             .and_then(|drts| drts.iter().find(|d| d["drt_type"] == "append"))
-            .and_then(|d| d["remaining_supply"].as_u64())
-            .ok_or_else(|| format!("the summary has no append supply: {summary}"))
+            .and_then(|d| d["mint"].as_str()?.parse::<Pubkey>().ok())
+            .ok_or_else(|| format!("the summary has no append mint: {summary}"))?;
+        let mut last = String::new();
+        for _ in 0..15 {
+            match self.solana.rpc().get_token_supply(&mint).await {
+                Ok(supply) => {
+                    return supply.amount.parse().map_err(|_| {
+                        format!("the mint's supply isn't a number: {}", supply.amount)
+                    })
+                }
+                Err(e) => last = e.to_string(),
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        Err(format!("reading the append mint's supply: {last}"))
     }
 
     /// How many times `record_id` is in the pool's issuance log.
@@ -389,7 +405,9 @@ async fn replays(s: &Suite) -> Result<String, String> {
 async fn issued_once(s: &Suite, pool: &str, call: &Call, before: u64) -> Result<(), String> {
     let after = s.remaining(pool).await?;
     if after + 1 != before {
-        return Err(format!("{} append DRTs burned, not 1", before - after));
+        return Err(format!(
+            "the append DRTs went from {before} to {after}, not down by 1"
+        ));
     }
     match s.logged(pool, &s.record_id(pool, call)).await? {
         1 => Ok(()),
