@@ -131,9 +131,16 @@ pub const AZURITE_BLOB_URL: &str = "http://127.0.0.1:10000/devstoreaccount1";
 #[cfg(feature = "dev")]
 pub const DEFAULT_DATA_DIR: &str = "./data";
 
+/// Dev builds' environment name.
+#[cfg(feature = "dev")]
+pub const DEV_ENVIRONMENT: &str = "dev";
+
 /// Process configuration read once from the environment at startup.
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
+    /// The environment's name, such as `pilot`: it names the environment's
+    /// reference values in storage.
+    pub environment: String,
     pub addr: SocketAddr,
     pub transport: Transport,
     pub keys: KeyProviderConfig,
@@ -148,7 +155,7 @@ pub struct ServerConfig {
 }
 
 impl ServerConfig {
-    /// Read `BIND_ADDR`, `PORT`, `TRANSPORT`, `API_HOSTNAME`,
+    /// Read `ENVIRONMENT`, `BIND_ADDR`, `PORT`, `TRANSPORT`, `API_HOSTNAME`,
     /// and the key provider and storage settings (see
     /// [`key_provider_from_lookup`] and [`storage_from_lookup`]).
     pub fn from_env() -> Result<Self, String> {
@@ -179,6 +186,7 @@ impl ServerConfig {
         }
 
         Ok(Self {
+            environment: environment_from_lookup(&lookup)?,
             addr: SocketAddr::new(ip, port),
             transport,
             keys: key_provider_from_lookup(&lookup)?,
@@ -190,6 +198,27 @@ impl ServerConfig {
             dev_token_key: dev_token_key_from_lookup(&lookup),
         })
     }
+}
+
+/// Read `ENVIRONMENT`: lowercase letters, digits and hyphens. Release builds
+/// require it; dev builds default to `dev`.
+pub(crate) fn environment_from_lookup(
+    lookup: &impl Fn(&str) -> Option<String>,
+) -> Result<String, String> {
+    #[cfg(feature = "dev")]
+    let name = lookup("ENVIRONMENT").unwrap_or_else(|| DEV_ENVIRONMENT.into());
+    #[cfg(not(feature = "dev"))]
+    let name = lookup("ENVIRONMENT").ok_or("ENVIRONMENT is required")?;
+    let valid = !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    if !valid {
+        return Err(format!(
+            "ENVIRONMENT {name:?} must be lowercase letters, digits and hyphens"
+        ));
+    }
+    Ok(name)
 }
 
 /// Read `TRANSPORT` and `API_HOSTNAME`. Release builds serve only HTTPS and
@@ -649,7 +678,8 @@ mod tests {
     const DASHBOARD: &str = "33333333-3333-3333-3333-333333333333";
 
     /// Settings a release build requires.
-    const RELEASE_BASE: [(&str, &str); 7] = [
+    const RELEASE_BASE: [(&str, &str); 8] = [
+        ("ENVIRONMENT", "pilot"),
         ("API_HOSTNAME", "api.pilot.example"),
         ("KEY_VAULT_URL", "kv.vault.azure.net"),
         ("STORAGE_BLOB_URL", "https://acct.blob.core.windows.net"),
@@ -702,6 +732,21 @@ mod tests {
             config.dev_token_key,
             PathBuf::from("dev/keys/entra-signing-key.pem")
         );
+        assert_eq!(config.environment, "dev");
+    }
+
+    #[test]
+    fn the_environment_name_can_name_a_storage_directory() {
+        assert_eq!(complete(&[]).unwrap().environment, "pilot");
+        assert_eq!(
+            complete(&[("ENVIRONMENT", "staging-2")])
+                .unwrap()
+                .environment,
+            "staging-2"
+        );
+        for bad in ["Pilot", "pilot/x", "..", "pilot env"] {
+            assert!(complete(&[("ENVIRONMENT", bad)]).is_err(), "{bad}");
+        }
     }
 
     #[cfg(not(feature = "dev"))]
@@ -712,6 +757,7 @@ mod tests {
             "ENTRA_API_CLIENT_ID",
             "ENTRA_ALLOWED_CLIENT_IDS",
             "DASHBOARD_ORIGIN",
+            "ENVIRONMENT",
         ] {
             assert!(config_from(&base_without(&[name])).is_err(), "{name}");
         }

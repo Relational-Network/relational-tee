@@ -11,6 +11,7 @@ use crate::blockchain::SolanaClient;
 use crate::edge::Limiter;
 use crate::health::Health;
 use crate::history::History;
+use crate::reference_values::ReferenceValues;
 use crate::storage::Storage;
 use crate::tee::WorkerKeys;
 
@@ -21,6 +22,8 @@ pub struct AppState {
     pub keys: Arc<WorkerKeys>,
     /// The cached attestation token for the transport key.
     pub attestation: Arc<Attestation>,
+    /// The environment's signed manifest of approved workloads.
+    pub reference_values: Arc<ReferenceValues>,
     /// Readiness state, kept current in the background.
     pub health: Arc<Health>,
 
@@ -54,13 +57,20 @@ impl AppState {
         use crate::tee::KeyName;
 
         let keys = Arc::new(crate::tee::tests::test_keys());
-        let attestation = Arc::new(Attestation::new(&keys.get(KeyName::Transport).current));
+        let transport = &keys.get(KeyName::Transport).current;
+        let attestation = Arc::new(Attestation::new(transport));
+        let reference_values = Arc::new(ReferenceValues::new(
+            Arc::new(crate::store::files::LocalFiles::temporary()),
+            "dev",
+            transport.thumbprint(),
+        ));
         let certificate = Certificate::TlsKey(crate::tls::tests::serving());
         let health = Arc::new(Health::new(&keys, certificate));
         let unreachable = "http://127.0.0.1:9";
         Self {
             keys,
             attestation,
+            reference_values,
             health,
             auth: Arc::new(crate::auth::entra::tests::verifier()),
             dashboard_origin: "http://localhost:5173".into(),

@@ -31,9 +31,12 @@ pub const STATE: &str = "state";
 /// The public container of certificate chains and CSRs.
 pub const TLS: &str = "tls";
 
+/// The public container of signed reference-values manifests.
+pub const REFERENCE_VALUES: &str = "reference-values";
+
 /// Every container the worker creates at startup: `state`, and the public
-/// `tls` and `reference-values` (signed manifests) that CD writes.
-pub const CONTAINERS: [&str; 3] = [STATE, TLS, "reference-values"];
+/// `tls` and `reference-values` that CD writes.
+pub const CONTAINERS: [&str; 3] = [STATE, TLS, REFERENCE_VALUES];
 
 /// An opaque version tag for compare-and-swap writes, in quoted form.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]

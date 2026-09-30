@@ -32,6 +32,7 @@ mod http_client;
 mod idempotency;
 mod ids;
 mod reconciler;
+mod reference_values;
 mod request_id;
 mod state;
 mod storage;
@@ -102,6 +103,7 @@ The `Admin` app role grants `pools:read`, `pools:create`, `pools:write`, `wallet
         health::liveness,
         health::readiness,
         attestation::get_attestation,
+        reference_values::get_reference_values,
         handlers::get_public_key,
         handlers::admin_status,
         // Wallet API
@@ -347,14 +349,21 @@ fn token_verifier(config: &ServerConfig) -> auth::entra::Verifier {
     verifier
 }
 
-/// Open the sealed `state` container, and the public `tls` container. On
-/// Azure, any missing container is created first.
+/// The public containers beside the sealed `state`.
+struct PublicStores {
+    tls: Arc<dyn store::ObjectStore>,
+    reference_values: Arc<dyn store::ObjectStore>,
+}
+
+/// Open the sealed `state` container, and the public `tls` and
+/// `reference-values` containers. On Azure, any missing container is
+/// created first.
 async fn open_storage(
     config: &StorageConfig,
     keys: storage::StorageKeys,
     worker_id: String,
-) -> Result<(storage::Storage, Arc<dyn store::ObjectStore>), String> {
-    let (state, tls): (Arc<dyn store::ObjectStore>, Arc<dyn store::ObjectStore>) = match config {
+) -> Result<(storage::Storage, PublicStores), String> {
+    let (state, public): (Arc<dyn store::ObjectStore>, PublicStores) = match config {
         StorageConfig::Azure(azure) => {
             let state = store::azure::AzureBlob::new(azure, store::STATE)?;
             for name in store::CONTAINERS {
@@ -365,19 +374,24 @@ async fn open_storage(
                     .map_err(|e| format!("preparing storage at {}: {e}", azure.blob_url))?;
             }
             info!(blob = %azure.blob_url, "Storage ready");
-            let tls = state.container(store::TLS);
-            (Arc::new(state), Arc::new(tls))
+            let public = PublicStores {
+                tls: Arc::new(state.container(store::TLS)),
+                reference_values: Arc::new(state.container(store::REFERENCE_VALUES)),
+            };
+            (Arc::new(state), public)
         }
         #[cfg(feature = "dev")]
         StorageConfig::Files { dir } => {
             warn!(dir = %dir.display(), "STORAGE_BACKEND=files: sealed objects in local files (dev builds only)");
-            (
-                Arc::new(store::files::LocalFiles::new(dir.join(store::STATE))),
-                Arc::new(store::files::LocalFiles::new(dir.join(store::TLS))),
-            )
+            let files = |name: &str| Arc::new(store::files::LocalFiles::new(dir.join(name)));
+            let public = PublicStores {
+                tls: files(store::TLS),
+                reference_values: files(store::REFERENCE_VALUES),
+            };
+            (files(store::STATE), public)
         }
     };
-    Ok((storage::Storage::new(state, keys, worker_id), tls))
+    Ok((storage::Storage::new(state, keys, worker_id), public))
 }
 
 /// Service entrypoint: read configuration, build the router, and serve.
@@ -427,7 +441,7 @@ async fn main() {
     // Sealed Blob storage, with keys derived from storage-root.
     let worker_id = uuid::Uuid::new_v4().to_string();
     info!(worker_id = %worker_id, "Worker identity for this process");
-    let (storage, tls_store) = open_storage(
+    let (storage, public_stores) = open_storage(
         &server_config.storage,
         storage::StorageKeys::derive(&keys.get(KeyName::StorageRoot).current),
         worker_id,
@@ -437,6 +451,14 @@ async fn main() {
         tracing::error!("Storage unavailable: {e}");
         std::process::exit(1);
     });
+
+    // The environment's signed manifest, served as it is.
+    let reference_values = Arc::new(reference_values::ReferenceValues::new(
+        public_stores.reference_values,
+        &server_config.environment,
+        keys.get(KeyName::Transport).current.thumbprint(),
+    ));
+    reference_values.spawn();
 
     let verifier = token_verifier(&server_config);
 
@@ -464,12 +486,15 @@ async fn main() {
     // What readiness reports, kept current in the background.
     let certificate = match &server_config.transport {
         Transport::Https { hostname } => {
-            let certificates =
-                tls::Certificates::new(&keys.get(KeyName::Tls).current, hostname, tls_store)
-                    .unwrap_or_else(|e| {
-                        tracing::error!("TLS setup failed: {e}");
-                        std::process::exit(1);
-                    });
+            let certificates = tls::Certificates::new(
+                &keys.get(KeyName::Tls).current,
+                hostname,
+                public_stores.tls,
+            )
+            .unwrap_or_else(|e| {
+                tracing::error!("TLS setup failed: {e}");
+                std::process::exit(1);
+            });
             info!(
                 hostname,
                 spki_sha256 = certificates.spki_sha256(),
@@ -481,7 +506,7 @@ async fn main() {
         }
         #[cfg(feature = "dev")]
         Transport::PlainHttp => {
-            drop(tls_store);
+            drop(public_stores.tls);
             Certificate::PlainHttp
         }
     };
@@ -491,6 +516,7 @@ async fn main() {
     let state = AppState {
         keys: Arc::new(keys),
         attestation,
+        reference_values,
         health,
         auth: Arc::new(verifier),
         dashboard_origin: server_config.dashboard_origin.as_str().into(),
@@ -554,6 +580,10 @@ fn router(state: AppState) -> Router {
         .route("/health/ready", get(readiness))
         // v1 API endpoints.
         .route("/v1/attestation", get(attestation::get_attestation))
+        .route(
+            "/v1/reference-values",
+            get(reference_values::get_reference_values),
+        )
         .route("/v1/attestation/public-key", get(get_public_key))
         .route("/v1/admin/status", get(admin_status))
         // Wallet service routes.
@@ -669,6 +699,9 @@ mod tests {
         let (status, body) = get(&app, "/v1/attestation").await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "no token yet");
         assert_eq!(body["code"], "attestation_unavailable");
+        let (status, body) = get(&app, "/v1/reference-values").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "no manifest yet");
+        assert_eq!(body["code"], "reference_values_unavailable");
 
         let (status, body) = get(&app, "/v1/attestation/public-key").await;
         assert_eq!(status, StatusCode::OK);
