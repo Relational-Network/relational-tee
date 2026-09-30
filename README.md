@@ -37,6 +37,7 @@ just            # list the recipes
 | `just azurite` | Start Azurite's Blob service, the Azure Storage emulator, in Docker on `127.0.0.1:10000`, data in memory; `just azurite-stop` stops it |
 | `just test-azurite` | Run the store conformance tests against Azurite, starting it first if needed |
 | `just check` | Run every gate: rustfmt, clippy (`-D warnings`, with and without all features), the tests, the banned-crate check and `cargo audit` |
+| `just openapi` | Print the OpenAPI document (`relational-tee openapi`), which CI publishes as each run's `openapi` artifact |
 | `just spa` | Run the dashboard dev server from `../iob-pilot` (override with `IOB_PILOT_DIR`), using the host's Node and pnpm |
 | `just image` | Build the canonical x86_64-linux image with Nix and load it into Docker as `relational-tee:latest` |
 | `just image-dev` | Build the aarch64-linux dev image and load it into Docker as `relational-tee:dev` |
@@ -159,7 +160,7 @@ The worker creates the `state`, `tls` and `reference-values` containers at start
 - `packages.aarch64-linux.image-dev`: the same image with the `dev` feature, for local container stacks on Apple Silicon.
 - `checks`: rustfmt, clippy and nextest, run by `nix flake check`.
 
-CI (`.github/workflows/ci.yml`) runs `just check` in the dev shell, `nix flake check`, and the x86_64 image build on every pull request and push to `main`. It fails if the `rsa` crate (RUSTSEC-2023-0071) or OpenSSL enters the dependency graph. Nothing is pushed or deployed yet.
+CI (`.github/workflows/ci.yml`) runs `just check` in the dev shell, `nix flake check`, and the x86_64 image build on every pull request and push to `main`, and publishes the OpenAPI document as the run's `openapi` artifact. It fails if the `rsa` crate (RUSTSEC-2023-0071) or OpenSSL enters the dependency graph. No image is pushed to a registry or deployed yet.
 
 ## API conventions
 
@@ -184,7 +185,7 @@ CI (`.github/workflows/ci.yml`) runs `just check` in the dev shell, `nix flake c
 - **Wallets:** `GET` and `POST /v1/wallets`; `GET` and `DELETE /v1/wallets/{id}`; `GET …/balance`; `POST …/estimate` and `…/send`; `GET …/transactions` and `…/transactions/{signature}`.
 - **Pools:** `POST /v1/drt/pools/malta`; `GET /v1/drt/pools/list`, `/v1/drt/pools/{pda}`, `…/drt/{name}` and `/v1/drt/pools/by-wallet/{wallet_id}`; `POST` and `GET …/schema`; `POST …/initialize`, `…/issue` and `…/revoke`; `GET …/revocations`, `…/summary` and `…/issuance-log`. The summary, issuance log and revocations together are the pool's audit trail: who created it and when, with the creation signature; the initial upload; each issuance with its burn signature; and each revocation with who, when and why.
 - **Admin:** `GET /v1/admin/status`, `/v1/admin/wallet-stats` and `/v1/admin/wallets`; `POST /v1/admin/wallets/{id}/suspend` and `…/activate`.
-- **Docs:** `GET /api-doc/openapi.json`; Swagger UI at `/docs` in builds with the `swagger-ui` feature.
+- **Docs:** builds with the `swagger-ui` feature (`just dev`) serve Swagger UI at `/docs` and the OpenAPI document at `/api-doc/openapi.json`; release builds serve neither. `just openapi` prints the document, and CI publishes it with every run.
 
 Analyst grants, DRT script execution and the data query were removed from this server and will be rebuilt on the new stack. `drt-examples/` keeps an example DRT script for that work.
 

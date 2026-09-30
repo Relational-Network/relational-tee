@@ -33,6 +33,14 @@ jobs:
       # appears in the dependency graph.
       - name: just check
         run: nix develop --command just check
+      # Release builds don't serve the OpenAPI document, so CI publishes it.
+      - name: The OpenAPI document
+        run: nix develop --command just openapi > openapi.json
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: openapi
+          path: openapi.json
+          if-no-files-found: error
 
   flake-check:
     name: nix flake check

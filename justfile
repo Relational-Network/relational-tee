@@ -130,6 +130,11 @@ deny-crates:
 audit:
     cargo audit
 
+# Print the OpenAPI document, which CI publishes; only builds with the
+# swagger-ui feature (`just dev`) serve it, at /api-doc/openapi.json.
+openapi:
+    @cargo run --quiet -- openapi
+
 # Run the dashboard dev server (override the path with IOB_PILOT_DIR).
 spa:
     cd {{ pilot }} && pnpm install --frozen-lockfile && pnpm dev

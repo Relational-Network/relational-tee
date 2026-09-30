@@ -242,9 +242,12 @@ impl Modify for SecurityAddon {
     }
 }
 
-#[cfg(not(feature = "swagger-ui"))]
-async fn openapi_json() -> axum::Json<utoipa::openapi::OpenApi> {
-    axum::Json(ApiDoc::openapi())
+/// The OpenAPI document, which `relational-tee openapi` prints for CI to
+/// publish. Only builds with the `swagger-ui` feature serve it.
+fn openapi_document() -> String {
+    ApiDoc::openapi()
+        .to_pretty_json()
+        .expect("the OpenAPI document serializes")
 }
 
 // ============================================================================
@@ -403,6 +406,11 @@ async fn open_storage(
 /// Service entrypoint: read configuration, build the router, and serve.
 #[tokio::main]
 async fn main() {
+    if std::env::args().nth(1).as_deref() == Some("openapi") {
+        println!("{}", openapi_document());
+        return;
+    }
+
     let log_format =
         config::log_format_from_lookup(&|key| std::env::var(key).ok().filter(|v| !v.is_empty()))
             .unwrap_or_else(|e| {
@@ -633,11 +641,9 @@ fn router(state: AppState) -> Router {
     let app = app.layer(axum::middleware::from_fn(fault::middleware));
     let app = app.with_state(state);
 
-    // SwaggerUi serves the OpenAPI document itself.
+    // Swagger UI and the OpenAPI document, in builds with the feature only.
     #[cfg(feature = "swagger-ui")]
     let app = app.merge(SwaggerUi::new("/docs").url("/api-doc/openapi.json", ApiDoc::openapi()));
-    #[cfg(not(feature = "swagger-ui"))]
-    let app = app.route("/api-doc/openapi.json", get(openapi_json));
 
     let trace = TraceLayer::new_for_http()
         .make_span_with(logs::request_span)
@@ -860,6 +866,80 @@ mod tests {
             get_as(&app, &expired.sign(entra_key()).unwrap(), "/v1/users/me").await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert_eq!(body["error"], "invalid or expired token");
+    }
+
+    #[tokio::test]
+    async fn the_openapi_document_names_every_route_and_each_is_served() {
+        let doc: serde_json::Value = serde_json::from_str(&openapi_document()).unwrap();
+        assert_eq!(
+            doc["components"]["securitySchemes"]["bearer_auth"]["scheme"],
+            "bearer"
+        );
+        let paths = doc["paths"].as_object().unwrap();
+        let documented: std::collections::BTreeSet<&str> =
+            paths.keys().map(String::as_str).collect();
+        let served = std::collections::BTreeSet::from([
+            "/health",
+            "/health/live",
+            "/health/ready",
+            "/v1/attestation",
+            "/v1/reference-values",
+            "/v1/admin/status",
+            "/v1/admin/wallet-stats",
+            "/v1/admin/wallets",
+            "/v1/admin/wallets/{wallet_id}/activate",
+            "/v1/admin/wallets/{wallet_id}/suspend",
+            "/v1/users",
+            "/v1/users/me",
+            "/v1/wallets",
+            "/v1/wallets/{wallet_id}",
+            "/v1/wallets/{wallet_id}/balance",
+            "/v1/wallets/{wallet_id}/estimate",
+            "/v1/wallets/{wallet_id}/send",
+            "/v1/wallets/{wallet_id}/transactions",
+            "/v1/wallets/{wallet_id}/transactions/{signature}",
+            "/v1/drt/pools/by-wallet/{wallet_id}",
+            "/v1/drt/pools/list",
+            "/v1/drt/pools/malta",
+            "/v1/drt/pools/{pool_pda}",
+            "/v1/drt/pools/{pool_pda}/drt/{drt_name}",
+            "/v1/drt/pools/{pool_pda}/initialize",
+            "/v1/drt/pools/{pool_pda}/issuance-log",
+            "/v1/drt/pools/{pool_pda}/issue",
+            "/v1/drt/pools/{pool_pda}/revocations",
+            "/v1/drt/pools/{pool_pda}/revoke",
+            "/v1/drt/pools/{pool_pda}/schema",
+            "/v1/drt/pools/{pool_pda}/summary",
+        ]);
+        assert_eq!(documented, served);
+
+        // Without a token, protected operations get 401 and public ones
+        // answer, but none is missing (404) or has another method (405).
+        let app = router(AppState::for_tests());
+        for (path, operations) in paths {
+            let concrete = path.replace(['{', '}'], "");
+            for method in operations.as_object().unwrap().keys() {
+                let request = Request::builder()
+                    .method(method.to_uppercase().as_str())
+                    .uri(&concrete)
+                    .body(Body::empty())
+                    .unwrap();
+                let status = app.clone().oneshot(request).await.unwrap().status();
+                assert!(
+                    status != StatusCode::NOT_FOUND && status != StatusCode::METHOD_NOT_ALLOWED,
+                    "{method} {path}: {status}"
+                );
+            }
+        }
+    }
+
+    #[cfg(not(feature = "swagger-ui"))]
+    #[tokio::test]
+    async fn without_swagger_ui_the_openapi_document_is_not_served() {
+        let app = router(AppState::for_tests());
+        let (status, body) = get(&app, "/api-doc/openapi.json").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["code"], "not_found");
     }
 
     #[tokio::test]
