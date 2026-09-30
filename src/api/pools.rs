@@ -296,6 +296,7 @@ pub async fn create_malta_pool(
         return Err(ApiError::internal("another saga is staged under this pool"));
     };
     let mut doc = *pool;
+    crate::fault::point("staged");
 
     let owner = keypair.pubkey();
     let ixs = pool_instructions(&owner, &pool_pda, &pool_uuid, &drts)?;
@@ -315,6 +316,7 @@ pub async fn create_malta_pool(
         Created::New(_) => doc,
         Created::AlreadyExists => load_pool(&state, &pool_pda_str).await?,
     };
+    crate::fault::point("recorded");
 
     info!(
         signature = %doc.creation_signature,

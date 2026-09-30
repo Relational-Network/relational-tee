@@ -24,6 +24,9 @@ mod config;
 mod data_validation;
 mod edge;
 mod error;
+mod fault;
+#[cfg(feature = "dev")]
+mod faults;
 mod handlers;
 mod health;
 mod history;
@@ -252,8 +255,9 @@ async fn openapi_json() -> axum::Json<utoipa::openapi::OpenApi> {
 /// Dev-only commands: `relational-tee dev-keys [DIR]` creates any missing dev
 /// key files, `relational-tee dev-token …` prints a token signed with the dev
 /// token signing key, `relational-tee dev-manifest …` signs and stores a dev
-/// reference-values manifest, and `relational-tee fake-skr` runs the fake
-/// SKR sidecar. Returns the exit code when the arguments name a command.
+/// reference-values manifest, `relational-tee fake-skr` runs the fake SKR
+/// sidecar, and `relational-tee faults` runs the fault-injection suite.
+/// Returns the exit code when the arguments name a command.
 #[cfg(feature = "dev")]
 async fn run_dev_command(args: &[String]) -> Option<i32> {
     let command = args.get(1)?;
@@ -295,10 +299,11 @@ async fn run_dev_command(args: &[String]) -> Option<i32> {
         }
         "dev-token" => Some(auth::dev_token::run(&args[2..])),
         "dev-manifest" => Some(reference_values::dev::run(&args[2..]).await),
+        "faults" => Some(faults::run(&args[2..]).await),
         other => {
             eprintln!(
                 "error: unknown command {other:?} (dev commands: dev-keys, dev-token, \
-                 dev-manifest, fake-skr)"
+                 dev-manifest, fake-skr, faults)"
             );
             Some(2)
         }
@@ -424,6 +429,14 @@ async fn main() {
     // http_client (hyper-rustls) pick this up via process-global default.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
+    #[cfg(feature = "dev")]
+    if server_config.fault_injection {
+        warn!(
+            "FAULT_INJECTION=on: an X-Fault-Exit header makes this worker exit (dev builds only)"
+        );
+        fault::enable();
+    }
+
     // Release the four keys before anything else; without them the worker
     // can't serve. Exiting lets the platform restart it.
     let (key_provider, attestation_provider) = providers(&server_config.keys);
@@ -535,7 +548,11 @@ async fn main() {
 
     state.health.spawn_canary(state.storage.clone());
     state.health.spawn_rpc_check(state.solana_client.clone());
-    reconciler::spawn(state.storage.clone(), state.solana_client.clone());
+    reconciler::spawn(
+        state.storage.clone(),
+        state.solana_client.clone(),
+        server_config.reconciler,
+    );
     state.limiter.spawn_cleanup();
     let health = state.health.clone();
     let app = router(state);
@@ -597,8 +614,10 @@ fn router(state: AppState) -> Router {
         // DRT pool routes.
         .merge(api::drt_router())
         .fallback(request_id::not_found)
-        .layer(axum::middleware::from_fn(audit::record))
-        .with_state(state);
+        .layer(axum::middleware::from_fn(audit::record));
+    #[cfg(feature = "dev")]
+    let app = app.layer(axum::middleware::from_fn(fault::middleware));
+    let app = app.with_state(state);
 
     // SwaggerUi serves the OpenAPI document itself.
     #[cfg(feature = "swagger-ui")]

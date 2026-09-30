@@ -260,6 +260,7 @@ pub async fn send_transaction(
         signature,
         wallet_id,
     };
+    crate::fault::point("recorded");
     op.finish(StatusCode::OK, &response).await
 }
 

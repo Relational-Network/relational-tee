@@ -109,5 +109,3 @@ tokio = { version = "1.49.0", default-features = false, features = ["test-util"]
 tower = { version = "0.5", default-features = false, features = ["util"] }
 # Tests in every configuration mint RS256 tokens, as the dev token signer does.
 aws-lc-rs = { version = "1.18", default-features = false, features = ["aws-lc-sys", "ring-io"] }
-# Tests seal uploads as clients do; hpke takes this rand_core's RNGs.
-rand_core = { version = "0.9", default-features = false, features = ["os_rng"] }

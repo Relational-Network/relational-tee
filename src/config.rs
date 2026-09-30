@@ -149,9 +149,13 @@ pub struct ServerConfig {
     /// The one origin CORS allows: the environment's dashboard.
     pub dashboard_origin: String,
     pub rate_limits: RateLimits,
+    pub reconciler: crate::reconciler::Timing,
     /// The dev token signing key, whose public half dev builds also trust.
     #[cfg(feature = "dev")]
     pub dev_token_key: PathBuf,
+    /// `FAULT_INJECTION=on`: honour `X-Fault-Exit` (see [`crate::fault`]).
+    #[cfg(feature = "dev")]
+    pub fault_injection: bool,
 }
 
 impl ServerConfig {
@@ -184,6 +188,14 @@ impl ServerConfig {
                         Entra ID's signing keys"
                 .into());
         }
+        #[cfg(not(feature = "dev"))]
+        if lookup("FAULT_INJECTION").is_some() {
+            return Err(
+                "FAULT_INJECTION isn't available: release builds contain no \
+                        fault injection"
+                    .into(),
+            );
+        }
 
         Ok(Self {
             environment: environment_from_lookup(&lookup)?,
@@ -194,10 +206,53 @@ impl ServerConfig {
             entra: entra_from_lookup(&lookup)?,
             dashboard_origin: dashboard_origin_from_lookup(&lookup)?,
             rate_limits: RateLimits::from_lookup(&lookup)?,
+            reconciler: reconciler_from_lookup(&lookup)?,
             #[cfg(feature = "dev")]
             dev_token_key: dev_token_key_from_lookup(&lookup),
+            #[cfg(feature = "dev")]
+            fault_injection: match lookup("FAULT_INJECTION").as_deref() {
+                None | Some("off") => false,
+                Some("on") => true,
+                Some(other) => return Err(format!("FAULT_INJECTION {other:?} must be on or off")),
+            },
         })
     }
+}
+
+/// Read `RECONCILER_INTERVAL_SECS` and `RECONCILER_MIN_AGE_SECS`, which
+/// only dev builds take; release builds reconcile every 5 minutes, sagas
+/// older than 10.
+fn reconciler_from_lookup(
+    lookup: &impl Fn(&str) -> Option<String>,
+) -> Result<crate::reconciler::Timing, String> {
+    let names = ["RECONCILER_INTERVAL_SECS", "RECONCILER_MIN_AGE_SECS"];
+    #[cfg(not(feature = "dev"))]
+    if let Some(name) = names.iter().find(|name| lookup(name).is_some()) {
+        return Err(format!(
+            "{name} isn't available: release builds reconcile every 5 minutes"
+        ));
+    }
+    #[allow(unused_mut)] // release builds keep the defaults
+    let mut timing = crate::reconciler::Timing::default();
+    #[cfg(feature = "dev")]
+    {
+        let secs = |name: &str| match lookup(name) {
+            None => Ok(None),
+            Some(v) => v
+                .parse::<u64>()
+                .ok()
+                .filter(|n| *n > 0)
+                .map(|n| Some(std::time::Duration::from_secs(n)))
+                .ok_or_else(|| format!("{name} {v:?} isn't a positive whole number")),
+        };
+        if let Some(interval) = secs(names[0])? {
+            timing.interval = interval;
+        }
+        if let Some(min_age) = secs(names[1])? {
+            timing.min_age = min_age;
+        }
+    }
+    Ok(timing)
 }
 
 /// Read `ENVIRONMENT`: lowercase letters, digits and hyphens. Release builds
@@ -735,6 +790,39 @@ mod tests {
             PathBuf::from("dev/keys/entra-signing-key.pem")
         );
         assert_eq!(config.environment, "dev");
+    }
+
+    #[cfg(feature = "dev")]
+    #[test]
+    fn dev_builds_can_speed_up_the_reconciler_and_inject_faults() {
+        use std::time::Duration;
+        let config = config_from(&[]).unwrap();
+        assert_eq!(config.reconciler, crate::reconciler::Timing::default());
+        assert!(!config.fault_injection);
+        let config = config_from(&[
+            ("RECONCILER_INTERVAL_SECS", "15"),
+            ("RECONCILER_MIN_AGE_SECS", "45"),
+            ("FAULT_INJECTION", "on"),
+        ])
+        .unwrap();
+        assert_eq!(config.reconciler.interval, Duration::from_secs(15));
+        assert_eq!(config.reconciler.min_age, Duration::from_secs(45));
+        assert!(config.fault_injection);
+        assert!(config_from(&[("FAULT_INJECTION", "yes")]).is_err());
+        assert!(config_from(&[("RECONCILER_MIN_AGE_SECS", "0")]).is_err());
+    }
+
+    #[cfg(not(feature = "dev"))]
+    #[test]
+    fn release_builds_refuse_fault_injection_and_reconciler_tuning() {
+        for name in [
+            "FAULT_INJECTION",
+            "RECONCILER_INTERVAL_SECS",
+            "RECONCILER_MIN_AGE_SECS",
+        ] {
+            let err = complete(&[(name, "1")]).expect_err(name);
+            assert!(err.contains(name), "{err}");
+        }
     }
 
     #[test]

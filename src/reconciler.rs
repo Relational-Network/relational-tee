@@ -10,7 +10,8 @@
 //! issuance entry, with the signature from the saga's idempotency record.
 //! It never deletes or undoes anything. Each of its writes is create-only,
 //! or a compare-and-swap that adds a missing entry, so any number of
-//! workers can run it at once.
+//! workers can run it at once. Dev builds can shorten both times, so the
+//! fault suite needn't wait 15 minutes.
 
 use std::str::FromStr;
 use std::sync::Arc;
@@ -29,17 +30,30 @@ use crate::storage::staged::{Saga, Staged};
 use crate::storage::{Change, Storage};
 use crate::store::Created;
 
-/// How often each worker reconciles.
-pub const INTERVAL: Duration = Duration::from_secs(5 * 60);
-/// A younger saga may still have its request running.
-const MIN_AGE: TimeDelta = TimeDelta::minutes(10);
+/// When the reconciler runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Timing {
+    /// How often each worker reconciles.
+    pub interval: Duration,
+    /// A younger saga may still have its request running.
+    pub min_age: Duration,
+}
 
-/// Reconcile every [`INTERVAL`].
-pub fn spawn(storage: Arc<Storage>, solana: Arc<SolanaClient>) {
+impl Default for Timing {
+    fn default() -> Self {
+        Self {
+            interval: Duration::from_secs(5 * 60),
+            min_age: Duration::from_secs(10 * 60),
+        }
+    }
+}
+
+/// Reconcile every `timing.interval`.
+pub fn spawn(storage: Arc<Storage>, solana: Arc<SolanaClient>, timing: Timing) {
     tokio::spawn(async move {
         loop {
-            tokio::time::sleep(INTERVAL).await;
-            match reconcile(&storage, &solana).await {
+            tokio::time::sleep(timing.interval).await;
+            match reconcile(&storage, &solana, timing.min_age).await {
                 Ok(0) => {}
                 Ok(finished) => info!(finished, "Finished abandoned sagas"),
                 Err(e) => warn!(error = %e, "Reconciling staged sagas failed"),
@@ -48,11 +62,17 @@ pub fn spawn(storage: Arc<Storage>, solana: Arc<SolanaClient>) {
     });
 }
 
-/// One pass over `staged/`. Returns how many sagas it finished.
-pub async fn reconcile(storage: &Storage, solana: &SolanaClient) -> Result<usize, ApiError> {
+/// One pass over `staged/`, finishing sagas at least `min_age` old. Returns
+/// how many it finished.
+pub async fn reconcile(
+    storage: &Storage,
+    solana: &SolanaClient,
+    min_age: Duration,
+) -> Result<usize, ApiError> {
+    let min_age = TimeDelta::from_std(min_age).unwrap_or(TimeDelta::MAX);
     let mut finished = 0;
     for staged in storage.sagas().all().await? {
-        if Utc::now() - staged.staged_at < MIN_AGE {
+        if Utc::now() - staged.staged_at < min_age {
             continue;
         }
         match finish(storage, solana, &staged).await {
@@ -219,7 +239,12 @@ mod tests {
         chain.land("sig-burn", true);
         let solana = fake::start(chain);
 
-        assert_eq!(reconcile(&storage, &solana).await.unwrap(), 1);
+        assert_eq!(
+            reconcile(&storage, &solana, Timing::default().min_age)
+                .await
+                .unwrap(),
+            1
+        );
         let doc = storage.pools().get("P1").await.unwrap().unwrap();
         let entries: Vec<_> = doc
             .issuances
@@ -233,7 +258,12 @@ mod tests {
         );
 
         // Another pass, on any worker, changes nothing.
-        assert_eq!(reconcile(&storage, &solana).await.unwrap(), 0);
+        assert_eq!(
+            reconcile(&storage, &solana, Timing::default().min_age)
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]
@@ -269,7 +299,12 @@ mod tests {
         ];
         let solana = fake::start(chain);
 
-        assert_eq!(reconcile(&storage, &solana).await.unwrap(), 1);
+        assert_eq!(
+            reconcile(&storage, &solana, Timing::default().min_age)
+                .await
+                .unwrap(),
+            1
+        );
         let doc = storage
             .pools()
             .get(&on_chain.to_string())

@@ -2,7 +2,7 @@
 
 The worker behind IOB MicRes: an Axum server that runs Use Case 1 credential pools on Solana (create a Malta pool, upload its schema, initialise it, issue and revoke credentials, read the issuance log and audit trail) and custodial Solana wallets (create, balance, fee estimate, send, history, admin suspend and activate).
 
-> **Migration in progress.** This repo was imported from `relational-sdk`, a Gramine SGX enclave, and is being moved to Azure Confidential Containers (AMD SEV-SNP). Gramine, RA-TLS, the SGX build and the old SSH deployment are gone, and the server now builds and runs natively. Still to come: key release and attestation on real Azure hardware, and the fault-injection suite for the idempotency work. Until then, parts of the server are interim, as described below.
+> **Migration in progress.** This repo was imported from `relational-sdk`, a Gramine SGX enclave, and is being moved to Azure Confidential Containers (AMD SEV-SNP). Gramine, RA-TLS, the SGX build and the old SSH deployment are gone, and the server now builds and runs natively. Still to come: key release and attestation on real Azure hardware. Until then, parts of the server are interim, as described below.
 
 ## What works today, and what's interim
 
@@ -40,6 +40,7 @@ just            # list the recipes
 | `just image` | Build the canonical x86_64-linux image with Nix and load it into Docker as `relational-tee:latest` |
 | `just image-dev` | Build the aarch64-linux dev image and load it into Docker as `relational-tee:dev` |
 | `just stack-up` | Start the local stack (needs `just image-dev`): Azurite, the fake SKR sidecar, three workers and a round-robin proxy on `127.0.0.1:8443`; `just stack-down` stops it |
+| `just faults` | Run the idempotency fault-injection suite against the local stack, which it (re)starts with fault injection on and a fast reconciler (see [Fault injection](#fault-injection)); `--runs N` sets the randomised runs |
 
 `just image` and `just image-dev` run Nix in a `nixos/nix` container with a cached `/nix` volume, so a Mac needs no separate Linux builder. On Apple Silicon the x86_64 image runs under emulation.
 
@@ -54,7 +55,21 @@ Dev builds include `relational-tee fake-skr`, a stand-in for Microsoft's SKR sid
 | `FAKE_MAA_TOKEN_SECS` | `28800` (8 hours) | Token lifetime |
 | `DEV_KEYS_DIR` | `dev/keys` | Dev keys to release and sign with |
 
-Not there yet: a fault-injection suite for the idempotency work, and a debug-mode sandbox on Azure.
+Not there yet: a debug-mode sandbox on Azure.
+
+### Fault injection
+
+A dev worker started with `FAULT_INJECTION=on` honours an `X-Fault-Exit` request header naming a point in a request: `staged` (a pool creation or issuance staged its saga), `tx_stored` (a chain step stored its signed transaction), `tx_sent`, `tx_confirmed`, or `recorded` (the request's last document write is done, its response isn't stored). When the request reaches that point, the process exits at once with status 137, as if it had been killed. Release builds contain none of this and refuse `FAULT_INJECTION`.
+
+`just faults` starts the local stack with `dev/compose.faults.yaml` layered on (fault injection on, and the reconciler running every 15 seconds for sagas older than 45 seconds), then runs `relational-tee faults` against the proxy. The suite calls the API as dev-token users, seals uploads to the stack's transport key, and crashes workers mid-request; compose restarts them, and the suite retries with the same `Idempotency-Key`. It checks that:
+- a replay returns the stored response and creates nothing, and a reused key with another body gets `422`;
+- two concurrent attempts with one key have one effect and one response;
+- a worker killed after each step of an issuance or a pool creation, with the request retried on another, burns one DRT, adds one issuance entry, and leaves one pool document;
+- after a crash between the burn and the pool document, with no retry, the reconciler adds the entry;
+- two users with one key get different IDs;
+- randomised runs across issue, pool creation, wallet creation, send and revoke, with duplicates, concurrent attempts and crashes, leave no double burn, double transfer, lost update or second wallet.
+
+Chain steps run on devnet, so the suite user's wallet in the stack needs about 0.2 devnet SOL; the suite stops at once and names the address if it holds less. The stack keeps its data in memory, so move any SOL left in that wallet elsewhere before `just stack-down`.
 
 ### The dev manifest
 
@@ -112,6 +127,8 @@ Never print, log or commit a real token.
 | `DASHBOARD_ORIGIN` | `http://localhost:5173` (Vite) | required, `https://` | The one origin CORS allows |
 | `RATE_LIMIT_IP_PER_SECOND`, `RATE_LIMIT_IP_BURST` | `20`, `40` | same | Requests per client IP, per worker |
 | `RATE_LIMIT_USER_MUTATIONS_PER_SECOND` | `10` | same | POST, PUT, PATCH and DELETE requests per user, per worker |
+| `RECONCILER_INTERVAL_SECS`, `RECONCILER_MIN_AGE_SECS` | `300`, `600` | refused | How often the reconciler runs, and how old a saga must be to finish |
+| `FAULT_INJECTION` | `off` | refused | `on` honours `X-Fault-Exit` (see [Fault injection](#fault-injection)) |
 | `RUST_LOG` | `info` | `info` | Log filter |
 
 Dev builds are the ones with the `dev` Cargo feature (`just dev`, or `cargo run --features dev`).

@@ -4,9 +4,8 @@
 # Local development tasks. Run `nix develop` first for the pinned toolchain
 # and tools, or use your own installs of the same versions.
 #
-# Not here yet, because what they drive doesn't exist yet: faults (the
-# idempotency fault-injection suite) and sandbox (a debug-mode confidential
-# group on Azure).
+# Not here yet, because what it drives doesn't exist yet: sandbox (a
+# debug-mode confidential group on Azure).
 
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
@@ -144,6 +143,16 @@ stack-up: dev-keys
 # Stop the local stack; its data is in memory and goes with it.
 stack-down:
     docker compose down
+
+# Run the idempotency fault-injection suite against the local stack, which
+# it (re)starts with fault injection on and a fast reconciler. Needs
+# `just image-dev` first, and devnet SOL in the suite's wallet: the suite
+# names the address if it has too little. `--runs N` sets the randomised
+# runs (default 20).
+[positional-arguments]
+faults *args: dev-keys
+    STACK_UID=$(id -u) STACK_GID=$(id -g) docker compose -f compose.yaml -f dev/compose.faults.yaml up -d --wait
+    cargo run --features dev -- faults "$@"
 
 # Build the canonical x86_64-linux image and load it into Docker.
 image: (_nix-image "linux/amd64" "x86_64-linux" "image")

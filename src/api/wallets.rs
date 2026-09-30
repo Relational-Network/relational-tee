@@ -170,6 +170,7 @@ pub async fn create_wallet(
         explorer_url,
     };
 
+    crate::fault::point("recorded");
     op.finish(StatusCode::CREATED, &response).await
 }
 

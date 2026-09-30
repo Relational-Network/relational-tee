@@ -203,8 +203,14 @@ mod tests {
             assert_eq!(err["error"], "sealed payload invalid");
         }
 
-        // For its own request it opens, and initialises the pool.
-        let (status, headers, first) = send(&app, upload(&path, &key, &admin, sealed)).await;
+        // For its own request it opens, and initialises the pool. Without
+        // FAULT_INJECTION=on, X-Fault-Exit does nothing.
+        let mut request = upload(&path, &key, &admin, sealed);
+        request.headers_mut().insert(
+            "x-fault-exit",
+            axum::http::HeaderValue::from_static("recorded"),
+        );
+        let (status, headers, first) = send(&app, request).await;
         assert_eq!(status, StatusCode::OK, "{first}");
         assert!(headers.get(&REPLAYED_HEADER).is_none());
         assert_eq!(

@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Relational Network
+
+# The fault-injection suite's settings for the local stack (`just faults`),
+# layered over compose.yaml: the workers honour X-Fault-Exit, and the
+# reconciler runs every 15 seconds for sagas older than 45 seconds, instead
+# of every 5 minutes for sagas older than 10, so an abandoned saga is
+# finished within about a minute.
+
+x-faults: &faults
+  environment:
+    FAULT_INJECTION: "on"
+    RECONCILER_INTERVAL_SECS: "15"
+    RECONCILER_MIN_AGE_SECS: "45"
+
+services:
+  worker1: *faults
+  worker2: *faults
+  worker3: *faults

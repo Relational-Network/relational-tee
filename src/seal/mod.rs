@@ -170,6 +170,84 @@ pub fn open_upload(
     open(&key, &upload.enc, INFO, &upload.ct, aad)
 }
 
+/// Seal `plaintext` to `recipient` as a client does: the `enc` part
+/// (unpadded base64url) and the ciphertext. For dev tools and tests.
+#[cfg(any(test, feature = "dev"))]
+pub fn seal_to(
+    recipient: &p256::PublicKey,
+    aad: &[u8],
+    plaintext: &[u8],
+) -> Result<(String, Vec<u8>), SealError> {
+    use hpke::Serializable;
+    use p256::elliptic_curve::sec1::ToEncodedPoint;
+    let point = recipient.to_encoded_point(false);
+    let public = <Kem as hpke::Kem>::PublicKey::from_bytes(point.as_bytes())
+        .map_err(|_| SealError("the recipient isn't a P-256 key"))?;
+    let (enc, ct) = hpke::single_shot_seal::<AesGcm256, HkdfSha256, Kem, _>(
+        &hpke::OpModeS::Base,
+        &public,
+        INFO,
+        plaintext,
+        aad,
+        &mut OsRng,
+    )
+    .map_err(|_| SealError("sealing failed"))?;
+    Ok((URL_SAFE_NO_PAD.encode(enc.to_bytes()), ct))
+}
+
+/// A multipart body of `parts`, separated by `boundary`, with `ct` and
+/// `file` sent as binary file parts, as a browser sends a `Blob`.
+#[cfg(any(test, feature = "dev"))]
+pub fn form(boundary: &str, parts: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut body = Vec::new();
+    for (name, value) in parts {
+        let disposition = if *name == "ct" || *name == "file" {
+            format!(
+                "form-data; name=\"{name}\"; filename=\"blob\"\r\n\
+                 Content-Type: application/octet-stream"
+            )
+        } else {
+            format!("form-data; name=\"{name}\"")
+        };
+        body.extend_from_slice(
+            format!("--{boundary}\r\nContent-Disposition: {disposition}\r\n\r\n").as_bytes(),
+        );
+        body.extend_from_slice(value);
+        body.extend_from_slice(b"\r\n");
+    }
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    body
+}
+
+/// The OS RNG, through the `rand_core` traits `hpke` takes.
+#[cfg(any(test, feature = "dev"))]
+struct OsRng;
+
+#[cfg(any(test, feature = "dev"))]
+impl hpke::rand_core::RngCore for OsRng {
+    fn next_u32(&mut self) -> u32 {
+        p256::elliptic_curve::rand_core::RngCore::next_u32(
+            &mut p256::elliptic_curve::rand_core::OsRng,
+        )
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        p256::elliptic_curve::rand_core::RngCore::next_u64(
+            &mut p256::elliptic_curve::rand_core::OsRng,
+        )
+    }
+
+    fn fill_bytes(&mut self, dst: &mut [u8]) {
+        p256::elliptic_curve::rand_core::RngCore::fill_bytes(
+            &mut p256::elliptic_curve::rand_core::OsRng,
+            dst,
+        )
+    }
+}
+
+#[cfg(any(test, feature = "dev"))]
+impl hpke::rand_core::CryptoRng for OsRng {}
+
 /// Open a single-shot HPKE ciphertext sealed to `key`.
 fn open(key: &EcKey, enc: &[u8], info: &[u8], ct: &[u8], aad: &[u8]) -> Result<Vec<u8>, SealError> {
     let scalar = Zeroizing::new(key.secret().to_bytes());
@@ -195,52 +273,20 @@ pub(crate) mod tests {
     use axum::body::Body;
     use axum::extract::FromRequest;
     use axum::http::{header, Request};
-    use hpke::{OpModeS, Serializable};
-    use p256::elliptic_curve::sec1::ToEncodedPoint;
-    use rand_core::TryRngCore;
+    use hpke::Serializable;
     use serde_json::Value;
     use std::sync::Arc;
 
     /// Seal `plaintext` to `recipient` as a client does: the `enc` and `ct`
     /// parts.
     pub(crate) fn seal(recipient: &EcKey, aad: &[u8], plaintext: &[u8]) -> (String, Vec<u8>) {
-        let point = recipient.public_key().to_encoded_point(false);
-        let public = <Kem as hpke::Kem>::PublicKey::from_bytes(point.as_bytes()).unwrap();
-        let (enc, ct) = hpke::single_shot_seal::<AesGcm256, HkdfSha256, Kem, _>(
-            &OpModeS::Base,
-            &public,
-            INFO,
-            plaintext,
-            aad,
-            &mut rand_core::OsRng.unwrap_err(),
-        )
-        .unwrap();
-        (URL_SAFE_NO_PAD.encode(enc.to_bytes()), ct)
+        seal_to(&recipient.public_key(), aad, plaintext).unwrap()
     }
 
     pub(crate) const BOUNDARY: &str = "sealed-upload-boundary";
 
-    /// A multipart body of `parts`, with `ct` sent as a binary file part,
-    /// as a browser sends a `Blob`.
     pub(crate) fn form(parts: &[(&str, &[u8])]) -> Vec<u8> {
-        let mut body = Vec::new();
-        for (name, value) in parts {
-            let disposition = if *name == "ct" || *name == "file" {
-                format!(
-                    "form-data; name=\"{name}\"; filename=\"blob\"\r\n\
-                     Content-Type: application/octet-stream"
-                )
-            } else {
-                format!("form-data; name=\"{name}\"")
-            };
-            body.extend_from_slice(
-                format!("--{BOUNDARY}\r\nContent-Disposition: {disposition}\r\n\r\n").as_bytes(),
-            );
-            body.extend_from_slice(value);
-            body.extend_from_slice(b"\r\n");
-        }
-        body.extend_from_slice(format!("--{BOUNDARY}--\r\n").as_bytes());
-        body
+        super::form(BOUNDARY, parts)
     }
 
     /// The four parts of an upload sealed to `recipient` under `aad`.

@@ -236,6 +236,7 @@ pub async fn issue_credentials(
         ));
     };
     audit::upload(&record_id, row_count);
+    crate::fault::point("staged");
 
     // ── BURN (irreversible, at most once) ─────────────────────────
 
@@ -276,6 +277,7 @@ pub async fn issue_credentials(
                 "DRT burned; the issuance entry waits for a retry");
         })?
         .ok_or_else(|| pool_not_found(&pool_pda_str))?;
+    crate::fault::point("recorded");
 
     let total_rows = doc.totals().rows;
     let explorer_url = state.solana_client.network().explorer_tx_url(&sig_str);

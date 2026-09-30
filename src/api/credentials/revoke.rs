@@ -150,6 +150,7 @@ pub async fn revoke_credentials(
         "Credentials revoked"
     );
 
+    crate::fault::point("recorded");
     op.finish(
         StatusCode::OK,
         &RevokeCredentialsResponse {

@@ -156,6 +156,7 @@ pub async fn initialize_pool(
         "Pool dataset initialized"
     );
 
+    crate::fault::point("recorded");
     op.finish(
         StatusCode::OK,
         &InitializePoolResponse {

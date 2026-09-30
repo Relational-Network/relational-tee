@@ -172,12 +172,15 @@ pub async fn run(
         }
     };
 
+    crate::fault::point("tx_stored");
     rpc.send_encoded_transaction(&to_send.transaction)
         .await
         .map_err(rpc_error("transaction send failed"))?;
+    crate::fault::point("tx_sent");
     solana
         .await_confirmation(&to_send.signature, commitment)
         .await?;
+    crate::fault::point("tx_confirmed");
     Ok(to_send.signature)
 }
 
