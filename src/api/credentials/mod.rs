@@ -714,7 +714,7 @@ pub(crate) mod tests {
     }
 
     /// The pilot's largest pools hold about 100,000 rows, which an admin may
-    /// upload at once.
+    /// upload at once, and which the pool's analysis then queries.
     #[tokio::test]
     #[ignore = "pilot scale, slow in unoptimised builds: run `just scale`"]
     async fn a_pilot_sized_dataset_uploads_within_the_body_limit() {
@@ -789,6 +789,63 @@ pub(crate) mod tests {
         eprintln!(
             "uploads: {}; pool document: {doc_size} bytes",
             timings.join(", ")
+        );
+
+        // The Awards Report over both uploads, as an admin: the first query
+        // builds the table, and the later ones read it from memory.
+        let hash = worker
+            .storage
+            .scripts()
+            .put(crate::analysis::definition::tests::AWARDS_REPORT.as_bytes())
+            .await
+            .unwrap();
+        worker
+            .storage
+            .pools()
+            .update::<ApiError>(&pool_pda.to_string(), |doc| {
+                doc.analysis = Some(crate::storage::pools::AnalysisRef {
+                    analysis_id: "awards-report-v1".into(),
+                    display_name: "Awards Report".into(),
+                    code_repo_url: String::new(),
+                    code_hash_hex: hash.clone(),
+                });
+                Ok(Change::Changed)
+            })
+            .await
+            .unwrap();
+        let path = format!("/v1/drt/pools/{pool_pda}/analyses/awards-report-v1/query");
+        let filtered = json!({
+            "filters": {
+                "award": { "mode": "selected", "values": ["Certificate in Digital Banking"] },
+                "exam_board_date": { "from": "01/03/2026", "to": "30/06/2026" },
+            },
+            "sort": { "field": "surname", "direction": "asc" },
+            "pagination": { "limit": 500, "offset": 1000 },
+        });
+        let mut query_timings = Vec::new();
+        for (label, body) in [
+            ("first (builds the table)", json!({})),
+            ("warm", json!({})),
+            ("filtered and sorted, 500 rows", filtered),
+        ] {
+            let request = Request::post(&path)
+                .header(header::AUTHORIZATION, format!("Bearer {}", admin.token))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let started = Instant::now();
+            let (status, _, page) = send(&worker.app, request).await;
+            let elapsed = started.elapsed();
+            assert_eq!(status, StatusCode::OK, "{label}: {page}");
+            if label == "warm" {
+                assert_eq!(page["total_matched"], 2 * ROWS);
+            }
+            query_timings.push(format!("{label} {:.0} ms", elapsed.as_secs_f64() * 1000.0));
+        }
+        eprintln!(
+            "analysis over {} rows: {}",
+            2 * ROWS,
+            query_timings.join(", ")
         );
     }
 }
