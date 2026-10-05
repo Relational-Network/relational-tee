@@ -319,11 +319,11 @@ fn validate_flag(value: &str) -> Option<String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    /// Test-only helper: returns the pilot_v1 schema for validation tests.
-    fn test_pilot_schema() -> Vec<FieldSchema> {
+    /// Test-only helper: returns the pilot_v1 schema.
+    pub(crate) fn test_pilot_schema() -> Vec<FieldSchema> {
         vec![
             FieldSchema {
                 name: "description".into(),

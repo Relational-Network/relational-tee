@@ -67,6 +67,7 @@ fn parse_pda(pool_pda: &str) -> Result<Pubkey, ApiError> {
 mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
+    use std::time::Instant;
 
     use axum::body::{to_bytes, Body};
     use axum::http::{header, HeaderMap, Request, StatusCode};
@@ -80,14 +81,15 @@ mod tests {
     use crate::blockchain::drt::pda::{derive_grant_pda, derive_user_ata, Commitments};
     use crate::blockchain::drt::types::{Pool, APPEND_DRT_NAME, DISC_POOL_ACCOUNT};
     use crate::blockchain::fake::{self, FakeChain};
-    use crate::data_validation::ValidationMode;
+    use crate::config::MAX_BODY_SIZE;
+    use crate::data_validation::{FieldSchema, ValidationMode};
     use crate::idempotency::{KEY_HEADER, REPLAYED_HEADER};
     use crate::seal::request_aad;
     use crate::seal::tests::{form, sealed_form, BOUNDARY};
     use crate::state::AppState;
     use crate::storage::pools::{DrtMetadata, PoolDoc, PoolKind, Upload, INITIAL};
     use crate::storage::staged::{Saga, Staged};
-    use crate::storage::Storage;
+    use crate::storage::{Change, Storage};
     use crate::tee::tests::fixed_key;
     use crate::tee::EcKey;
 
@@ -221,6 +223,22 @@ mod tests {
                     initial,
                     issuances: Vec::new(),
                     revocations: Vec::new(),
+                })
+                .await
+                .unwrap();
+            pool_pda
+        }
+
+        /// A pool as [`Self::pool`] makes it, without an initial upload, that
+        /// checks every upload against `schema` in Strict mode.
+        async fn strict_pool(&self, owner: &Admin, schema: Vec<FieldSchema>) -> Pubkey {
+            let pool_pda = self.pool(owner, None).await;
+            self.storage
+                .pools()
+                .update::<ApiError>(&pool_pda.to_string(), |doc| {
+                    doc.schema = schema.clone();
+                    doc.validation_mode = ValidationMode::Strict;
+                    Ok(Change::Changed)
                 })
                 .await
                 .unwrap();
@@ -511,5 +529,144 @@ mod tests {
         assert!(cursor.is_none(), "three pages of two hold five pools");
         seen.sort();
         assert_eq!(seen, ["P0", "P1", "P2", "P3", "P4"]);
+    }
+
+    /// Row `i`'s value in the pilot schema's column `name`, at a typical length.
+    fn pilot_value(name: &str, i: usize) -> String {
+        const RESULTS: [&str; 4] = ["Pass", "Merit", "Distinction", "Pass with Distinction"];
+        const AWARDS: [&str; 3] = [
+            "Professional Certificate in Financial Services",
+            "Professional Diploma in Compliance",
+            "Certificate in Digital Banking",
+        ];
+        match name {
+            "description" => "MICRO".into(),
+            "externalTypeId" => (100_000 + i % 900_000).to_string(),
+            "privacy" | "is_deleted" => (i % 2).to_string(),
+            "issuingBody" => "IOB".into(),
+            "memberBody" => ["AIB", "BOI", "PTS"][i % 3].into(),
+            "awardBoardDate" => format!("{:02}/06/2025", 1 + i % 28),
+            "awardGpaValue" => format!("{}.{:02}", 2 + i % 3, i % 100),
+            "awardResult" => RESULTS[i % RESULTS.len()].into(),
+            "awardName" => AWARDS[i % AWARDS.len()].into(),
+            "awardMajorCode" => format!("MAJ-{:04}", i % 500),
+            "awardProgrammeCode" => format!("PRG-{:05}", i % 2_000),
+            "awardYear" => "2024/2025".into(),
+            "awardType" => (1 + i % 5).to_string(),
+            "updated_at" | "created_at" => format!("2025-06-{:02}T09:30:00Z", 1 + i % 28),
+            "azureId" => uuid::Uuid::from_u128(i as u128).to_string(),
+            other => panic!("{other} isn't a pilot schema column"),
+        }
+    }
+
+    /// A dataset of `rows` rows and 30 columns: the pilot schema's 17, then
+    /// its first 13 again under new names. Returns the columns' schema and
+    /// the CSV.
+    fn pilot_scale_dataset(rows: usize) -> (Vec<FieldSchema>, String) {
+        let pilot = crate::data_validation::tests::test_pilot_schema();
+        let columns: Vec<(&str, FieldSchema)> = pilot
+            .iter()
+            .cycle()
+            .take(30)
+            .enumerate()
+            .map(|(n, field)| {
+                let mut column = field.clone();
+                if n >= pilot.len() {
+                    column.name = format!("{}_2", field.name);
+                }
+                (field.name.as_str(), column)
+            })
+            .collect();
+        let header: Vec<&str> = columns.iter().map(|(_, c)| c.name.as_str()).collect();
+        let mut csv = header.join(",");
+        csv.push('\n');
+        for i in 0..rows {
+            for (n, (pilot_name, _)) in columns.iter().enumerate() {
+                if n > 0 {
+                    csv.push(',');
+                }
+                csv.push_str(&pilot_value(pilot_name, i));
+            }
+            csv.push('\n');
+        }
+        (columns.into_iter().map(|(_, c)| c).collect(), csv)
+    }
+
+    /// The pilot's largest pools hold about 100,000 rows of 30 fields, which
+    /// an admin may upload at once.
+    #[tokio::test]
+    #[ignore = "pilot scale, slow in unoptimised builds: run `just scale`"]
+    async fn a_pilot_sized_dataset_uploads_within_the_body_limit() {
+        const ROWS: usize = 100_000;
+        let (schema, csv) = pilot_scale_dataset(ROWS);
+        let fields = schema.len();
+        let worker = worker();
+        let admin = worker.admin("oid-admin").await;
+        let pool_pda = worker.strict_pool(&admin, schema).await;
+        worker.holds_append_drts(&admin, &pool_pda, 1);
+        worker
+            .chain
+            .lands
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let mut body_size = 0;
+        let mut timings = Vec::new();
+        for (route, rows) in [("initialize", "rows"), ("issue", "rows_issued")] {
+            let path = format!("/v1/drt/pools/{pool_pda}/{route}");
+            let key = uuid::Uuid::new_v4().to_string();
+            let body = worker.sealed(&admin, &path, &key, csv.as_bytes());
+            body_size = body.len();
+            assert!(
+                body_size <= MAX_BODY_SIZE,
+                "{route}: the {body_size}-byte body is over the limit"
+            );
+            let started = Instant::now();
+            let (status, _, response) =
+                send(&worker.app, upload(&path, &key, &admin.token, body)).await;
+            let elapsed = started.elapsed();
+            assert_eq!(status, StatusCode::OK, "{route}: {response}");
+            assert_eq!(response[rows], ROWS, "{route}: {response}");
+            timings.push(format!("{route} {:.2} s", elapsed.as_secs_f64()));
+        }
+
+        // Rows never enter the pool document, which records each upload's
+        // digest and row count.
+        let doc = worker
+            .storage
+            .pools()
+            .get(&pool_pda.to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        let digest = sha256_hex(csv.as_bytes());
+        assert_eq!(doc.uploads().count(), 2);
+        assert!(doc
+            .uploads()
+            .all(|u| u.sha256 == digest && u.rows == ROWS as u64));
+        let doc_size = serde_json::to_vec(&doc).unwrap().len();
+        assert!(
+            doc_size < 16 * 1024,
+            "the pool document is {doc_size} bytes"
+        );
+
+        let mib = |bytes: usize| bytes as f64 / f64::from(1 << 20);
+        let overhead = body_size - csv.len();
+        eprintln!(
+            "pilot scale: {ROWS} rows of {fields} fields, {:.1} MiB ({} bytes a row)",
+            mib(csv.len()),
+            csv.len() / ROWS,
+        );
+        eprintln!(
+            "sealed body: {:.1} MiB of the {:.0} MiB limit ({:.0}%); {ROWS} rows fit while \
+             rows average up to {} bytes",
+            mib(body_size),
+            mib(MAX_BODY_SIZE),
+            100.0 * body_size as f64 / MAX_BODY_SIZE as f64,
+            (MAX_BODY_SIZE - overhead) / ROWS,
+        );
+        eprintln!(
+            "uploads: {}; pool document: {doc_size} bytes",
+            timings.join(", ")
+        );
     }
 }

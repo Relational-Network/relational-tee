@@ -100,6 +100,12 @@ azurite-stop:
 test-azurite: azurite
     cargo nextest run --features dev --run-ignored only -E 'test(azurite)'
 
+# Upload a pilot-sized dataset (100,000 rows of 30 fields) to a pool's initial
+# upload and issuance routes in an optimised build, and print its size against
+# the upload limit and how long each upload took.
+scale:
+    cargo nextest run --release --run-ignored only --no-capture -E 'test(pilot_sized)'
+
 # Run every local gate.
 check: fmt-check clippy test deny-crates audit
 

@@ -36,6 +36,7 @@ just            # list the recipes
 | `just test` | Run the tests with cargo-nextest, in the release and dev configurations; storage tests use local files in temporary directories |
 | `just azurite` | Start Azurite's Blob service, the Azure Storage emulator, in Docker on `127.0.0.1:10000`, data in memory; `just azurite-stop` stops it |
 | `just test-azurite` | Run the store conformance tests against Azurite, starting it first if needed |
+| `just scale` | Upload a pilot-sized dataset (100,000 rows of 30 fields, about 30 MiB) as a pool's initial upload and as an issuance, in an optimised build, and print its size against the 50 MiB upload limit and how long each upload took |
 | `just check` | Run every gate: rustfmt, clippy (`-D warnings`, with and without all features), the tests, the banned-crate check and `cargo audit` |
 | `just openapi` | Print the OpenAPI document (`relational-tee openapi`), which CI publishes as each run's `openapi` artifact |
 | `just spa` | Run the dashboard dev server from `../iob-pilot` (override with `IOB_PILOT_DIR`), using the host's Node and pnpm |
