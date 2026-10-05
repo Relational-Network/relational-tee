@@ -9,9 +9,9 @@
 //! transport key, and crashes workers mid-request with `X-Fault-Exit` (see
 //! [`crate::fault`]); the stack restarts them, as ACI restarts a container,
 //! and the suite retries through the proxy with the same `Idempotency-Key`.
-//! Every check reads effects back through the API or Solana: append DRTs
-//! burned, issuance entries, pool documents, wallets, transfers and
-//! revocations. Chain steps run on devnet, so the suite user's wallet needs
+//! Every check reads effects back through the API or Solana: append and
+//! Execute DRTs burned, issuance entries, grants, pool documents, wallets,
+//! transfers and revocations. Chain steps run on devnet, so the suite user's wallet needs
 //! devnet SOL; the suite stops at once, naming the address, if it has too
 //! little.
 
@@ -22,6 +22,7 @@ use bytes::Bytes;
 use http_body_util::Full;
 use p256::elliptic_curve::rand_core::{OsRng, RngCore};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use solana_pubkey::Pubkey;
 
 use crate::blockchain::SolanaClient;
@@ -45,6 +46,23 @@ const BOUNDARY: &str = "fault-suite-boundary";
 
 /// The saga steps a pool creation or an issuance can crash after.
 const SAGA_POINTS: [&str; 5] = ["staged", "tx_stored", "tx_sent", "tx_confirmed", "recorded"];
+
+/// Every pool's analysis, which the stack's workers fetch from GitHub, so
+/// `main` must hold this file as it is here.
+const AWARDS_REPORT_URL: &str = "https://raw.githubusercontent.com/relational-network/\
+    relational-tee/main/drt-examples/awards-report/awards-report-v1.toml";
+const AWARDS_REPORT: &str = include_str!("../drt-examples/awards-report/awards-report-v1.toml");
+/// Its Execute DRT's name.
+const ANALYSIS: &str = "awards-report-v1";
+
+/// A one-row upload in the Awards Report's columns, told apart by `staff`.
+fn awards_csv(staff: &str) -> String {
+    format!(
+        "Staff Number,Membership Number,Title,First Name,Surname,Date of Birth,Employer,\
+         Employer Group,Award,Award Grade,Exam Board Date\n\
+         {staff},0100045,Mx,Sam,Example,01/01/1990,AIB,AIB,Certificate,Pass,01/06/2026\n"
+    )
+}
 
 /// What came back: a response, or a dropped connection, as when the worker
 /// handling the request exits.
@@ -220,9 +238,13 @@ struct Suite {
 
 impl Suite {
     async fn user(&self, oid: &str) -> Result<User, String> {
+        self.signed_in(oid, "Admin").await
+    }
+
+    async fn signed_in(&self, oid: &str, role: &str) -> Result<User, String> {
         let mut spec = crate::auth::entra::mint::Spec::valid(&self.entra);
         spec.oid = oid.into();
-        spec.roles = vec!["Admin".into()];
+        spec.roles = vec![role.into()];
         spec.email = Some(format!("{oid}@faults.invalid"));
         spec.name = Some("Fault suite".into());
         let token = spec.sign(&self.signer)?;
@@ -244,16 +266,21 @@ impl Suite {
         }
     }
 
-    /// A pool creation for the owner's wallet.
+    /// A pool creation for the owner's wallet, with the Awards Report.
     fn pool_call(&self, name: &str, supply: u64) -> Call {
+        self.pool_call_with(name, supply, 1)
+    }
+
+    fn pool_call_with(&self, name: &str, supply: u64, execute_supply: u64) -> Call {
         let body = json!({
             "wallet_id": self.wallet_id,
             "pool_name": name,
-            "drts": [{ "name": "append", "supply": supply }],
-            "schema": { "fields": [
-                { "name": "name", "field_type": { "varchar": 64 }, "nullable": false },
-                { "name": "score", "field_type": "integer", "nullable": false },
-            ]},
+            "append_supply": supply,
+            "analysis": {
+                "code_repo_url": AWARDS_REPORT_URL,
+                "code_hash_hex": hex::encode(Sha256::digest(AWARDS_REPORT)),
+                "supply": execute_supply,
+            },
         });
         self.call(
             &self.owner,
@@ -299,15 +326,19 @@ impl Suite {
     /// `remaining_supply` falls back to the original supply when its RPC
     /// call fails.
     async fn remaining(&self, pool: &str) -> Result<u64, String> {
+        self.remaining_of(pool, "append").await
+    }
+
+    async fn remaining_of(&self, pool: &str, drt: &str) -> Result<u64, String> {
         let summary = self
             .api
             .get(&format!("/v1/drt/pools/{pool}/summary"), &self.owner.token)
             .await?;
         let mint = summary["drts"]
             .as_array()
-            .and_then(|drts| drts.iter().find(|d| d["drt_type"] == "append"))
+            .and_then(|drts| drts.iter().find(|d| d["drt_type"] == drt))
             .and_then(|d| d["mint"].as_str()?.parse::<Pubkey>().ok())
-            .ok_or_else(|| format!("the summary has no append mint: {summary}"))?;
+            .ok_or_else(|| format!("the summary has no {drt} mint: {summary}"))?;
         let mut last = String::new();
         for _ in 0..15 {
             match self.solana.rpc().get_token_supply(&mint).await {
@@ -320,7 +351,31 @@ impl Suite {
             }
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
-        Err(format!("reading the append mint's supply: {last}"))
+        Err(format!("reading the {drt} mint's supply: {last}"))
+    }
+
+    /// The pool's grants to `analyst`, by status.
+    async fn grants_of(&self, pool: &str, analyst: &User) -> Result<Vec<String>, String> {
+        let grants = self
+            .api
+            .get(&format!("/v1/drt/pools/{pool}/grants"), &self.owner.token)
+            .await?;
+        Ok(grants["grants"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|g| g["analyst_user_id"] == analyst.user_id.as_str())
+            .filter_map(|g| g["status"].as_str().map(String::from))
+            .collect())
+    }
+
+    fn grant_call(&self, pool: &str, route: &str, analyst: &User) -> Call {
+        self.call(
+            &self.owner,
+            Method::POST,
+            format!("/v1/drt/pools/{pool}/{route}"),
+            Body::Json(json!({ "analyst_user_id": analyst.user_id, "analysis_id": ANALYSIS })),
+        )
     }
 
     /// How many times `record_id` is in the pool's issuance log.
@@ -365,7 +420,7 @@ impl Suite {
             .await?
             .expect(201)?
             .str("pool_pda")?;
-        let init = self.upload_call(&pool, "initialize", "name,score\nseed,0\n");
+        let init = self.upload_call(&pool, "initialize", &awards_csv("seed"));
         self.api.settle(&init).await?.expect(200)?;
         Ok(pool)
     }
@@ -393,7 +448,7 @@ async fn replays(s: &Suite) -> Result<String, String> {
         return Err(format!("pool {pool} doesn't have exactly one document"));
     }
 
-    let init = s.upload_call(&pool, "initialize", "name,score\nseed,0\n");
+    let init = s.upload_call(&pool, "initialize", &awards_csv("seed"));
     let first = s.api.settle(&init).await?.expect(200)?;
     let again = s.api.settle(&init).await?.expect(200)?;
     if !again.replayed || again.body != first.body {
@@ -421,7 +476,7 @@ async fn issued_once(s: &Suite, pool: &str, call: &Call, before: u64) -> Result<
 /// one response.
 async fn concurrent(s: &Suite, pool: &str) -> Result<(), String> {
     let before = s.remaining(pool).await?;
-    let call = s.upload_call(pool, "issue", "name,score\nconcurrent,1\n");
+    let call = s.upload_call(pool, "issue", &awards_csv("concurrent"));
     let (a, b) = tokio::join!(s.api.settle(&call), s.api.settle(&call));
     let (a, b) = (a?.expect(200)?, b?.expect(200)?);
     if a.body != b.body {
@@ -435,7 +490,7 @@ async fn concurrent(s: &Suite, pool: &str) -> Result<(), String> {
 async fn kills_during_issuance(s: &Suite, pool: &str) -> Result<(), String> {
     for point in SAGA_POINTS {
         let before = s.remaining(pool).await?;
-        let call = s.upload_call(pool, "issue", &format!("name,score\n{point},2\n"));
+        let call = s.upload_call(pool, "issue", &awards_csv(point));
         s.api.crash(&call, point).await?;
         s.api.settle(&call).await?.expect(200)?;
         issued_once(s, pool, &call, before)
@@ -466,7 +521,7 @@ async fn kills_during_pool_creation(s: &Suite) -> Result<(), String> {
 /// no retry, the reconciler adds the entry.
 async fn reconciler(s: &Suite, pool: &str) -> Result<(), String> {
     let before = s.remaining(pool).await?;
-    let call = s.upload_call(pool, "issue", "name,score\nabandoned,3\n");
+    let call = s.upload_call(pool, "issue", &awards_csv("abandoned"));
     s.api.crash(&call, "tx_confirmed").await?;
     let started = Instant::now();
     let record_id = s.record_id(pool, &call);
@@ -481,6 +536,56 @@ async fn reconciler(s: &Suite, pool: &str) -> Result<(), String> {
         started.elapsed().as_secs()
     );
     issued_once(s, pool, &call, before).await
+}
+
+/// Criterion 9: a worker killed after each saga step of a grant, and the
+/// request retried on another, burns one Execute DRT and records one active
+/// grant; a revocation killed the same way ends that grant and burns
+/// nothing.
+async fn kills_during_grants(s: &Suite) -> Result<(), String> {
+    let name = format!("faults-grants-{}", random(1_000_000));
+    let create = s.pool_call_with(&name, 1, SAGA_POINTS.len() as u64);
+    let pool = s.api.settle(&create).await?.expect(201)?.str("pool_pda")?;
+    for point in SAGA_POINTS {
+        let analyst = s.signed_in(&uuid(), "Analyst").await?;
+        let before = s.remaining_of(&pool, ANALYSIS).await?;
+        let grant = s.grant_call(&pool, "grant", &analyst);
+        s.api.crash(&grant, point).await?;
+        s.api.settle(&grant).await?.expect(200)?;
+        let after = s.remaining_of(&pool, ANALYSIS).await?;
+        if after + 1 != before {
+            return Err(format!(
+                "after {point}: the Execute DRTs went from {before} to {after}, not down by 1"
+            ));
+        }
+        let grants = s.grants_of(&pool, &analyst).await?;
+        if grants != ["active"] {
+            return Err(format!(
+                "after {point}: the analyst's grants are {grants:?}"
+            ));
+        }
+
+        let revoke = s.grant_call(&pool, "revoke-grant", &analyst);
+        s.api.crash(&revoke, point).await?;
+        let revoked = s.api.settle(&revoke).await?.expect(200)?;
+        if revoked.body["status"] != "revoked" {
+            return Err(format!(
+                "after {point}: the revocation left {}",
+                revoked.body
+            ));
+        }
+        if s.remaining_of(&pool, ANALYSIS).await? != after {
+            return Err(format!("after {point}: the revocation burned a DRT"));
+        }
+        let grants = s.grants_of(&pool, &analyst).await?;
+        if grants != ["revoked"] {
+            return Err(format!(
+                "after {point}: the analyst's grants are {grants:?}"
+            ));
+        }
+        println!("    killed after {point}: one burn, one grant, revoked once");
+    }
+    Ok(())
 }
 
 /// Criterion 7: two users with one key get different IDs.
@@ -566,7 +671,7 @@ async fn randomised(s: &Suite, pool: &str, runs: u32) -> Result<(), String> {
             0..=2 => {
                 let mode = mode_for(&SAGA_POINTS);
                 let before = s.remaining(pool).await?;
-                let call = s.upload_call(pool, "issue", &format!("name,score\nrun{run},{run}\n"));
+                let call = s.upload_call(pool, "issue", &awards_csv(&format!("run{run}")));
                 exercise(&s.api, &call, mode).await?.expect(200)?;
                 issued_once(s, pool, &call, before).await?;
                 ("issue", mode)
@@ -812,6 +917,10 @@ async fn run_inner(args: &[String]) -> Result<(), String> {
         reconciler(&s, &pool)
     );
     scenario!("7: two users, one key", two_users_one_key(&s));
+    scenario!(
+        "9: kills during a grant and its revocation",
+        kills_during_grants(&s)
+    );
     scenario!(
         format!("6: {runs} randomised runs"),
         randomised(&s, &pool, runs)

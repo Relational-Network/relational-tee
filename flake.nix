@@ -49,10 +49,15 @@
       sourceDateEpoch = toString (self.lastModified or 1);
 
       commonArgs = craneLib: pkgs: {
-        # The Cargo sources, and the JSON schemas their tests check.
+        # The Cargo sources, and the JSON their tests check: the schemas and
+        # the program's IDL.
         src = lib.cleanSourceWith {
           src = lib.cleanSource ./.;
-          filter = path: type: craneLib.filterCargoSources path type || lib.hasSuffix ".schema.json" path;
+          filter =
+            path: type:
+            craneLib.filterCargoSources path type
+            || lib.hasSuffix ".schema.json" path
+            || lib.hasSuffix "/idl/digital_rights_tokens.json" path;
           name = "source";
         };
         strictDeps = true;

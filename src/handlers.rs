@@ -13,7 +13,7 @@ use tracing::info;
 use utoipa::ToSchema;
 
 use crate::auth::Caller;
-use crate::data_validation::{validate_csv_bytes, FieldSchema, ValidationMode, ValidationSummary};
+use crate::data_validation::{validate_csv_bytes, FieldSchema, ValidationSummary};
 use crate::error::ApiError;
 use crate::idempotency::Idempotent;
 use crate::seal::{self, SealedUpload, TransportKeys};
@@ -83,21 +83,15 @@ pub(crate) async fn open_sealed_csv(
 }
 
 /// Validate a CSV payload against the pool's schema.
-///
-/// `mode == None` skips the schema entirely. Other modes need one.
 pub(crate) fn validate_payload(
     schema: &[FieldSchema],
     pool_pda: &str,
     csv_bytes: &[u8],
-    mode: ValidationMode,
 ) -> Result<ValidationSummary, ApiError> {
-    if matches!(mode, ValidationMode::None) {
-        return Ok(validate_csv_bytes(csv_bytes, &[], mode));
-    }
     if schema.is_empty() {
         return Err(ApiError::bad_request(format!(
-            "pool {pool_pda} has no schema — upload one first",
+            "pool {pool_pda} has no schema, so it takes no uploads"
         )));
     }
-    Ok(validate_csv_bytes(csv_bytes, schema, mode))
+    Ok(validate_csv_bytes(csv_bytes, schema))
 }

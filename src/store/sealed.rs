@@ -253,6 +253,21 @@ impl Sealed {
         }
     }
 
+    /// The object at `path`, opened, without caching it: for large objects
+    /// that a caller caches itself.
+    pub async fn read_uncached(
+        &self,
+        path: &str,
+    ) -> Result<Option<Zeroizing<Vec<u8>>>, StoreError> {
+        match self.store.get(path, None).await? {
+            Fetched::Found { body, .. } => Ok(Some(self.keys.open(self.container, path, &body)?)),
+            Fetched::Missing => Ok(None),
+            Fetched::NotModified => Err(StoreError::Invalid(format!(
+                "{path} was \"not modified\" on an unconditional read"
+            ))),
+        }
+    }
+
     /// Create the object unless `path` is taken.
     pub async fn create(&self, path: &str, plain: &[u8]) -> Result<Created, StoreError> {
         let sealed = self.keys.seal(self.container, path, plain);

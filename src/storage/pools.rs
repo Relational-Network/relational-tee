@@ -3,9 +3,9 @@
 
 //! Credential pools: one sealed document per pool, `pools/{pool_pda}.json`,
 //! holding its metadata, schema, who created it with the creation
-//! signature, the initial upload, the issuance log and the revocations. It
-//! is the pool's audit trail. Every pool view reads this one document, and
-//! every change is a compare-and-swap on it.
+//! signature, the initial upload, the issuance log, the revocations and the
+//! analysts' grants. It is the pool's audit trail. Every pool view reads
+//! this one document, and every change is a compare-and-swap on it.
 //!
 //! Each uploaded CSV is its own create-only object,
 //! `pools/{pool_pda}/datasets/{upload_id}`.
@@ -17,9 +17,10 @@ use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 use super::{id, Change, Storage, StoreError};
-use crate::data_validation::{FieldSchema, ValidationMode};
+use crate::data_validation::FieldSchema;
 use crate::store::Created;
 
 /// The record ID of a pool's initial upload.
@@ -74,6 +75,18 @@ pub struct DrtMetadata {
     pub code_hash_hex: String,
 }
 
+/// The analysis a pool's Execute DRT pins: its definition, by hash.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct AnalysisRef {
+    /// The definition's `analysis_id`, also its Execute DRT's name in `drts`.
+    pub analysis_id: String,
+    pub display_name: String,
+    /// Where the definition came from, as recorded on-chain.
+    pub code_repo_url: String,
+    /// SHA-256 of the definition, hex: it is stored as `scripts/{hash}`.
+    pub code_hash_hex: String,
+}
+
 /// One uploaded dataset: the initialisation or an issuance.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Upload {
@@ -115,6 +128,60 @@ pub struct Revocation {
     pub reason: Option<String>,
 }
 
+/// An analyst's access to the pool's analysis, for which one of its Execute
+/// DRTs was burned. Active until revoked.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Grant {
+    /// Names the request that made it.
+    pub grant_id: String,
+    /// The analyst's `user_id`.
+    pub analyst: String,
+    /// The analysis, which is also its Execute DRT's name.
+    pub drt_name: String,
+    /// The grant commitment, hex, of the analyst to that DRT: the same for
+    /// every grant of theirs to it. Its Grant PDA is the on-chain receipt.
+    pub commitment: String,
+    pub granted_by: String,
+    /// When the grant was staged, before its burn.
+    pub granted_at: DateTime<Utc>,
+    /// The `grant_right` burn; a staged grant has none yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoked: Option<GrantRevocation>,
+}
+
+impl Grant {
+    pub fn commitment_bytes(&self) -> Option<[u8; 32]> {
+        hex::decode(&self.commitment).ok()?.try_into().ok()
+    }
+}
+
+/// A grant's revocation. Access ends when it is recorded; closing the Grant
+/// PDA follows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrantRevocation {
+    /// Names the request that revoked it.
+    pub revocation_id: String,
+    pub revoked_by: String,
+    pub revoked_at: DateTime<Utc>,
+    /// The `revoke_grant` that closed the Grant PDA, once it has.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+}
+
+/// What recording a burned grant would do.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Recording<'a> {
+    /// Add it.
+    Add,
+    /// It is there already, or another active grant under its commitment.
+    Present(&'a Grant),
+    /// A grant under its commitment was revoked after it was staged, and
+    /// that revocation stands.
+    Superseded(&'a Grant),
+}
+
 /// The pool document.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PoolDoc {
@@ -131,12 +198,13 @@ pub struct PoolDoc {
     pub owner_wallet_id: String,
     /// Solana public key of the pool owner (base58).
     pub owner_pubkey: String,
-    /// Schema id label.
+    /// Schema id label: the analysis's `analysis_id`.
     pub schema_id: String,
-    /// The CSV schema uploads are validated against.
+    /// The CSV schema uploads are validated against: the analysis's columns.
     pub schema: Vec<FieldSchema>,
-    /// CSV validation strictness.
-    pub validation_mode: ValidationMode,
+    /// The pool's analysis. Pools created before analyses have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analysis: Option<AnalysisRef>,
     /// The `user_id` who created the pool.
     pub created_by: String,
     pub created_at: DateTime<Utc>,
@@ -150,6 +218,9 @@ pub struct PoolDoc {
     pub issuances: Vec<Upload>,
     #[serde(default)]
     pub revocations: Vec<Revocation>,
+    /// Analyst grants, oldest first.
+    #[serde(default)]
+    pub grants: Vec<Grant>,
 }
 
 /// Totals computed from a pool document.
@@ -192,6 +263,43 @@ impl PoolDoc {
         self.revocations
             .iter()
             .any(|r| r.credential_id == credential_id)
+    }
+
+    /// The analyst's active grant to `drt_name`.
+    pub fn active_grant(&self, analyst: &str, drt_name: &str) -> Option<&Grant> {
+        self.grants
+            .iter()
+            .find(|g| g.analyst == analyst && g.drt_name == drt_name && g.revoked.is_none())
+    }
+
+    /// The analyst's newest grant to `drt_name`, active or not.
+    pub fn latest_grant(&self, analyst: &str, drt_name: &str) -> Option<&Grant> {
+        self.grants
+            .iter()
+            .rev()
+            .find(|g| g.analyst == analyst && g.drt_name == drt_name)
+    }
+
+    /// Whether `grant`, whose burn exists, may be added. A grant revoked
+    /// after `grant` was staged wins over it, so a burn that lands after a
+    /// revocation never restores access.
+    pub fn recording(&self, grant: &Grant) -> Recording<'_> {
+        let same = |g: &&Grant| g.commitment == grant.commitment;
+        if let Some(present) = self
+            .grants
+            .iter()
+            .find(|g| g.grant_id == grant.grant_id || (same(g) && g.revoked.is_none()))
+        {
+            return Recording::Present(present);
+        }
+        match self.grants.iter().filter(same).find(|g| {
+            g.revoked
+                .as_ref()
+                .is_some_and(|r| r.revoked_at >= grant.granted_at)
+        }) {
+            Some(revoked) => Recording::Superseded(revoked),
+            None => Recording::Add,
+        }
     }
 }
 
@@ -256,8 +364,8 @@ impl<'a> Pools<'a> {
             .await
     }
 
-    /// Store an uploaded CSV, create-only. The worker never reads datasets
-    /// back, so they aren't cached.
+    /// Store an uploaded CSV, create-only. Analyses cache datasets
+    /// themselves, so the store's cache doesn't hold them.
     pub async fn put_dataset(
         &self,
         pool_pda: &str,
@@ -268,18 +376,19 @@ impl<'a> Pools<'a> {
         self.s.state().create_uncached(&path, csv).await
     }
 
-    #[cfg(test)]
+    /// An uploaded CSV.
     pub async fn read_dataset(
         &self,
         pool_pda: &str,
         upload_id: &str,
-    ) -> Result<Option<Vec<u8>>, StoreError> {
-        Ok(self
-            .s
+    ) -> Result<Option<Zeroizing<Vec<u8>>>, StoreError> {
+        let (Some(pda), Some(upload)) = (id(pool_pda), id(upload_id)) else {
+            return Ok(None);
+        };
+        self.s
             .state()
-            .read(&dataset_path(pool_pda, upload_id))
-            .await?
-            .map(|doc| doc.plain.to_vec()))
+            .read_uncached(&dataset_path(pda, upload))
+            .await
     }
 }
 
@@ -301,16 +410,30 @@ pub(crate) mod tests {
             schema_id: "s1".into(),
             schema: vec![FieldSchema {
                 name: "id".into(),
-                field_type: FieldType::Integer,
+                field_type: FieldType::Text,
                 nullable: false,
             }],
-            validation_mode: ValidationMode::HeadersOnly,
+            analysis: None,
             created_by: "alice".into(),
             created_at: Utc::now(),
             creation_signature: "sig-create".into(),
             initial: None,
             issuances: Vec::new(),
             revocations: Vec::new(),
+            grants: Vec::new(),
+        }
+    }
+
+    pub(crate) fn grant(grant_id: &str, analyst: &str, minutes_ago: i64) -> Grant {
+        Grant {
+            grant_id: grant_id.into(),
+            analyst: analyst.into(),
+            drt_name: "awards-report-v1".into(),
+            commitment: hex::encode([analyst.len() as u8; 32]),
+            granted_by: "alice".into(),
+            granted_at: Utc::now() - chrono::Duration::minutes(minutes_ago),
+            signature: Some(format!("sig-{grant_id}")),
+            revoked: None,
         }
     }
 
@@ -371,6 +494,44 @@ pub(crate) mod tests {
             .is_none());
     }
 
+    #[test]
+    fn a_revocation_wins_over_a_grant_staged_before_it() {
+        let revoked = |mut g: Grant, minutes_ago: i64| {
+            g.revoked = Some(GrantRevocation {
+                revocation_id: "r-1".into(),
+                revoked_by: "alice".into(),
+                revoked_at: Utc::now() - chrono::Duration::minutes(minutes_ago),
+                signature: None,
+            });
+            g
+        };
+        let mut doc = pool("P1", "w1");
+        let staged = grant("g-late", "ana", 10);
+        assert_eq!(doc.recording(&staged), Recording::Add);
+
+        // Recorded once, by request or by reconciler.
+        doc.grants.push(staged.clone());
+        assert_eq!(doc.recording(&staged), Recording::Present(&doc.grants[0]));
+        // Another request's burn under the same commitment finds it.
+        let other = grant("g-other", "ana", 9);
+        assert_eq!(doc.recording(&other), Recording::Present(&doc.grants[0]));
+
+        // A revocation after a grant was staged supersedes it; one before
+        // doesn't.
+        doc.grants[0] = revoked(staged.clone(), 5);
+        assert_eq!(doc.recording(&staged), Recording::Present(&doc.grants[0]));
+        assert_eq!(doc.recording(&other), Recording::Superseded(&doc.grants[0]));
+        let after = grant("g-after", "ana", 1);
+        assert_eq!(doc.recording(&after), Recording::Add);
+        assert_eq!(doc.recording(&grant("g-bo", "bo", 9)), Recording::Add);
+
+        assert!(doc.active_grant("ana", "awards-report-v1").is_none());
+        doc.grants.push(after.clone());
+        assert_eq!(doc.active_grant("ana", "awards-report-v1"), Some(&after));
+        assert_eq!(doc.latest_grant("ana", "awards-report-v1"), Some(&after));
+        assert!(doc.active_grant("ana", "other-analysis").is_none());
+    }
+
     #[tokio::test]
     async fn every_worker_sees_the_same_pools_and_datasets_open_only_in_place() {
         let (a, b, _files) = two_workers();
@@ -393,8 +554,19 @@ pub(crate) mod tests {
             Created::AlreadyExists
         );
         assert_eq!(
-            b.pools().read_dataset("P1", "u1").await.unwrap().unwrap(),
+            b.pools()
+                .read_dataset("P1", "u1")
+                .await
+                .unwrap()
+                .unwrap()
+                .as_slice(),
             b"id\n1\n"
         );
+        assert!(b
+            .pools()
+            .read_dataset("P1", "../u1")
+            .await
+            .unwrap()
+            .is_none());
     }
 }

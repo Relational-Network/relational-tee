@@ -19,12 +19,24 @@ use crate::tee::dev_rsa::RsaSigner;
 /// are the same user.
 pub const DEFAULT_OID: &str = "d0000000-0000-4000-8000-000000000001";
 
-const USAGE: &str = "usage: relational-tee dev-token [--roles R1,R2] [--oid ID] [--tid ID] \
-    [--email E] [--name N] [--azp ID] [--bad expired|not-yet-valid|audience|tenant|client|scope]
+const USAGE: &str = "usage: relational-tee dev-token [--roles R1,R2] [--groups G1,G2] [--oid ID] \
+    [--tid ID] [--email E] [--name N] [--azp ID] \
+    [--bad expired|not-yet-valid|audience|tenant|client|scope]
 
 Prints a token signed with the dev token signing key, for the Entra settings
 in the environment (the dev app registrations by default). --roles defaults to
-Admin; pass --roles '' for none. --bad makes a token the worker must refuse.";
+Admin; pass --roles '' for none. --groups sets the groups claim, which the
+employer-scope mapping turns into the rows an analyst sees. --bad makes a
+token the worker must refuse.";
+
+fn list(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(String::from)
+        .collect()
+}
 
 /// Create the dev token signing key in `dir` if it's missing.
 pub fn generate_missing(dir: &Path) -> std::io::Result<Option<std::path::PathBuf>> {
@@ -47,14 +59,8 @@ pub fn spec_from_args(config: &EntraConfig, args: &[String]) -> Result<Spec, Str
                 .ok_or_else(|| format!("{flag} needs a value\n\n{USAGE}"))
         };
         match flag.as_str() {
-            "--roles" => {
-                spec.roles = value()?
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|r| !r.is_empty())
-                    .map(String::from)
-                    .collect()
-            }
+            "--roles" => spec.roles = list(&value()?),
+            "--groups" => spec.groups = list(&value()?),
             "--oid" => spec.oid = value()?,
             "--tid" => spec.tid = value()?,
             "--email" => spec.email = Some(value()?),
@@ -129,6 +135,14 @@ mod tests {
         assert!(spec.roles.is_empty());
         assert_eq!(spec.oid, "o-1");
         assert!(spec.scp.is_none());
+
+        let spec = spec_from_args(
+            &config(),
+            &args(&["--roles", "Analyst", "--groups", "g-aib, g-ebs,"]),
+        )
+        .unwrap();
+        assert_eq!(spec.roles, ["Analyst"]);
+        assert_eq!(spec.groups, ["g-aib", "g-ebs"]);
 
         let spec = spec_from_args(&config(), &args(&["--bad", "audience"])).unwrap();
         assert_eq!(spec.aud, "api://aa827d93-d487-40bf-8956-b6872ed55290");

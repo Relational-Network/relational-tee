@@ -28,15 +28,26 @@ use crate::error::{code_for_status, ErrorInfo};
 fn event_for(method: &Method, route: &str) -> Option<&'static str> {
     Some(match (method.as_str(), route) {
         ("POST", "/v1/drt/pools/malta") => "pool_created",
-        ("POST", "/v1/drt/pools/{pool_pda}/schema") => "schema_uploaded",
         ("POST", "/v1/drt/pools/{pool_pda}/initialize") => "dataset_initialized",
         ("POST", "/v1/drt/pools/{pool_pda}/issue") => "credential_issued",
         ("POST", "/v1/drt/pools/{pool_pda}/revoke") => "credential_revoked",
+        ("POST", "/v1/drt/pools/{pool_pda}/grant") => "grant_created",
+        ("POST", "/v1/drt/pools/{pool_pda}/revoke-grant") => "grant_revoked",
+        ("POST", "/v1/drt/pools/{pool_pda}/analyses/{analysis_id}/query") => "analysis_queried",
+        ("GET", "/v1/drt/pools/{pool_pda}/analyses/{analysis_id}/options") => {
+            "analysis_options_read"
+        }
+        ("GET", "/v1/drt/pools/{pool_pda}/analyses/{analysis_id}/options/{filter}") => {
+            "analysis_values_searched"
+        }
         ("POST", "/v1/wallets") => "wallet_created",
         ("DELETE", "/v1/wallets/{wallet_id}") => "wallet_deleted",
         ("POST", "/v1/wallets/{wallet_id}/send") => "transaction_sent",
         ("POST", "/v1/admin/wallets/{wallet_id}/suspend") => "wallet_suspended",
         ("POST", "/v1/admin/wallets/{wallet_id}/activate") => "wallet_activated",
+        ("PUT", "/v1/admin/employer-scopes") => "employer_scopes_replaced",
+        ("GET", "/v1/admin/employer-scopes") => "admin_employer_scopes_read",
+        ("GET", "/v1/admin/analysis-log") => "admin_analysis_log_read",
         ("GET", "/v1/admin/status") => "admin_status_read",
         ("GET", "/v1/admin/wallet-stats") => "admin_wallet_stats_read",
         ("GET", "/v1/admin/wallets") => "admin_wallets_listed",
@@ -89,6 +100,16 @@ pub fn upload(record_id: &str, rows: u64) {
         f.record_id = Some(record_id.to_string());
         f.rows = Some(rows);
     });
+}
+
+/// The rows an analysis query returned.
+pub fn rows(rows: u64) {
+    set(|f| f.rows = Some(rows));
+}
+
+/// The grant a request made or revoked, as its `record_id`.
+pub fn grant(grant_id: &str) {
+    set(|f| f.record_id = Some(grant_id.to_string()));
 }
 
 /// The transaction a request sent.

@@ -11,7 +11,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use super::pools::{PoolDoc, Upload};
+use super::pools::{Grant, PoolDoc, Upload};
 use super::{Storage, StoreError};
 use crate::store::Created;
 
@@ -23,6 +23,8 @@ pub enum Saga {
     Pool { pool: Box<PoolDoc> },
     /// An issuance: the upload to add to the pool's log, less its signature.
     Issue { pool_pda: String, upload: Upload },
+    /// A grant: the entry to add to the pool's grants, less its signature.
+    Grant { pool_pda: String, grant: Grant },
 }
 
 /// A staged saga.

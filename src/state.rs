@@ -5,6 +5,8 @@
 
 use std::sync::Arc;
 
+use crate::analysis::fetch::Fetcher;
+use crate::analysis::runner::Analyses;
 use crate::attestation::Attestation;
 use crate::auth::entra::Verifier;
 use crate::blockchain::drt::pda::Commitments;
@@ -49,6 +51,12 @@ pub struct AppState {
     pub commitments: Arc<Commitments>,
     /// Wallet history pages and parsed transactions, read from the chain.
     pub history: Arc<History>,
+
+    // ── Analyses ────────────────────────────────────────────────
+    /// Where pool creation fetches analysis definitions.
+    pub fetcher: Arc<dyn Fetcher>,
+    /// Cached definitions, datasets and tables, and the threads queries run on.
+    pub analyses: Arc<Analyses>,
 }
 
 #[cfg(test)]
@@ -93,6 +101,8 @@ impl AppState {
             )),
             commitments: Arc::new(Commitments::derive(&keys.get(KeyName::Commitment).current)),
             history: Arc::new(History::new(8, std::time::Duration::from_secs(30), 8)),
+            fetcher: Arc::new(crate::analysis::fetch::tests::Fixed::awards_report()),
+            analyses: Arc::default(),
         }
     }
 }

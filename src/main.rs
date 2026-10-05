@@ -14,6 +14,7 @@
 //! just dev    # dev build: plain HTTP on 127.0.0.1:8443
 //! ```
 
+mod analysis;
 mod api;
 mod attestation;
 mod audit;
@@ -97,7 +98,9 @@ Protected endpoints need an Entra ID access token for this API, with the `access
 
 ### Permissions:
 
-The `Admin` app role grants `pools:read`, `pools:create`, `pools:write`, `wallets:read` and `users:read`, and is itself required for wallet creation, deletion and sends and for `/v1/admin/…`. A caller with no role can call only `/v1/users/me` and the pool list. `GET /v1/users/me` lists the caller's permissions.
+The `Admin` app role grants `pools:read`, `pools:create`, `pools:write`, `wallets:read`, `users:read` and `analyses:run`, and is itself required for wallet creation, deletion and sends and for `/v1/admin/…`. The `Analyst` app role grants only `analyses:run`. A caller with no role can call only `/v1/users/me` and the pool list. `GET /v1/users/me` lists the caller's permissions.
+
+An analysis shows admins every row. An analyst sees only the rows `/v1/admin/employer-scopes` maps their Entra security groups (the token's `groups` claim) to; an analyst with no mapped group, or a token whose groups overflowed, sees nothing.
 "#
     ),
     paths(
@@ -123,12 +126,14 @@ The `Admin` app role grants `pools:read`, `pools:create`, `pools:write`, `wallet
         api::admin::list_all_wallets,
         api::admin::suspend_wallet,
         api::admin::activate_wallet,
+        api::admin::get_employer_scopes,
+        api::admin::replace_employer_scopes,
+        api::admin::get_analysis_log,
         // DRT Pool API (new contract)
         api::pools::create_malta_pool,
         api::pools::get_pool,
         api::pools::get_drt,
         // Credential / Pool discovery API
-        api::credentials::schema::upload_schema,
         api::credentials::schema::get_schema,
         api::credentials::initialize::initialize_pool,
         api::credentials::issue::issue_credentials,
@@ -138,6 +143,16 @@ The `Admin` app role grants `pools:read`, `pools:create`, `pools:write`, `wallet
         api::credentials::reads::get_issuance_log,
         api::credentials::reads::list_pools_by_wallet,
         api::credentials::reads::list_all_pools,
+        // Analyst grants
+        api::grants::grant_analysis,
+        api::grants::revoke_grant,
+        api::grants::list_grants,
+        api::grants::my_analyses,
+        // Analyses
+        api::analyses::get_analysis,
+        api::analyses::get_options,
+        api::analyses::search_values,
+        api::analyses::run_query,
     ),
     components(schemas(
         HealthResponse,
@@ -150,7 +165,6 @@ The `Admin` app role grants `pools:read`, `pools:create`, `pools:write`, `wallet
         error::ErrorBody,
         attestation::AttestationResponse,
         data_validation::ValidationError,
-        data_validation::ValidationMode,
         // Wallet schemas
         api::users::UserMeResponse,
         api::users::UsersResponse,
@@ -173,6 +187,11 @@ The `Admin` app role grants `pools:read`, `pools:create`, `pools:write`, `wallet
         api::admin::AdminListWalletsResponse,
         api::admin::AdminWalletEntry,
         api::admin::WalletStatusChangeResponse,
+        api::admin::ReplaceEmployerScopesRequest,
+        api::admin::AnalysisLogResponse,
+        storage::scopes::EmployerScope,
+        storage::scopes::EmployerScopes,
+        storage::analysis_log::AnalysisRecord,
         // Shared domain types
         storage::wallets::WalletResponse,
         history::WalletTransaction,
@@ -180,17 +199,14 @@ The `Admin` app role grants `pools:read`, `pools:create`, `pools:write`, `wallet
         history::TxStatus,
         blockchain::types::TokenBalance,
         // DRT schemas (new contract)
-        blockchain::drt::types::DrtRequest,
-        blockchain::drt::types::SchemaFieldRequest,
-        blockchain::drt::types::InlineSchemaRequest,
+        blockchain::drt::types::AnalysisRequest,
         blockchain::drt::types::CreateMaltaPoolRequest,
         blockchain::drt::types::CreatePoolResponse,
         blockchain::drt::types::DrtConfigResponse,
         blockchain::drt::types::PoolInfoResponse,
         // Credential schemas
-        api::credentials::schema::UploadSchemaRequest,
-        api::credentials::schema::UploadSchemaResponse,
         api::credentials::schema::GetSchemaResponse,
+        storage::pools::AnalysisRef,
         data_validation::FieldSchema,
         data_validation::FieldType,
         seal::SealedUploadForm,
@@ -209,6 +225,28 @@ The `Admin` app role grants `pools:read`, `pools:create`, `pools:write`, `wallet
         api::credentials::reads::AllPoolsResponse,
         api::credentials::reads::IssuanceRecord,
         api::credentials::reads::IssuanceLogResponse,
+        // Grant schemas
+        api::grants::GrantRequest,
+        api::grants::GrantEntry,
+        api::grants::GrantsResponse,
+        api::grants::MyAnalysis,
+        api::grants::MyAnalysesResponse,
+        // Analysis schemas
+        api::analyses::AnalysisSummary,
+        api::analyses::ColumnSummary,
+        api::analyses::FilterSummary,
+        api::analyses::PageSize,
+        api::analyses::ScopeSummary,
+        api::analyses::OptionsResponse,
+        api::analyses::SearchResponse,
+        analysis::query::QueryRequest,
+        analysis::query::FilterRequest,
+        analysis::query::Mode,
+        analysis::query::SortRequest,
+        analysis::query::PageRequest,
+        analysis::query::Page,
+        analysis::query::FilterOptions,
+        analysis::query::OptionValue,
     )),
     modifiers(&SecurityAddon),
     tags(
@@ -222,6 +260,8 @@ The `Admin` app role grants `pools:read`, `pools:create`, `pools:write`, `wallet
         (name = "Transactions", description = "Transaction endpoints"),
         (name = "DRT Pools", description = "Data Rights Token pool endpoints"),
         (name = "Credentials", description = "Credential issuance, revocation, and pool discovery"),
+        (name = "Grants", description = "Analyst access to pools' analyses"),
+        (name = "Analyses", description = "Running a pool's analysis over the caller's rows"),
     )
 )]
 struct ApiDoc;
@@ -555,6 +595,8 @@ async fn main() {
         solana_client: Arc::new(solana_client),
         commitments,
         history,
+        fetcher: Arc::new(analysis::fetch::GitHub::new()),
+        analyses: Arc::default(),
     };
 
     state.health.spawn_canary(state.storage.clone());
@@ -827,7 +869,8 @@ mod tests {
                 "pools:create",
                 "pools:write",
                 "wallets:read",
-                "users:read"
+                "users:read",
+                "analyses:run"
             ])
         );
         assert_eq!(me["email"], "Ada@Example.com");
@@ -859,6 +902,18 @@ mod tests {
         assert_eq!(next["users"][0]["user_id"], them["user_id"]);
         assert!(next.get("next_cursor").is_none());
 
+        // An analyst may run analyses, and nothing else.
+        let analyst = token(&["Analyst"], "cy@example.com");
+        let (_, cy) = get_as(&app, &analyst, "/v1/users/me").await;
+        assert_eq!(cy["permissions"], serde_json::json!(["analyses:run"]));
+        for path in ["/v1/users", "/v1/wallets", "/v1/admin/employer-scopes"] {
+            assert_eq!(
+                get_as(&app, &analyst, path).await.0,
+                StatusCode::FORBIDDEN,
+                "{path}"
+            );
+        }
+
         // Tokens that fail validation are 401.
         let mut expired = Spec::valid(&config());
         expired.expires_in = -3600;
@@ -866,6 +921,88 @@ mod tests {
             get_as(&app, &expired.sign(entra_key()).unwrap(), "/v1/users/me").await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert_eq!(body["error"], "invalid or expired token");
+    }
+
+    #[tokio::test]
+    async fn admins_replace_the_employer_scopes_from_the_version_they_read() {
+        use auth::entra::mint::Spec;
+        use auth::entra::tests::{config, entra_key};
+        use serde_json::json;
+
+        let app = router(AppState::for_tests());
+        let mut spec = Spec::valid(&config());
+        spec.roles = vec!["Admin".into()];
+        let admin = spec.sign(entra_key()).unwrap();
+        let put = |key: String, body: serde_json::Value| {
+            let request = Request::put("/v1/admin/employer-scopes")
+                .header(header::AUTHORIZATION, format!("Bearer {admin}"))
+                .header("idempotency-key", key)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let app = app.clone();
+            async move {
+                let response = app.oneshot(request).await.unwrap();
+                let status = response.status();
+                let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+                (
+                    status,
+                    serde_json::from_slice::<serde_json::Value>(&body).unwrap_or_default(),
+                )
+            }
+        };
+        let new_key = || uuid::Uuid::new_v4().to_string();
+
+        let (status, empty) = get_as(&app, &admin, "/v1/admin/employer-scopes").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(empty, json!({ "version": 0, "scopes": [] }));
+
+        let scopes = json!([
+            { "group_id": "g-aib", "label": "UAT_EDQ_CP_AIB", "employer_group": "AIB" },
+            { "group_id": "g-ebs", "label": "UAT_EDQ_EBS_NETWORK", "employer": "EBS Network" },
+        ]);
+        let key = new_key();
+        let (status, first) = put(key.clone(), json!({ "version": 0, "scopes": scopes })).await;
+        assert_eq!(status, StatusCode::OK, "{first}");
+        assert_eq!((&first["version"], &first["scopes"]), (&json!(1), &scopes));
+
+        // A retry replays, and the same edit under a new key converges.
+        assert_eq!(
+            put(key, json!({ "version": 0, "scopes": scopes })).await,
+            (StatusCode::OK, first.clone())
+        );
+        let (status, again) = put(new_key(), json!({ "version": 0, "scopes": scopes })).await;
+        assert_eq!((status, &again["version"]), (StatusCode::OK, &json!(1)));
+        assert_eq!(
+            get_as(&app, &admin, "/v1/admin/employer-scopes").await,
+            (StatusCode::OK, first)
+        );
+
+        // A stale edit, an entry with two targets and an unknown field are
+        // refused.
+        let (status, body) = put(new_key(), json!({ "version": 0, "scopes": [] })).await;
+        assert_eq!(
+            (status, body["code"].as_str()),
+            (StatusCode::CONFLICT, Some("version_conflict"))
+        );
+        let both = json!([{
+            "group_id": "g", "label": "G", "employer_group": "AIB", "employer": "EBS Network"
+        }]);
+        let (status, _) = put(new_key(), json!({ "version": 1, "scopes": both })).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = put(
+            new_key(),
+            json!({ "version": 1, "scopes": [], "everyone": true }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+        let (status, cleared) = put(new_key(), json!({ "version": 1, "scopes": [] })).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            (&cleared["version"], &cleared["scopes"]),
+            (&json!(2), &json!([]))
+        );
     }
 
     #[tokio::test]
@@ -885,6 +1022,8 @@ mod tests {
             "/v1/attestation",
             "/v1/reference-values",
             "/v1/admin/status",
+            "/v1/admin/analysis-log",
+            "/v1/admin/employer-scopes",
             "/v1/admin/wallet-stats",
             "/v1/admin/wallets",
             "/v1/admin/wallets/{wallet_id}/activate",
@@ -898,16 +1037,24 @@ mod tests {
             "/v1/wallets/{wallet_id}/send",
             "/v1/wallets/{wallet_id}/transactions",
             "/v1/wallets/{wallet_id}/transactions/{signature}",
+            "/v1/drt/me/analyses",
             "/v1/drt/pools/by-wallet/{wallet_id}",
             "/v1/drt/pools/list",
             "/v1/drt/pools/malta",
             "/v1/drt/pools/{pool_pda}",
+            "/v1/drt/pools/{pool_pda}/analyses/{analysis_id}",
+            "/v1/drt/pools/{pool_pda}/analyses/{analysis_id}/options",
+            "/v1/drt/pools/{pool_pda}/analyses/{analysis_id}/options/{filter}",
+            "/v1/drt/pools/{pool_pda}/analyses/{analysis_id}/query",
             "/v1/drt/pools/{pool_pda}/drt/{drt_name}",
+            "/v1/drt/pools/{pool_pda}/grant",
+            "/v1/drt/pools/{pool_pda}/grants",
             "/v1/drt/pools/{pool_pda}/initialize",
             "/v1/drt/pools/{pool_pda}/issuance-log",
             "/v1/drt/pools/{pool_pda}/issue",
             "/v1/drt/pools/{pool_pda}/revocations",
             "/v1/drt/pools/{pool_pda}/revoke",
+            "/v1/drt/pools/{pool_pda}/revoke-grant",
             "/v1/drt/pools/{pool_pda}/schema",
             "/v1/drt/pools/{pool_pda}/summary",
         ]);

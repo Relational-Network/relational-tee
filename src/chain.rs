@@ -2,7 +2,8 @@
 // Copyright (C) 2026 Relational Network
 
 //! The stored-transaction rule, for every chain write an idempotent request
-//! makes: creating a pool, burning an append DRT, sending a transfer.
+//! makes: creating a pool, burning a DRT, closing a grant, sending a
+//! transfer.
 //!
 //! 1. Before sending, the step stores its signed transaction and last valid
 //!    block height in the request's idempotency record, by compare-and-swap.
@@ -33,8 +34,36 @@ use crate::idempotency::{Operation, StoredTx};
 pub enum Effect {
     /// An account the transaction creates: a pool, or a Grant PDA.
     Account(Pubkey),
+    /// An account the transaction closes: a revoked Grant PDA.
+    Closed(Pubkey),
     /// The transaction itself, for a transfer.
     Transfer,
+}
+
+impl Effect {
+    /// The effect's signature if it has happened, as seen at `commitment`.
+    async fn done(
+        &self,
+        solana: &SolanaClient,
+        stored: Option<&str>,
+        commitment: &str,
+    ) -> Result<Option<String>, ApiError> {
+        let (account, created) = match self {
+            Self::Account(account) => (account, true),
+            Self::Closed(account) => (account, false),
+            Self::Transfer => return Ok(None),
+        };
+        let exists = solana
+            .rpc()
+            .account_exists(account, commitment)
+            .await
+            .map_err(rpc_error("account lookup failed"))?;
+        Ok(match (created, exists) {
+            (true, true) => Some(creating_signature(solana, stored, account, commitment).await?),
+            (false, false) => Some(closing_signature(solana, stored, account, commitment).await?),
+            _ => None,
+        })
+    }
 }
 
 fn rpc_error(what: &str) -> impl FnOnce(RpcError) -> ApiError + '_ {
@@ -117,6 +146,34 @@ pub async fn creating_signature(
     oldest.ok_or_else(|| ApiError::rpc_unavailable(format!("no transaction created {account}")))
 }
 
+/// The signature of the transaction that closed `account`, which existed
+/// and is gone: `stored` if that transaction succeeded, or else the newest
+/// successful transaction that touched the account.
+async fn closing_signature(
+    solana: &SolanaClient,
+    stored: Option<&str>,
+    account: &Pubkey,
+    commitment: &str,
+) -> Result<String, ApiError> {
+    let rpc = solana.rpc();
+    if let Some(signature) = stored {
+        let status = rpc
+            .signature_status(signature)
+            .await
+            .map_err(rpc_error("status lookup failed"))?;
+        if status.is_some_and(|s| s.err.is_none()) {
+            return Ok(signature.to_string());
+        }
+    }
+    rpc.get_signatures_for_address(account, None, None, Some(100), commitment)
+        .await
+        .map_err(rpc_error("signature lookup failed"))?
+        .into_iter()
+        .find(|s| s.err.is_none())
+        .map(|s| s.signature)
+        .ok_or_else(|| ApiError::rpc_unavailable(format!("no transaction closed {account}")))
+}
+
 /// Run one chain step under the stored-transaction rule and return the
 /// signature of the transaction that made its effect, once that has
 /// reached `commitment`.
@@ -128,15 +185,9 @@ pub async fn run(
     build: impl Fn(Hash) -> Transaction,
 ) -> Result<String, ApiError> {
     let rpc = solana.rpc();
-    if let Effect::Account(account) = effect {
-        let exists = rpc
-            .account_exists(account, commitment)
-            .await
-            .map_err(rpc_error("account lookup failed"))?;
-        if exists {
-            let stored = op.stored_tx().map(|s| s.signature.clone());
-            return creating_signature(solana, stored.as_deref(), account, commitment).await;
-        }
+    let stored = op.stored_tx().map(|s| s.signature.clone());
+    if let Some(signature) = effect.done(solana, stored.as_deref(), commitment).await? {
+        return Ok(signature);
     }
 
     let to_send = match op.stored_tx().cloned() {
@@ -175,14 +226,8 @@ pub async fn run(
                 }
                 None if height <= stored.last_valid_block_height => stored,
                 None => {
-                    if let Effect::Account(account) = effect {
-                        let exists = rpc
-                            .account_exists(account, "finalized")
-                            .await
-                            .map_err(rpc_error("account lookup failed"))?;
-                        if exists {
-                            return creating_signature(solana, None, account, "finalized").await;
-                        }
+                    if let Some(signature) = effect.done(solana, None, "finalized").await? {
+                        return Ok(signature);
                     }
                     let fresh = sign(solana, &build).await?;
                     op.store_tx(fresh, Some(&stored.signature)).await?
@@ -315,6 +360,52 @@ mod tests {
         let (signature, _) = s.retry(&Effect::Account(grant), "finalized").await;
         assert_eq!(signature, first.signature);
         assert!(s.chain.sent().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_closed_account_is_never_closed_again() {
+        let grant = Pubkey::new_from_array([5; 32]);
+
+        // The stored close landed, and the account is gone.
+        let s = setup();
+        let first = s.stored_then_died().await;
+        s.chain.land(&first.signature, true);
+        let (signature, _) = s.retry(&Effect::Closed(grant), "finalized").await;
+        assert_eq!(signature, first.signature);
+        assert!(s.chain.sent().is_empty());
+
+        // The stored close expired unsent, but another closed the account:
+        // the newest successful transaction that touched it.
+        let s = setup();
+        s.stored_then_died().await;
+        s.chain.block_height.store(100 + VALID_FOR + 1, SeqCst);
+        let failed = json!({ "InstructionError": [0, "Custom"] });
+        *s.chain.history.lock().unwrap() = vec![
+            json!({ "signature": "sig-failed", "err": failed }),
+            json!({ "signature": "sig-close", "err": null }),
+            json!({ "signature": "sig-grant", "err": null }),
+        ];
+        let (signature, _) = s.retry(&Effect::Closed(grant), "finalized").await;
+        assert_eq!(signature, "sig-close");
+        assert!(s.chain.sent().is_empty());
+
+        // While the account exists, the close is sent.
+        let s = setup();
+        s.chain.accounts.lock().unwrap().push(grant);
+        s.chain.lands.store(true, SeqCst);
+        let mut op = s.open().await;
+        let build = signed(&s.keypair, &s.transfer);
+        let signature = run(
+            &s.solana,
+            &mut op,
+            &Effect::Closed(grant),
+            "finalized",
+            build,
+        )
+        .await
+        .unwrap();
+        assert_eq!(s.chain.sent().len(), 1);
+        assert_eq!(op.stored_tx().unwrap().signature, signature);
     }
 
     #[tokio::test]

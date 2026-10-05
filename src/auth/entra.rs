@@ -10,6 +10,11 @@
 //! The `rsa` crate is never involved: jsonwebtoken verifies RS256 through
 //! aws-lc-rs, with public keys only.
 //!
+//! The `groups` claim lists the caller's security groups. A user in more
+//! groups than a token can hold gets an overage marker instead, which points
+//! at Microsoft Graph; the worker doesn't call Graph, so such a caller's
+//! groups are unknown and resolve to no employer scope.
+//!
 //! Dev builds trust one more key, the dev token signing key, so tests and
 //! scripts can mint tokens offline. Release builds contain no such key.
 
@@ -67,6 +72,42 @@ struct RawClaims {
     email: Option<String>,
     #[serde(default)]
     name: Option<String>,
+    #[serde(default)]
+    groups: Vec<String>,
+    /// The overage markers: `_claim_names.groups` in access tokens,
+    /// `hasgroups` in tokens from the implicit flow.
+    #[serde(default, rename = "_claim_names")]
+    claim_names: Option<serde_json::Value>,
+    #[serde(default)]
+    hasgroups: Option<serde_json::Value>,
+}
+
+impl RawClaims {
+    fn groups(&mut self) -> Groups {
+        let overage = self
+            .claim_names
+            .as_ref()
+            .is_some_and(|names| names.get("groups").is_some())
+            || self
+                .hasgroups
+                .as_ref()
+                .is_some_and(|has| *has != serde_json::Value::Bool(false));
+        if overage {
+            Groups::Overage
+        } else {
+            Groups::Listed(std::mem::take(&mut self.groups))
+        }
+    }
+}
+
+/// The security groups a token names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Groups {
+    /// Every group the caller is in (possibly none), by the value the
+    /// `groups` claim carries: the group's object ID.
+    Listed(Vec<String>),
+    /// Too many to list: the caller's groups are unknown.
+    Overage,
 }
 
 /// What a valid token says about its caller.
@@ -75,6 +116,7 @@ pub struct Claims {
     pub tid: String,
     pub oid: String,
     pub roles: Vec<String>,
+    pub groups: Groups,
     pub email: Option<String>,
     pub name: Option<String>,
 }
@@ -150,7 +192,7 @@ impl Verifier {
         validation.set_audience(&[&self.config.api_client_id]);
         validation.required_spec_claims =
             HashSet::from(["exp", "nbf", "iss", "aud"].map(String::from));
-        let claims = decode::<RawClaims>(token, &key, &validation)
+        let mut claims = decode::<RawClaims>(token, &key, &validation)
             .map_err(|e| Rejected::Invalid(e.to_string()))?
             .claims;
 
@@ -169,6 +211,7 @@ impl Verifier {
             return Err(Rejected::Scope);
         }
         Ok(Claims {
+            groups: claims.groups(),
             tid: claims.tid,
             oid: claims.oid,
             roles: claims.roles,
@@ -197,6 +240,10 @@ pub mod mint {
         pub azp: String,
         pub scp: Option<String>,
         pub roles: Vec<String>,
+        pub groups: Vec<String>,
+        /// Send the overage marker instead of `groups`, as Entra ID does for
+        /// a user in too many groups.
+        pub groups_overage: bool,
         pub email: Option<String>,
         pub name: Option<String>,
         /// Seconds from now; negative for an expired token.
@@ -219,6 +266,8 @@ pub mod mint {
                     .unwrap_or_default(),
                 scp: Some(super::SCOPE.into()),
                 roles: Vec::new(),
+                groups: Vec::new(),
+                groups_overage: false,
                 email: None,
                 name: None,
                 expires_in: 3600,
@@ -252,6 +301,15 @@ pub mod mint {
                 if let Some(value) = value {
                     claims[name] = json!(value);
                 }
+            }
+            if self.groups_overage {
+                claims["_claim_names"] = json!({ "groups": "src1" });
+                claims["_claim_sources"] = json!({ "src1": { "endpoint": format!(
+                    "https://graph.microsoft.com/v1.0/users/{}/getMemberObjects",
+                    self.oid
+                ) } });
+            } else if !self.groups.is_empty() {
+                claims["groups"] = json!(self.groups);
             }
             claims
         }
@@ -322,6 +380,30 @@ pub(crate) mod tests {
         spec.expires_in = 3600;
         spec.not_before_in = 30;
         assert!(check(&spec).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn groups_are_listed_unless_the_token_has_an_overage_marker() {
+        let mut spec = Spec::valid(&config());
+        assert_eq!(check(&spec).await.unwrap().groups, Groups::Listed(vec![]));
+        spec.groups = vec!["group-aib".into(), "group-ebs".into()];
+        assert_eq!(
+            check(&spec).await.unwrap().groups,
+            Groups::Listed(vec!["group-aib".into(), "group-ebs".into()])
+        );
+
+        spec.groups_overage = true;
+        assert_eq!(check(&spec).await.unwrap().groups, Groups::Overage);
+
+        // An implicit-flow marker counts too, even next to a groups claim.
+        let mut claims = Spec::valid(&config()).claims();
+        claims["groups"] = serde_json::json!(["group-aib"]);
+        claims["hasgroups"] = serde_json::json!(true);
+        let token = entra_key().sign(serde_json::json!({}), &claims).unwrap();
+        assert_eq!(
+            verifier().verify(&token).await.unwrap().groups,
+            Groups::Overage
+        );
     }
 
     #[tokio::test]

@@ -55,16 +55,16 @@ fn validation_failed(errors: usize) -> ApiError {
         .with_code("validation_failed")
 }
 
-fn pool_not_found(pool_pda: &str) -> ApiError {
+pub(crate) fn pool_not_found(pool_pda: &str) -> ApiError {
     ApiError::not_found(format!("pool metadata not found for {pool_pda}"))
 }
 
-fn parse_pda(pool_pda: &str) -> Result<Pubkey, ApiError> {
+pub(crate) fn parse_pda(pool_pda: &str) -> Result<Pubkey, ApiError> {
     Pubkey::from_str(pool_pda).map_err(|_| ApiError::bad_request("invalid pool PDA address"))
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::time::Instant;
@@ -82,7 +82,7 @@ mod tests {
     use crate::blockchain::drt::types::{Pool, APPEND_DRT_NAME, DISC_POOL_ACCOUNT};
     use crate::blockchain::fake::{self, FakeChain};
     use crate::config::MAX_BODY_SIZE;
-    use crate::data_validation::{FieldSchema, ValidationMode};
+    use crate::data_validation::{FieldSchema, FieldType};
     use crate::idempotency::{KEY_HEADER, REPLAYED_HEADER};
     use crate::seal::request_aad;
     use crate::seal::tests::{form, sealed_form, BOUNDARY};
@@ -93,7 +93,7 @@ mod tests {
     use crate::tee::tests::fixed_key;
     use crate::tee::EcKey;
 
-    const POOL_UUID: [u8; 16] = [7; 16];
+    pub(crate) const POOL_UUID: [u8; 16] = [7; 16];
     const APPEND_RIGHT_ID: [u8; 16] = [8; 16];
     const CSV: &[u8] = b"name,score\nalice,1\nbob,2\n";
 
@@ -104,7 +104,10 @@ mod tests {
         spec.sign(entra_key()).unwrap()
     }
 
-    async fn send(app: &Router, request: Request<Body>) -> (StatusCode, HeaderMap, Value) {
+    pub(crate) async fn send(
+        app: &Router,
+        request: Request<Body>,
+    ) -> (StatusCode, HeaderMap, Value) {
         let response = app.clone().oneshot(request).await.unwrap();
         let (parts, body) = response.into_parts();
         let body = to_bytes(body, 1 << 20).await.unwrap();
@@ -128,45 +131,55 @@ mod tests {
     }
 
     /// A worker on a fake chain.
-    struct Worker {
-        app: Router,
-        chain: Arc<FakeChain>,
-        storage: Arc<Storage>,
+    pub(crate) struct Worker {
+        pub app: Router,
+        pub chain: Arc<FakeChain>,
+        pub storage: Arc<Storage>,
+        pub commitments: Arc<Commitments>,
         transport: Arc<EcKey>,
     }
 
     /// An admin who has signed in and has a wallet.
-    struct Admin {
-        token: String,
-        user_id: String,
-        wallet_id: String,
-        address: Pubkey,
+    pub(crate) struct Admin {
+        pub token: String,
+        pub user_id: String,
+        pub wallet_id: String,
+        pub address: Pubkey,
     }
 
-    fn worker() -> Worker {
+    pub(crate) fn worker() -> Worker {
         let chain = Arc::new(FakeChain::default());
         let mut state = AppState::for_tests();
         state.solana_client = Arc::new(fake::start(chain.clone()));
         let transport = state.transport.get(state.transport.current_kid()).unwrap();
         let storage = state.storage.clone();
+        let commitments = state.commitments.clone();
         Worker {
             app: crate::router(state),
             chain,
             storage,
+            commitments,
             transport,
         }
+    }
+
+    /// The caller's user ID, which their first request creates.
+    pub(crate) async fn sign_in(app: &Router, token: &str) -> String {
+        let me = Request::get("/v1/users/me")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _, me) = send(app, me).await;
+        assert_eq!(status, StatusCode::OK, "{me}");
+        me["user_id"].as_str().unwrap().into()
     }
 
     impl Worker {
         /// An admin who learns their user ID, as the dashboard does, and
         /// creates a wallet.
-        async fn admin(&self, oid: &str) -> Admin {
+        pub(crate) async fn admin(&self, oid: &str) -> Admin {
             let token = admin_token(oid);
-            let me = Request::get("/v1/users/me")
-                .header(header::AUTHORIZATION, format!("Bearer {token}"))
-                .body(Body::empty())
-                .unwrap();
-            let (_, _, me) = send(&self.app, me).await;
+            let user_id = sign_in(&self.app, &token).await;
             let create_wallet = Request::post("/v1/wallets")
                 .header(header::AUTHORIZATION, format!("Bearer {token}"))
                 .header(&KEY_HEADER, uuid::Uuid::new_v4().to_string())
@@ -178,7 +191,7 @@ mod tests {
             let wallet = &wallet["wallet"];
             Admin {
                 token,
-                user_id: me["user_id"].as_str().unwrap().into(),
+                user_id,
                 wallet_id: wallet["wallet_id"].as_str().unwrap().into(),
                 address: Pubkey::from_str(wallet["public_address"].as_str().unwrap()).unwrap(),
             }
@@ -186,7 +199,7 @@ mod tests {
 
         /// A pool of `owner`'s, on chain and in storage, with an append DRT
         /// whose mint is `append_mint`, and `initial` as its first upload.
-        async fn pool(&self, owner: &Admin, initial: Option<Upload>) -> Pubkey {
+        pub(crate) async fn pool(&self, owner: &Admin, initial: Option<Upload>) -> Pubkey {
             let pool_pda = Pubkey::new_unique();
             let account = Pool {
                 uuid: POOL_UUID,
@@ -215,29 +228,35 @@ mod tests {
                     owner_wallet_id: owner.wallet_id.clone(),
                     owner_pubkey: owner.address.to_string(),
                     schema_id: "s".into(),
-                    schema: Vec::new(),
-                    validation_mode: ValidationMode::None,
+                    schema: ["name", "score"]
+                        .map(|name| FieldSchema {
+                            name: name.into(),
+                            field_type: FieldType::Text,
+                            nullable: false,
+                        })
+                        .to_vec(),
+                    analysis: None,
                     created_by: owner.user_id.clone(),
                     created_at: chrono::Utc::now(),
                     creation_signature: "sig".into(),
                     initial,
                     issuances: Vec::new(),
                     revocations: Vec::new(),
+                    grants: Vec::new(),
                 })
                 .await
                 .unwrap();
             pool_pda
         }
 
-        /// A pool as [`Self::pool`] makes it, without an initial upload, that
-        /// checks every upload against `schema` in Strict mode.
-        async fn strict_pool(&self, owner: &Admin, schema: Vec<FieldSchema>) -> Pubkey {
+        /// A pool as [`Self::pool`] makes it, without an initial upload,
+        /// whose uploads are checked against `schema`.
+        async fn pool_with_schema(&self, owner: &Admin, schema: Vec<FieldSchema>) -> Pubkey {
             let pool_pda = self.pool(owner, None).await;
             self.storage
                 .pools()
                 .update::<ApiError>(&pool_pda.to_string(), |doc| {
                     doc.schema = schema.clone();
-                    doc.validation_mode = ValidationMode::Strict;
                     Ok(Change::Changed)
                 })
                 .await
@@ -247,10 +266,17 @@ mod tests {
 
         /// `holder` owns `amount` of the pool's append DRT.
         fn holds_append_drts(&self, holder: &Admin, pool_pda: &Pubkey, amount: u64) {
+            self.holds(holder, &append_mint(pool_pda), amount);
+        }
+
+        /// `holder` owns `amount` of the DRT whose mint is `mint`.
+        pub(crate) fn holds(&self, holder: &Admin, mint: &Pubkey, amount: u64) {
             let mut account = vec![0u8; 165];
             account[64..72].copy_from_slice(&amount.to_le_bytes());
-            let ata = derive_user_ata(&holder.address, &append_mint(pool_pda));
-            self.chain.data.lock().unwrap().push((ata, account));
+            let ata = derive_user_ata(&holder.address, mint);
+            let mut data = self.chain.data.lock().unwrap();
+            data.retain(|(address, _)| *address != ata);
+            data.push((ata, account));
         }
 
         /// `csv`, sealed for `admin`'s `POST` of `path` with `key`.
@@ -266,7 +292,7 @@ mod tests {
         Pubkey::find_program_address(&[b"append", pool_pda.as_ref()], &Pubkey::default()).0
     }
 
-    fn initial_upload(uploaded_by: &str) -> Upload {
+    pub(crate) fn initial_upload(uploaded_by: &str) -> Upload {
         Upload {
             record_id: INITIAL.into(),
             upload_id: "first".into(),
@@ -331,7 +357,7 @@ mod tests {
             .read_dataset(&pool_pda.to_string(), &upload_id)
             .await
             .unwrap();
-        assert_eq!(stored.as_deref(), Some(csv));
+        assert_eq!(stored.as_deref().map(Vec::as_slice), Some(csv));
 
         // A retry sealed afresh replays: the fingerprint covers the plaintext.
         let resealed = sealed_form(transport, &aad, csv);
@@ -443,22 +469,12 @@ mod tests {
                 .body(Body::from(body.to_string()))
                 .unwrap()
         };
-        let schema = json!({
-            "schema_id": "s",
-            "fields": [{ "name": "score", "field_type": "integer", "nullable": false }],
-        });
         let revoke = json!({ "wallet_id": other.wallet_id, "credential_ids": [INITIAL] });
 
-        let mut requests = vec![
-            (
-                "schema",
-                json_post(format!("{base}/schema"), &other.token, &schema),
-            ),
-            (
-                "revoke",
-                json_post(format!("{base}/revoke"), &other.token, &revoke),
-            ),
-        ];
+        let mut requests = vec![(
+            "revoke",
+            json_post(format!("{base}/revoke"), &other.token, &revoke),
+        )];
         for route in ["initialize", "issue"] {
             let path = format!("{base}/{route}");
             let key = uuid::Uuid::new_v4().to_string();
@@ -475,9 +491,128 @@ mod tests {
         }
 
         // The pool's owner gets past the same check.
-        let request = json_post(format!("{base}/schema"), &owner.token, &schema);
-        let (status, _, saved) = send(&worker.app, request).await;
-        assert_eq!(status, StatusCode::OK, "{saved}");
+        let revoke = json!({ "wallet_id": owner.wallet_id, "credential_ids": [INITIAL] });
+        let request = json_post(format!("{base}/revoke"), &owner.token, &revoke);
+        let (status, _, revoked) = send(&worker.app, request).await;
+        assert_eq!(status, StatusCode::OK, "{revoked}");
+    }
+
+    /// `admin`'s request to create a pool with `analysis`.
+    fn create_pool(admin: &Admin, analysis: Value) -> Request<Body> {
+        let body = json!({
+            "wallet_id": admin.wallet_id,
+            "pool_name": "Awards",
+            "append_supply": 3,
+            "analysis": analysis,
+        });
+        Request::post("/v1/drt/pools/malta")
+            .header(header::AUTHORIZATION, format!("Bearer {}", admin.token))
+            .header(&KEY_HEADER, uuid::Uuid::new_v4().to_string())
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    fn awards_report_hash() -> String {
+        hex::encode(Sha256::digest(
+            crate::analysis::definition::tests::AWARDS_REPORT,
+        ))
+    }
+
+    #[tokio::test]
+    async fn a_pool_takes_its_schema_and_execute_drt_from_its_analysis() {
+        use crate::analysis::fetch::tests::AWARDS_REPORT_URL;
+
+        let worker = worker();
+        let admin = worker.admin("oid-admin").await;
+        worker
+            .chain
+            .lands
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let hash = awards_report_hash();
+        let analysis =
+            json!({ "code_repo_url": AWARDS_REPORT_URL, "code_hash_hex": hash, "supply": 200 });
+        let (status, _, created) = send(&worker.app, create_pool(&admin, analysis)).await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        assert!(
+            created["mints"]["awards-report-v1"].is_string(),
+            "{created}"
+        );
+
+        let pool_pda = created["pool_pda"].as_str().unwrap();
+        let doc = worker.storage.pools().get(pool_pda).await.unwrap().unwrap();
+        assert_eq!(doc.schema, crate::data_validation::tests::awards_schema());
+        assert_eq!(doc.schema_id, "awards-report-v1");
+        let analysis = doc.analysis.clone().unwrap();
+        assert_eq!(
+            (
+                analysis.code_repo_url.as_str(),
+                analysis.code_hash_hex.as_str()
+            ),
+            (AWARDS_REPORT_URL, hash.as_str())
+        );
+        let execute = &doc.drts["awards-report-v1"];
+        assert_eq!(
+            (execute.supply, execute.code_repo_url.as_str()),
+            (200, AWARDS_REPORT_URL)
+        );
+        assert_eq!(doc.drts[APPEND_DRT_NAME].supply, 3);
+        assert!(
+            worker.storage.scripts().get(&hash).await.unwrap().is_some(),
+            "stored by hash"
+        );
+
+        let schema = Request::get(format!("/v1/drt/pools/{pool_pda}/schema"))
+            .header(header::AUTHORIZATION, format!("Bearer {}", admin.token))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _, schema) = send(&worker.app, schema).await;
+        assert_eq!(status, StatusCode::OK, "{schema}");
+        assert_eq!(
+            schema["fields"][0],
+            json!({ "name": "Staff Number", "field_type": "text", "nullable": true })
+        );
+        assert_eq!(schema["fields"][5]["field_type"], "date");
+    }
+
+    #[tokio::test]
+    async fn pool_creation_refuses_an_analysis_that_does_not_check_out() {
+        use crate::analysis::fetch::tests::AWARDS_REPORT_URL;
+
+        let worker = worker();
+        let admin = worker.admin("oid-admin").await;
+        let hash = awards_report_hash();
+        let elsewhere = AWARDS_REPORT_URL.replace("awards-report-v1.toml", "other.toml");
+        for (analysis, says) in [
+            (
+                json!({ "code_repo_url": AWARDS_REPORT_URL, "code_hash_hex": "ab".repeat(32), "supply": 1 }),
+                "doesn't hash",
+            ),
+            (
+                json!({ "code_repo_url": "https://example.com/awards.toml", "code_hash_hex": hash, "supply": 1 }),
+                "isn't under",
+            ),
+            (
+                json!({ "code_repo_url": elsewhere, "code_hash_hex": hash, "supply": 1 }),
+                "404",
+            ),
+            (
+                json!({ "code_repo_url": AWARDS_REPORT_URL, "code_hash_hex": "00".repeat(32), "supply": 1 }),
+                "SHA-256",
+            ),
+            (
+                json!({ "code_repo_url": AWARDS_REPORT_URL, "code_hash_hex": hash, "supply": 0 }),
+                "supply",
+            ),
+        ] {
+            let (status, _, err) = send(&worker.app, create_pool(&admin, analysis.clone())).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{analysis}: {err}");
+            assert!(
+                err["error"].as_str().unwrap().contains(says),
+                "{analysis}: {err}"
+            );
+        }
+        assert!(worker.chain.sent().is_empty(), "nothing reached the chain");
     }
 
     #[tokio::test]
@@ -531,78 +666,65 @@ mod tests {
         assert_eq!(seen, ["P0", "P1", "P2", "P3", "P4"]);
     }
 
-    /// Row `i`'s value in the pilot schema's column `name`, at a typical length.
-    fn pilot_value(name: &str, i: usize) -> String {
-        const RESULTS: [&str; 4] = ["Pass", "Merit", "Distinction", "Pass with Distinction"];
+    /// `rows` synthetic rows of the Awards Report's columns, at the lengths
+    /// IOB's export has.
+    fn awards_scale_csv(rows: usize) -> String {
+        const TITLES: [&str; 5] = ["Mr", "Ms", "Mrs", "Dr", "Mx"];
+        const FIRST: [&str; 6] = ["Aoife", "Cian", "Niamh", "Darragh", "Sinead", "Eoin"];
+        const SURNAMES: [&str; 6] = [
+            "Brennan",
+            "Doyle",
+            "Fitzgerald",
+            "Gallagher",
+            "O'Sullivan",
+            "Walsh",
+        ];
+        const EMPLOYERS: [(&str, &str); 4] = [
+            ("AIB", "AIB"),
+            ("EBS Network", "AIB"),
+            ("Bank of Ireland", "Bank of Ireland"),
+            ("PTSB", "PTSB"),
+        ];
         const AWARDS: [&str; 3] = [
             "Professional Certificate in Financial Services",
             "Professional Diploma in Compliance",
             "Certificate in Digital Banking",
         ];
-        match name {
-            "description" => "MICRO".into(),
-            "externalTypeId" => (100_000 + i % 900_000).to_string(),
-            "privacy" | "is_deleted" => (i % 2).to_string(),
-            "issuingBody" => "IOB".into(),
-            "memberBody" => ["AIB", "BOI", "PTS"][i % 3].into(),
-            "awardBoardDate" => format!("{:02}/06/2025", 1 + i % 28),
-            "awardGpaValue" => format!("{}.{:02}", 2 + i % 3, i % 100),
-            "awardResult" => RESULTS[i % RESULTS.len()].into(),
-            "awardName" => AWARDS[i % AWARDS.len()].into(),
-            "awardMajorCode" => format!("MAJ-{:04}", i % 500),
-            "awardProgrammeCode" => format!("PRG-{:05}", i % 2_000),
-            "awardYear" => "2024/2025".into(),
-            "awardType" => (1 + i % 5).to_string(),
-            "updated_at" | "created_at" => format!("2025-06-{:02}T09:30:00Z", 1 + i % 28),
-            "azureId" => uuid::Uuid::from_u128(i as u128).to_string(),
-            other => panic!("{other} isn't a pilot schema column"),
-        }
-    }
-
-    /// A dataset of `rows` rows and 30 columns: the pilot schema's 17, then
-    /// its first 13 again under new names. Returns the columns' schema and
-    /// the CSV.
-    fn pilot_scale_dataset(rows: usize) -> (Vec<FieldSchema>, String) {
-        let pilot = crate::data_validation::tests::test_pilot_schema();
-        let columns: Vec<(&str, FieldSchema)> = pilot
-            .iter()
-            .cycle()
-            .take(30)
-            .enumerate()
-            .map(|(n, field)| {
-                let mut column = field.clone();
-                if n >= pilot.len() {
-                    column.name = format!("{}_2", field.name);
-                }
-                (field.name.as_str(), column)
-            })
-            .collect();
-        let header: Vec<&str> = columns.iter().map(|(_, c)| c.name.as_str()).collect();
-        let mut csv = header.join(",");
-        csv.push('\n');
+        const GRADES: [&str; 4] = ["Pass", "Merit", "Distinction", "Pass with Distinction"];
+        let mut csv = format!("{}\n", crate::data_validation::tests::AWARDS_HEADER);
         for i in 0..rows {
-            for (n, (pilot_name, _)) in columns.iter().enumerate() {
-                if n > 0 {
-                    csv.push(',');
-                }
-                csv.push_str(&pilot_value(pilot_name, i));
-            }
-            csv.push('\n');
+            let (employer, group) = EMPLOYERS[i % EMPLOYERS.len()];
+            csv.push_str(&format!(
+                "{:06},{:07},{},{},{},{:02}/{:02}/{},{employer},{group},{},{},{:02}/{:02}/2026\n",
+                i % 1_000_000,
+                100_000 + i,
+                TITLES[i % TITLES.len()],
+                FIRST[i % FIRST.len()],
+                SURNAMES[i % SURNAMES.len()],
+                1 + i % 28,
+                1 + i % 12,
+                1960 + i % 40,
+                AWARDS[i % AWARDS.len()],
+                GRADES[i % GRADES.len()],
+                1 + i % 28,
+                1 + i % 12,
+            ));
         }
-        (columns.into_iter().map(|(_, c)| c).collect(), csv)
+        csv
     }
 
-    /// The pilot's largest pools hold about 100,000 rows of 30 fields, which
-    /// an admin may upload at once.
+    /// The pilot's largest pools hold about 100,000 rows, which an admin may
+    /// upload at once.
     #[tokio::test]
     #[ignore = "pilot scale, slow in unoptimised builds: run `just scale`"]
     async fn a_pilot_sized_dataset_uploads_within_the_body_limit() {
         const ROWS: usize = 100_000;
-        let (schema, csv) = pilot_scale_dataset(ROWS);
+        let schema = crate::data_validation::tests::awards_schema();
         let fields = schema.len();
+        let csv = awards_scale_csv(ROWS);
         let worker = worker();
         let admin = worker.admin("oid-admin").await;
-        let pool_pda = worker.strict_pool(&admin, schema).await;
+        let pool_pda = worker.pool_with_schema(&admin, schema).await;
         worker.holds_append_drts(&admin, &pool_pda, 1);
         worker
             .chain

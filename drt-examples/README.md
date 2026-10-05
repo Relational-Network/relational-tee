@@ -1,124 +1,61 @@
 # drt-examples
 
-Sample DRT scripts that run inside the SGX enclave when an analyst invokes a
-granted Digital Rights Token. Each script is a Rust crate compiled to
-`wasm32-unknown-unknown`, with its SHA-256 pinned on-chain at DRT
-registration time and re-verified on every fetch.
+Approved analyses that a pool's Execute DRT can pin. Each one is a single
+static file: a TOML definition holding the pool's columns, the filters a
+request may use, what a page returns, and the SQL the worker runs inside
+the TEE.
 
 ## Layout
 
 ```
 drt-examples/
-├── README.md         (this file)
-└── mean/             canonical sample DRT
-    ├── Cargo.toml
-    ├── .cargo/config.toml   (sets default target = wasm32-unknown-unknown)
-    ├── src/lib.rs
-    └── dist/mean.wasm       (committed build artifact)
+├── README.md                          (this file)
+└── awards-report/
+    ├── README.md
+    ├── awards-report-v1.toml          the Awards Report
+    └── fixtures/awards-synthetic.csv  synthetic rows with the export's headers
 ```
-
-Future DRTs live as sibling crates (`drt-examples/<name>/`). They are not
-part of the parent Cargo workspace — each is built standalone so its WASM
-release profile does not leak into the SDK build. The shipped profile is
-tuned for **runtime speed**, not file size (`opt-level = 3`, `lto = "fat"`,
-single codegen unit, `panic = abort`). The wasm is fetched once, then
-AOT-compiled to native by the enclave and cached on the encrypted FS, so
-the wire size is a one-off and the native code cost is what matters.
 
 ## Trust contract
 
-The enclave will run a DRT script only if its SHA-256 matches the
-`code_hash` recorded in the on-chain `DrtConfig`. The pipeline:
+1. The definition is committed here. Its raw GitHub URL at a commit, and
+   its SHA-256, go into the pool's Execute DRT when the pool is created; the
+   dashboard's DRT registry fills them in.
+2. At pool creation the worker fetches the URL, which must be under
+   `https://raw.githubusercontent.com/relational-network/`, refuses bytes
+   that don't hash to the recorded value, checks the definition, and stores
+   it by hash. Queries never fetch anything.
+3. The definition's columns are the pool's schema: every upload must have
+   exactly its headers, with dates as DD/MM/YYYY.
+4. The SQL reads one table, which holds only the rows the caller may see:
+   the worker builds it for the caller's employer scope, so no statement can
+   reach other employers' rows. Every statement must be read-only and may use
+   only the parameters its filters define.
 
-1. Admin builds and publishes the `.wasm`.
-2. Admin records `(code_repo_url, code_hash)` on-chain via pool creation.
-3. Enclave fetches `code_repo_url`, SHA-256-checks the bytes against
-   `code_hash` (see `relational-sdk/src/drt/verified_fetch.rs`), rejects on
-   mismatch, caches verified bytes under `/data/drt-scripts/<hash>`.
-4. Enclave loads the cached bytes into the `wasmtime` sandbox (see
-   `relational-sdk/src/drt/runtime.rs`), AOT-compiles them once via
-   Cranelift, caches the native artifact at
-   `/data/drt-scripts/{hash}.wt37.cwasm`, and invokes the `run` export.
-
-The cache is keyed by hash — the filename *is* the integrity claim, and the
-runtime re-hashes the bytes on every read. The `.cwasm` suffix is
-versioned by wasmtime release (`wt37`) so a runtime upgrade invalidates
-stale artifacts automatically.
-
-## Host ABI (zero-copy)
-
-A DRT module exports two functions plus `memory` and imports one:
-
-| Direction | Signature | Notes |
-|---|---|---|
-| export | `memory` | default linear memory; host reads/writes directly |
-| export | `alloc(size: i32) -> i32` | bump allocator the host calls before `run` |
-| export | `run(csv_ptr: i32, csv_len: i32, args_ptr: i32, args_len: i32, out_ptr_cell: i32, out_len_cell: i32) -> i32` | 0 = success, non-zero = script-level error |
-| import | `env.host_log(src: i32, len: i32)` | best-effort diagnostic; no other imports |
-
-Flow on every query:
-
-1. Host calls `alloc(csv_len)`, then writes the CSV bytes into `memory` at
-   the returned address.
-2. Host calls `alloc(args_len)`, then writes the args JSON.
-3. Host calls `alloc(8)` for two i32 output cells.
-4. Host calls `run(csv_ptr, csv_len, args_ptr, args_len, out_ptr_cell, out_len_cell)`.
-5. On return, the host reads two little-endian i32s from
-   `(out_ptr_cell, out_len_cell)` to find the output blob in `memory`.
-
-No JSON envelope — the CSV is delivered as raw bytes. `args` is a small
-UTF-8 JSON object scoped to the DRT.
-
-Output should be UTF-8 JSON. Errors should be `{"error": "..."}` with a
-non-zero exit from `run`.
-
-Sandbox limits enforced by the runtime: 600 MiB input, 4 MiB output, 1 GiB
-guest memory cap, fuel cap (`2 × 10⁹ + 1000 × input_bytes` instructions),
-120 s wall clock. No WASI, no filesystem, no clock — only `host_log`.
-
-## Build
+## Hash and URL
 
 ```bash
-cd mean
-cargo build --release --target wasm32-unknown-unknown
-cp target/wasm32-unknown-unknown/release/drt_mean.wasm dist/mean.wasm
-sha256sum dist/mean.wasm
+sha256sum awards-report/awards-report-v1.toml
 ```
 
-Host-side tests (no wasm runtime needed):
-
-```bash
-cargo test --target x86_64-unknown-linux-gnu
+```
+https://raw.githubusercontent.com/relational-network/relational-tee/<commit>/drt-examples/awards-report/awards-report-v1.toml
 ```
 
-End-to-end test through the enclave's wasmtime runtime against the
-committed `dist/mean.wasm` lives at `relational-sdk/src/drt/runtime.rs`
-(run with `cd .. && cargo test drt::`).
+Any change to a definition changes its hash. Pools registered with the old
+hash keep the old analysis; new pools need the new hash in the dashboard's
+registry.
 
-## Publish
+## The format
 
-The `code_repo_url` recorded on-chain must resolve to the exact bytes that
-hashed to `code_hash`. Commit `dist/<name>.wasm` to the relational-sdk repo
-so the URL
-
-```
-https://raw.githubusercontent.com/relational-network/relational-sdk/<ref>/drt-examples/<name>/dist/<name>.wasm
-```
-
-resolves to the same bytes `sha256sum` reports locally. Update the DRT
-registry entry (in the dashboard) with the new hash whenever the script
-changes — the enclave will refuse to run any script whose fetched bytes
-don't match the on-chain hash.
-
-The enclave only accepts URLs on `raw.githubusercontent.com` under the
-`relational-network/*` owner (allowlist in
-`relational-sdk/src/drt/verified_fetch.rs`).
-
-## Adding a new DRT
-
-1. Copy `mean/` to `drt-examples/<your-drt>/`.
-2. Rename the crate in `Cargo.toml` (set `name = "drt-<your-drt>"`).
-3. Implement `run()` against the host ABI above.
-4. Build and commit `dist/<your-drt>.wasm`.
-5. Add a registry entry on the dashboard side pointing at the raw URL and
-   the SHA-256.
+| Key | Meaning |
+|---|---|
+| `analysis_id` | Lowercase letters, digits and hyphens; also the Execute DRT's name |
+| `display_name` | What the dashboard shows |
+| `relation` | The table name the SQL reads |
+| `[columns]` | `name = { header = "CSV header", type = "text" \| "date" }`. Dates are DD/MM/YYYY in the CSV and in the API, and `YYYY-MM-DD` inside SQLite, so ranges and sorting work |
+| `[scope]` | The columns holding the employer and the employer group, which the caller's scope is applied to |
+| `[filters]` | `name = kind`. `date_range` binds `:name_from` and `:name_to`; `multi_select` and `search_select` bind `:name` as a JSON array of values. NULL means all |
+| `[output]` | `columns` returned in order, `default_sort`, and `page_size` (`default`, `max`). Any output column may be sorted on |
+| `sql.rows` | Every matching row, selecting `_record_id` and every output column. The worker adds the sort (then `_record_id`), `LIMIT` and `OFFSET`, and counts the same query |
+| `sql.options.<filter>` | For a `date_range`, one row of `min` and `max`; for a `multi_select`, `value` and `count`; for a `search_select`, `value`, using `:search` (a prefix, already escaped for `LIKE ... ESCAPE '\'`) and `:limit` |

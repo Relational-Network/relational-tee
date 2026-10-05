@@ -105,6 +105,15 @@ impl ApiError {
         Self::new(StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large", msg)
     }
 
+    /// 415 `unsupported_media_type` — the body isn't of a type the route takes.
+    pub fn unsupported_media_type(msg: impl Into<String>) -> Self {
+        Self::new(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported_media_type",
+            msg,
+        )
+    }
+
     /// 422 `unprocessable_entity` — semantically invalid (e.g., bad Solana address).
     pub fn unprocessable(msg: impl Into<String>) -> Self {
         Self::new(

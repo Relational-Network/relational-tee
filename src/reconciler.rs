@@ -7,11 +7,12 @@
 //! Every worker runs it every 5 minutes. It lists `staged/`, and for each
 //! saga older than 10 minutes whose on-chain effect exists at `finalized`
 //! but whose document lacks it, it writes the pool document or adds the
-//! issuance entry, with the signature from the saga's idempotency record.
-//! It never deletes or undoes anything. Each of its writes is create-only,
-//! or a compare-and-swap that adds a missing entry, so any number of
-//! workers can run it at once. Dev builds can shorten both times, so the
-//! fault suite needn't wait 15 minutes.
+//! issuance or grant entry, with the signature from the saga's idempotency
+//! record. A grant revoked after the saga was staged wins over it, so a
+//! grant is never restored. It never deletes or undoes anything. Each of
+//! its writes is create-only, or a compare-and-swap that adds a missing
+//! entry, so any number of workers can run it at once. Dev builds can
+//! shorten both times, so the fault suite needn't wait 15 minutes.
 
 use std::str::FromStr;
 use std::sync::Arc;
@@ -26,6 +27,7 @@ use crate::blockchain::SolanaClient;
 use crate::chain::creating_signature;
 use crate::error::ApiError;
 use crate::idempotency::stored_signature;
+use crate::storage::pools::Recording;
 use crate::storage::staged::{Saga, Staged};
 use crate::storage::{Change, Storage};
 use crate::store::Created;
@@ -89,6 +91,7 @@ fn describe(saga: &Saga) -> String {
     match saga {
         Saga::Pool { pool } => format!("pool {}", pool.pool_pda),
         Saga::Issue { pool_pda, upload } => format!("issue {} in {pool_pda}", upload.record_id),
+        Saga::Grant { pool_pda, grant } => format!("grant {} in {pool_pda}", grant.grant_id),
     }
 }
 
@@ -149,6 +152,38 @@ async fn finish(
                 .await?;
             Ok(added)
         }
+        Saga::Grant { pool_pda, grant } => {
+            let Some(doc) = storage.pools().get(pool_pda).await? else {
+                return Ok(false);
+            };
+            if doc.recording(grant) != Recording::Add {
+                return Ok(false);
+            }
+            let commitment = grant
+                .commitment_bytes()
+                .ok_or_else(|| ApiError::internal("a staged grant has no commitment"))?;
+            let (grant_pda, _) = derive_grant_pda(&commitment);
+            let Some(signature) =
+                effect_signature(storage, solana, &staged.record, &grant_pda).await?
+            else {
+                return Ok(false);
+            };
+            let mut entry = grant.clone();
+            entry.signature = Some(signature);
+            let mut added = false;
+            storage
+                .pools()
+                .update::<ApiError>(pool_pda, |doc| {
+                    added = doc.recording(&entry) == Recording::Add;
+                    if !added {
+                        return Ok(Change::Unchanged);
+                    }
+                    doc.grants.push(entry.clone());
+                    Ok(Change::Changed)
+                })
+                .await?;
+            Ok(added)
+        }
     }
 }
 
@@ -178,7 +213,8 @@ mod tests {
     use super::*;
     use crate::blockchain::fake::{self, FakeChain};
     use crate::idempotency::{Idempotent, Opened, Operation, StoredTx};
-    use crate::storage::pools::tests::{pool, upload};
+    use crate::storage::pools::tests::{grant, pool, upload};
+    use crate::storage::pools::GrantRevocation;
     use crate::storage::tests::files_storage;
     use serde_json::json;
 
@@ -255,6 +291,90 @@ mod tests {
         );
 
         // Another pass, on any worker, changes nothing.
+        assert_eq!(
+            reconcile(&storage, &solana, Timing::default().min_age)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn an_abandoned_grant_is_recorded_unless_a_revocation_came_after() {
+        let storage = files_storage();
+        storage.pools().create(&pool("P1", "w1")).await.unwrap();
+        let request = Idempotent::post(
+            "0f8fad5b-d9cb-469f-a165-70867728950e",
+            "/v1/drt/pools/{pool_pda}/grant",
+            "/v1/drt/pools/P1/grant",
+        );
+        let Opened::Run(mut op) = Operation::open(&storage, "admin-1", &request, b"{}")
+            .await
+            .unwrap()
+        else {
+            panic!("a new request");
+        };
+        let burn = StoredTx {
+            transaction: "AA==".into(),
+            signature: "sig-grant".into(),
+            last_valid_block_height: 1,
+        };
+        op.store_tx(burn, None).await.unwrap();
+
+        // Two grant requests burned, then died; Bo's access was revoked
+        // after his was staged.
+        let mut grant_pdas = Vec::new();
+        for (grant_id, analyst) in [("g-ana", "ana"), ("g-bo", "bo")] {
+            let mut entry = grant(grant_id, analyst, 11);
+            entry.signature = None;
+            grant_pdas.push(derive_grant_pda(&entry.commitment_bytes().unwrap()).0);
+            let staged = Staged {
+                record: op.record_path().into(),
+                staged_at: old(),
+                saga: Saga::Grant {
+                    pool_pda: "P1".into(),
+                    grant: entry,
+                },
+            };
+            storage
+                .sagas()
+                .stage(&format!("grant-{grant_id}"), staged)
+                .await
+                .unwrap();
+        }
+        storage
+            .pools()
+            .update::<ApiError>("P1", |doc| {
+                let mut earlier = grant("g-bo-earlier", "bo", 20);
+                earlier.revoked = Some(GrantRevocation {
+                    revocation_id: "r-bo".into(),
+                    revoked_by: "alice".into(),
+                    revoked_at: Utc::now() - TimeDelta::minutes(5),
+                    signature: Some("sig-close".into()),
+                });
+                doc.grants.push(earlier);
+                Ok(Change::Changed)
+            })
+            .await
+            .unwrap();
+        let chain = Arc::new(FakeChain::default());
+        *chain.accounts.lock().unwrap() = grant_pdas;
+        chain.land("sig-grant", true);
+        let solana = fake::start(chain);
+
+        assert_eq!(
+            reconcile(&storage, &solana, Timing::default().min_age)
+                .await
+                .unwrap(),
+            1
+        );
+        let doc = storage.pools().get("P1").await.unwrap().unwrap();
+        let ana = doc.active_grant("ana", "awards-report-v1").unwrap();
+        assert_eq!(
+            (ana.grant_id.as_str(), ana.signature.as_deref()),
+            ("g-ana", Some("sig-grant"))
+        );
+        assert!(doc.active_grant("bo", "awards-report-v1").is_none());
         assert_eq!(
             reconcile(&storage, &solana, Timing::default().min_age)
                 .await

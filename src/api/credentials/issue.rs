@@ -198,7 +198,7 @@ pub async fn issue_credentials(
     }
 
     // Validate CSV against pool's schema.
-    let summary = validate_payload(&doc.schema, &pool_pda_str, &csv_bytes, doc.validation_mode)?;
+    let summary = validate_payload(&doc.schema, &pool_pda_str, &csv_bytes)?;
     if !summary.valid {
         return Err(validation_failed(summary.errors.len()));
     }

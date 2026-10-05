@@ -107,8 +107,7 @@ pub async fn initialize_pool(
                 "pool is already initialized — use /issue to add credentials",
             ));
         }
-        let summary =
-            validate_payload(&doc.schema, &pool_pda_str, &csv_bytes, doc.validation_mode)?;
+        let summary = validate_payload(&doc.schema, &pool_pda_str, &csv_bytes)?;
         if !summary.valid {
             return Err(validation_failed(summary.errors.len()));
         }

@@ -10,6 +10,11 @@
 //!   `owners/{user_id}.json`, the user's current wallet ([`wallets`]).
 //! - `identities/{h(tid ‖ oid)}.json` and `identities/email/{h(email)}.json`
 //!   ([`identities`]).
+//! - `scripts/{sha256}`: analysis definitions, by hash ([`scripts`]).
+//! - `config/employer-scopes.json`: the rows each Entra group may see
+//!   ([`scopes`]).
+//! - `audit/analyses/{pool_pda}/{date}/{request_id}.json`: one record per
+//!   analysis request ([`analysis_log`]).
 //! - `staged/{op_id}.json`: in-flight chain sagas ([`staged`]), and
 //!   `idempotency/…`, the idempotency records ([`crate::idempotency`]).
 //! - `canary/{worker_id}`: the readiness canary.
@@ -26,8 +31,11 @@ use serde::{Deserialize, Serialize};
 use crate::store::sealed::Sealed;
 use crate::store::{valid_segment, ObjectStore, Replaced, STATE};
 
+pub mod analysis_log;
 pub mod identities;
 pub mod pools;
+pub mod scopes;
+pub mod scripts;
 pub mod staged;
 pub mod wallets;
 
@@ -71,6 +79,18 @@ impl Storage {
 
     pub fn sagas(&self) -> staged::Sagas<'_> {
         staged::Sagas::new(self)
+    }
+
+    pub fn scripts(&self) -> scripts::Scripts<'_> {
+        scripts::Scripts::new(self)
+    }
+
+    pub fn employer_scopes(&self) -> scopes::Scopes<'_> {
+        scopes::Scopes::new(self)
+    }
+
+    pub fn analysis_log(&self) -> analysis_log::AnalysisLog<'_> {
+        analysis_log::AnalysisLog::new(self)
     }
 
     pub fn identities(&self) -> identities::Identities<'_> {

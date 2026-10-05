@@ -1,0 +1,90 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Relational Network
+#
+# Awards Report: an approved analysis for MICRES awards pools.
+#
+# A pool's Execute DRT records this file's URL and SHA-256 on-chain. The
+# worker runs it only while its bytes hash to that value, so any change to
+# this file is a new analysis that needs a new pool registration.
+
+analysis_id  = "awards-report-v1"
+display_name = "Awards Report"
+relation     = "awards"   # the table the SQL below reads
+
+# The pool's schema: each logical column, the CSV header it comes from, and
+# its type. A date is DD/MM/YYYY in the CSV and in the API, and the SQL below
+# sees it as YYYY-MM-DD. Text keeps leading zeroes.
+[columns]
+staff_number      = { header = "Staff Number",      type = "text" }
+membership_number = { header = "Membership Number", type = "text" }
+title             = { header = "Title",             type = "text" }
+first_name        = { header = "First Name",        type = "text" }
+surname           = { header = "Surname",           type = "text" }
+date_of_birth     = { header = "Date of Birth",     type = "date" }
+employer          = { header = "Employer",          type = "text" }
+employer_group    = { header = "Employer Group",    type = "text" }
+award             = { header = "Award",             type = "text" }
+award_grade       = { header = "Award Grade",       type = "text" }
+exam_board_date   = { header = "Exam Board Date",   type = "date" }
+
+# The columns the worker applies the caller's employer scope to. Requests
+# can't filter on them.
+[scope]
+employer       = "employer"
+employer_group = "employer_group"
+
+# The only filters a request may send. A date range binds <name>_from and
+# <name>_to; the selects bind <name> as a JSON array of values. NULL means all.
+[filters]
+exam_board_date   = "date_range"
+award             = "multi_select"
+staff_number      = "search_select"
+membership_number = "search_select"
+
+# What a page returns. Any output column may be sorted on.
+[output]
+columns      = ["staff_number", "membership_number", "title", "first_name", "surname",
+                "date_of_birth", "employer", "employer_group", "award", "award_grade",
+                "exam_board_date"]
+default_sort = { column = "exam_board_date", direction = "desc" }
+page_size    = { default = 100, max = 500 }
+
+[sql]
+# Every row that matches the filters. The worker adds ORDER BY (an
+# allowlisted column, then _record_id), LIMIT and OFFSET, and counts the
+# same query for total_matched.
+rows = '''
+SELECT _record_id,
+       staff_number, membership_number, title, first_name, surname,
+       date_of_birth, employer, employer_group, award, award_grade,
+       exam_board_date
+FROM awards
+WHERE (:exam_board_date_from IS NULL OR exam_board_date >= :exam_board_date_from)
+  AND (:exam_board_date_to   IS NULL OR exam_board_date <= :exam_board_date_to)
+  AND (:award             IS NULL OR award             IN (SELECT value FROM json_each(:award)))
+  AND (:staff_number      IS NULL OR staff_number      IN (SELECT value FROM json_each(:staff_number)))
+  AND (:membership_number IS NULL OR membership_number IN (SELECT value FROM json_each(:membership_number)))
+'''
+
+# Filter options, computed from the caller's own rows. A date range returns
+# min and max; a multi-select returns each value with its count; a search
+# select returns the values that start with :search, at most :limit of them.
+[sql.options]
+exam_board_date = '''
+SELECT min(exam_board_date) AS min, max(exam_board_date) AS max FROM awards
+'''
+award = '''
+SELECT award AS value, count(*) AS count
+FROM awards WHERE award IS NOT NULL
+GROUP BY award ORDER BY award
+'''
+staff_number = '''
+SELECT staff_number AS value
+FROM awards WHERE staff_number LIKE :search || '%' ESCAPE '\'
+GROUP BY staff_number ORDER BY staff_number LIMIT :limit
+'''
+membership_number = '''
+SELECT membership_number AS value
+FROM awards WHERE membership_number LIKE :search || '%' ESCAPE '\'
+GROUP BY membership_number ORDER BY membership_number LIMIT :limit
+'''

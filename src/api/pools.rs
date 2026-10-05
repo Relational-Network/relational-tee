@@ -3,7 +3,7 @@
 
 //! DRT pool API handlers (new `digital_rights_tokens` contract).
 //!
-//! - `POST /v1/drt/pools/malta`        — atomic create (CSV-driven pool + schema)
+//! - `POST /v1/drt/pools/malta`        — atomic create (pool + its analysis)
 //! - `GET  /v1/drt/pools/{pool_pda}`   — pool info (chain + enclave metadata)
 
 use axum::{
@@ -24,6 +24,10 @@ use tracing::info;
 
 use crate::audit;
 use crate::auth::{Caller, Permission};
+use sha2::{Digest, Sha256};
+
+use crate::analysis::definition::Definition;
+use crate::analysis::fetch::{check_url, FetchError};
 use crate::blockchain::drt::{
     accounts::{fetch_drt_config, fetch_pool},
     instructions::{
@@ -31,16 +35,15 @@ use crate::blockchain::drt::{
     },
     pda::{derive_drt_config_pda, derive_mint_pda, derive_pool_pda},
     types::*,
-    validation::{validate_drt_requests, validate_pool_name, ResolvedDrt},
+    validation::{parse_code_hash, validate_drt_requests, validate_pool_name, ResolvedDrt},
 };
 use crate::blockchain::signing::keypair_from_bytes_verified;
 use crate::chain::{self, Effect};
-use crate::data_validation::FieldSchema;
 use crate::error::ApiError;
 use crate::idempotency::{Idempotent, JsonBody};
 use crate::ids;
 use crate::state::AppState;
-use crate::storage::pools::{DrtMetadata, PoolDoc, PoolKind};
+use crate::storage::pools::{AnalysisRef, DrtMetadata, PoolDoc, PoolKind};
 use crate::storage::staged::{Saga, Staged};
 use crate::storage::wallets::WalletMetadata;
 use crate::store::Created;
@@ -96,54 +99,36 @@ pub(crate) fn explorer_url(state: &AppState, sig: &str) -> String {
     state.solana_client.network().explorer_tx_url(sig)
 }
 
-/// Validate the inline schema submitted on MALTA pool create.
-///
-/// If the caller did not supply a `schema_id`, the pool's UUID names it. The
-/// schema id is an internal handle the dashboard does not surface, so the
-/// operator never has to invent one.
-fn parse_schema(
-    req: &InlineSchemaRequest,
-    pool_uuid: &[u8; 16],
-) -> Result<(String, Vec<FieldSchema>), ApiError> {
-    let schema_id = match req
-        .schema_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        Some(s) => {
-            if s.len() > 128
-                || !s
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-            {
-                return Err(ApiError::bad_request(
-                    "schema_id must be 1-128 chars, alphanumeric + hyphen/underscore",
-                ));
-            }
-            s.to_string()
-        }
-        None => uuid::Uuid::from_bytes(*pool_uuid).to_string(),
-    };
-    if req.fields.is_empty() {
-        return Err(ApiError::bad_request("schema must have at least one field"));
-    }
-    let mut fields = Vec::with_capacity(req.fields.len());
-    for f in &req.fields {
-        if f.name.is_empty() {
-            return Err(ApiError::bad_request("schema field name cannot be empty"));
-        }
-        let field_type: crate::data_validation::FieldType =
-            serde_json::from_value(f.field_type.clone()).map_err(|e| {
-                ApiError::bad_request(format!("invalid field_type for '{}': {e}", f.name))
+/// The analysis definition at `url`, which must hash to `hash`: stored by an
+/// earlier attempt, or else fetched. Either way it is checked, then stored.
+async fn load_definition(
+    state: &AppState,
+    url: &str,
+    hash: &[u8; 32],
+) -> Result<Definition, ApiError> {
+    let bytes = match state.storage.scripts().get(&hex::encode(hash)).await? {
+        Some(bytes) => bytes,
+        None => {
+            let bytes = state.fetcher.fetch(url).await.map_err(|e| match e {
+                FetchError::Refused(m) => {
+                    ApiError::bad_request(format!("the analysis couldn't be fetched: {m}"))
+                }
+                FetchError::Unavailable(m) => {
+                    ApiError::service_unavailable(format!("the analysis couldn't be fetched: {m}"))
+                }
             })?;
-        fields.push(FieldSchema {
-            name: f.name.clone(),
-            field_type,
-            nullable: f.nullable,
-        });
-    }
-    Ok((schema_id, fields))
+            if Sha256::digest(&bytes).as_slice() != hash {
+                return Err(ApiError::bad_request(format!(
+                    "the file at {url} doesn't hash to code_hash_hex"
+                )));
+            }
+            bytes
+        }
+    };
+    let definition = Definition::parse(&bytes)
+        .map_err(|e| ApiError::bad_request(format!("the analysis isn't valid: {e}")))?;
+    state.storage.scripts().put(&bytes).await?;
+    Ok(definition)
 }
 
 /// The one transaction that creates a pool: compute budget, `create_pool`,
@@ -179,10 +164,13 @@ fn pool_instructions(
 // POST /v1/drt/pools/malta
 // ============================================================================
 
-/// Create a MALTA pool (CSV-driven, schema required).
+/// Create a MALTA pool whose analysis is the definition at
+/// `analysis.code_repo_url`.
 ///
-/// The pool's UUID, and so its PDA, derives from the caller and the
-/// `Idempotency-Key`. The pool document is staged first; the creating
+/// The definition must hash to `analysis.code_hash_hex` and be a valid
+/// analysis; its columns are the pool's schema. The pool's UUID, and so its
+/// PDA, derives from the caller and the `Idempotency-Key`. The pool document
+/// is staged first; the creating
 /// transaction follows the stored-transaction rule, so a retry never creates
 /// a second pool; then, once that transaction is finalized, the document is
 /// written with the creation signature. Waiting for `finalized` means a
@@ -192,7 +180,7 @@ fn pool_instructions(
     path = "/v1/drt/pools/malta",
     tag = "DRT Pools",
     summary = "Create MALTA pool",
-    description = "Atomically: create_pool + register_drt × N (always includes 'append') + seal_pool, then, once that transaction is finalized, store the pool's document with its inline schema. Idempotent: retries with the same Idempotency-Key create one pool.",
+    description = "Fetch the analysis definition from its allowlisted GitHub URL and check it against code_hash_hex; then, atomically, create_pool + register_drt for 'append' and for the analysis + seal_pool; once that transaction is finalized, store the pool's document, whose schema is the definition's columns. Idempotent: retries with the same Idempotency-Key create one pool.",
     security(("bearer_auth" = [])),
     params(
         ("Idempotency-Key" = String, Header, description = "A UUID naming this user action; reuse it on every retry"),
@@ -200,11 +188,11 @@ fn pool_instructions(
     request_body = CreateMaltaPoolRequest,
     responses(
         (status = 201, description = "Pool created", body = CreatePoolResponse),
-        (status = 400, description = "Validation error, no Idempotency-Key, or Solana refused the transaction (`transaction_rejected`)"),
+        (status = 400, description = "Validation error, a definition that can't be fetched, doesn't match its hash or isn't valid, no Idempotency-Key, or Solana refused the transaction (`transaction_rejected`)"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden"),
         (status = 422, description = "The Idempotency-Key was used for a different request"),
-        (status = 503, description = "RPC unavailable"),
+        (status = 503, description = "RPC unavailable, or GitHub couldn't be reached"),
     )
 )]
 pub async fn create_malta_pool(
@@ -220,16 +208,32 @@ pub async fn create_malta_pool(
     let mut op = open_or_replay!(state, &caller.user_id, request, &bytes);
 
     validate_pool_name(&payload.pool_name)?;
-    let resolved = validate_drt_requests(&payload.drts)?;
-    if !resolved.iter().any(|d| d.name == APPEND_DRT_NAME) {
+    let analysis = &payload.analysis;
+    check_url(&analysis.code_repo_url).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let code_hash = parse_code_hash(&analysis.code_hash_hex)?;
+    if code_hash == [0; 32] {
         return Err(ApiError::bad_request(
-            "MALTA pools must include the 'append' DRT",
+            "code_hash_hex must be the definition's SHA-256",
         ));
     }
-    let pool_uuid = ids::pool_uuid(&caller.user_id, &request.key);
-    let (schema_id, fields) = parse_schema(&payload.schema, &pool_uuid)?;
     let (wallet, keypair) =
         load_wallet_keypair(&state, &payload.wallet_id, &caller.user_id).await?;
+    let definition = load_definition(&state, &analysis.code_repo_url, &code_hash).await?;
+    let resolved = validate_drt_requests(&[
+        DrtRequest {
+            name: APPEND_DRT_NAME.to_string(),
+            supply: payload.append_supply,
+            code_repo_url: None,
+            code_hash_hex: None,
+        },
+        DrtRequest {
+            name: definition.analysis_id.clone(),
+            supply: analysis.supply,
+            code_repo_url: Some(analysis.code_repo_url.clone()),
+            code_hash_hex: Some(hex::encode(code_hash)),
+        },
+    ])?;
+    let pool_uuid = ids::pool_uuid(&caller.user_id, &request.key);
 
     let (pool_pda, _bump) = derive_pool_pda(&pool_uuid);
     let pool_pda_str = pool_pda.to_string();
@@ -265,15 +269,21 @@ pub async fn create_malta_pool(
         drts: drt_records,
         owner_wallet_id: wallet.wallet_id.clone(),
         owner_pubkey: wallet.public_address.clone(),
-        schema_id,
-        schema: fields,
-        validation_mode: crate::data_validation::ValidationMode::HeadersOnly,
+        schema_id: definition.analysis_id.clone(),
+        schema: definition.schema(),
+        analysis: Some(AnalysisRef {
+            analysis_id: definition.analysis_id.clone(),
+            display_name: definition.display_name.clone(),
+            code_repo_url: analysis.code_repo_url.clone(),
+            code_hash_hex: hex::encode(code_hash),
+        }),
         created_by: caller.user_id.clone(),
         created_at: now,
         creation_signature: String::new(),
         initial: None,
         issuances: Vec::new(),
         revocations: Vec::new(),
+        grants: Vec::new(),
     };
 
     // ── STAGE, then CREATE ON-CHAIN, then WRITE THE DOCUMENT ─────────

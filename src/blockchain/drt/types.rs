@@ -37,7 +37,7 @@ pub const APPEND_DRT_NAME: &str = "append";
 
 pub use super::idl_generated::{
     DISC_CREATE_POOL, DISC_DRT_CONFIG_ACCOUNT, DISC_GRANT_RIGHT, DISC_POOL_ACCOUNT,
-    DISC_REGISTER_DRT, DISC_SEAL_POOL,
+    DISC_REGISTER_DRT, DISC_REVOKE_GRANT, DISC_SEAL_POOL,
 };
 
 // ── Limits ──────────────────────────────────────────────────────
@@ -79,57 +79,41 @@ pub struct DrtConfig {
 // API request / response types
 // ============================================================================
 
-/// One DRT to register inside a pool. Caller supplies supply and — for any
-/// non-`append` DRT — the script URL and hash that the enclave will verify
-/// at grant time.
-///
-/// The frontend pre-fills these from its own curated list; the operator can
-/// override them. The server validates lengths and the append-specific rule
-/// (no URL, zero hash).
-#[derive(Debug, Clone, Deserialize, ToSchema)]
+/// One DRT to register inside a pool: `append`, which has no code, or the
+/// pool's analysis, with its definition's URL and hash.
+#[derive(Debug, Clone)]
 pub struct DrtRequest {
-    /// Human-readable name (`"append"`, `"mean"`, `"variance"`, …).
     pub name: String,
     /// Token supply minted to the admin's wallet at registration.
     pub supply: u64,
-    /// Public URL of the script the enclave will run when this right is granted.
-    /// Empty/absent for `append`.
-    #[serde(default)]
     pub code_repo_url: Option<String>,
-    /// SHA-256 of the script as a 64-char hex string. Zero/empty for `append`.
-    #[serde(default)]
+    /// SHA-256 of the code as a 64-char hex string. Zero/empty for `append`.
     pub code_hash_hex: Option<String>,
 }
 
-/// Field of a CSV schema (mirrors [`crate::data_validation::FieldSchema`]).
-#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
-pub struct SchemaFieldRequest {
-    pub name: String,
-    pub field_type: serde_json::Value,
-    #[serde(default)]
-    pub nullable: bool,
-}
-
-/// Inline schema submitted with a MALTA pool create request.
-///
-/// `schema_id` is optional: if absent or empty the server generates a UUID.
-/// The dashboard never asks the user for it — schemas are an internal
-/// implementation detail of the pool, so we don't burden the operator with
-/// inventing an identifier.
+/// The analysis a new pool's Execute DRT pins.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
-pub struct InlineSchemaRequest {
-    #[serde(default)]
-    pub schema_id: Option<String>,
-    pub fields: Vec<SchemaFieldRequest>,
+#[serde(deny_unknown_fields)]
+pub struct AnalysisRequest {
+    /// The definition's raw URL, under
+    /// `https://raw.githubusercontent.com/relational-network/`.
+    pub code_repo_url: String,
+    /// SHA-256 of the definition, as 64 hex characters.
+    pub code_hash_hex: String,
+    /// Execute DRTs minted to the admin's wallet: one per analyst grant.
+    pub supply: u64,
 }
 
-/// MALTA pool create request. Schema is mandatory.
+/// MALTA pool create request. The analysis's definition is also the pool's
+/// schema.
 #[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CreateMaltaPoolRequest {
     pub wallet_id: String,
     pub pool_name: String,
-    pub drts: Vec<DrtRequest>,
-    pub schema: InlineSchemaRequest,
+    /// Append DRTs minted to the admin's wallet: one per issuance.
+    pub append_supply: u64,
+    pub analysis: AnalysisRequest,
 }
 
 /// Atomic create-pool response.

@@ -23,7 +23,7 @@ axum = { version = "0.8.8", default-features =  false, features = ["multipart", 
 axum-server = { version = "0.8.0", default-features = false, features = ["tls-rustls-no-provider"] }
 tower-http = { version = "0.6", default-features = false, features = ["cors", "set-header", "trace"] }
 governor = { version = "0.10", default-features = false, features = ["std", "dashmap"] }
-tokio = { version = "1.49.0", default-features = false, features = ["macros", "rt-multi-thread", "signal", "time"] }
+tokio = { version = "1.49.0", default-features = false, features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 
 # ── Serialization ──────────────────────────────────────────────────
 serde = { version = "1.0.228", default-features = false }
@@ -105,6 +105,16 @@ mimalloc = { version = "0.1.52", default-features = false }
 
 # ── In-process cache ──────────────────────────────────────────────
 lru = { version = "0.18", default-features = false }
+
+# ── Analyses ──────────────────────────────────────────────────────
+# Approved SQL analyses run on in-memory SQLite tables. `bundled` compiles
+# SQLite into the static binary; `hooks` provides the progress handler that
+# stops a query at its deadline.
+rusqlite = { version = "0.40", default-features = false, features = ["bundled", "hooks"] }
+# Analysis definitions are TOML files, pinned on-chain by their hash.
+toml = { version = "1.1", default-features = false, features = ["parse", "serde"] }
+# The resolver trait, for the definition fetcher's public-addresses-only DNS.
+tower-service = { version = "0.3", default-features = false }
 
 [dev-dependencies]
 tokio = { version = "1.49.0", default-features = false, features = ["io-util", "test-util"] }

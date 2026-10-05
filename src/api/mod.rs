@@ -20,8 +20,10 @@ macro_rules! open_or_replay {
 }
 
 pub mod admin;
+pub mod analyses;
 pub mod balance;
 pub mod credentials;
+pub mod grants;
 pub mod pools;
 pub mod transactions;
 pub mod users;
@@ -205,6 +207,11 @@ pub fn wallet_router() -> Router<AppState> {
             "/v1/admin/wallets/{wallet_id}/activate",
             post(admin::activate_wallet),
         )
+        .route(
+            "/v1/admin/employer-scopes",
+            get(admin::get_employer_scopes).put(admin::replace_employer_scopes),
+        )
+        .route("/v1/admin/analysis-log", get(admin::get_analysis_log))
 }
 
 /// Build the DRT pool routes (nested under `/v1/drt`).
@@ -219,10 +226,10 @@ pub fn drt_router() -> Router<AppState> {
             "/v1/drt/pools/{pool_pda}/drt/{drt_name}",
             get(pools::get_drt),
         )
-        // ── Schema upload ────────────────────────────────────────
+        // ── Schema, from the pool's analysis ─────────────────────
         .route(
             "/v1/drt/pools/{pool_pda}/schema",
-            post(credentials::schema::upload_schema).get(credentials::schema::get_schema),
+            get(credentials::schema::get_schema),
         )
         // ── Revocation (issuance is in `upload_router`) ─────────
         .route(
@@ -244,6 +251,34 @@ pub fn drt_router() -> Router<AppState> {
         .route(
             "/v1/drt/pools/by-wallet/{wallet_id}",
             get(credentials::reads::list_pools_by_wallet),
+        )
+        // ── Analyst grants ───────────────────────────────────────
+        .route(
+            "/v1/drt/pools/{pool_pda}/grant",
+            post(grants::grant_analysis),
+        )
+        .route(
+            "/v1/drt/pools/{pool_pda}/revoke-grant",
+            post(grants::revoke_grant),
+        )
+        .route("/v1/drt/pools/{pool_pda}/grants", get(grants::list_grants))
+        .route("/v1/drt/me/analyses", get(grants::my_analyses))
+        // ── Analyses ─────────────────────────────────────────────
+        .route(
+            "/v1/drt/pools/{pool_pda}/analyses/{analysis_id}",
+            get(analyses::get_analysis),
+        )
+        .route(
+            "/v1/drt/pools/{pool_pda}/analyses/{analysis_id}/options",
+            get(analyses::get_options),
+        )
+        .route(
+            "/v1/drt/pools/{pool_pda}/analyses/{analysis_id}/options/{filter}",
+            get(analyses::search_values),
+        )
+        .route(
+            "/v1/drt/pools/{pool_pda}/analyses/{analysis_id}/query",
+            post(analyses::run_query),
         )
         // ── Marketplace discovery ────────────────────────────────
         .route(

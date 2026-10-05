@@ -1,0 +1,26 @@
+Staff Number,Membership Number,Title,First Name,Surname,Date of Birth,Employer,Employer Group,Award,Award Grade,Exam Board Date
+000123,0100045,Ms,Aoife,Brennan,14/03/1988,AIB,AIB,Professional Certificate in Financial Services,Merit,01/01/2026
+000123,0100045,Ms,Aoife,Brennan,14/03/1988,AIB,AIB,Professional Diploma in Compliance,Pass,30/09/2026
+001234,0100046,Mr,Cian,Doyle,02/11/1990,AIB,AIB,Certificate in Digital Banking,Distinction,31/12/2025
+001234,0100046,Mr,Cian,Doyle,02/11/1990,AIB,AIB,Professional Certificate in Financial Services,Pass,01/10/2026
+012345,0100047,Dr,Niamh,Fitzgerald,23/07/1985,AIB,AIB,Professional Diploma in Compliance,Pass with Distinction,15/06/2026
+012346,0100048,Mr,Darragh,Gallagher,09/01/1993,AIB,AIB,Certificate in Digital Banking,Merit,15/06/2026
+012347,0100049,Mrs,Sinead,Hayes,30/05/1979,AIB,AIB,Certified Credit Union Advisor,Pass,02/03/2026
+0099,0100050,Mx,Rory,Kavanagh,17/08/1995,AIB,AIB,Professional Certificate in Financial Services,Distinction,02/03/2026
+020001,0200001,Ms,Orla,Lynch,05/02/1991,EBS Network,AIB,Professional Certificate in Financial Services,Pass,20/04/2026
+020002,0200002,Mr,Eoin,McCarthy,28/09/1987,EBS Network,AIB,Certified Credit Union Advisor,Merit,20/04/2026
+020003,0200003,Ms,Ciara,Nolan,11/12/1994,EBS Network,AIB,Professional Diploma in Compliance,Pass,08/11/2025
+020004,0200004,Mr,Fionn,O'Brien,19/04/1989,EBS Network,AIB,Certificate in Digital Banking,Pass with Distinction,30/09/2026
+030001,0300001,Ms,Grainne,O'Connor,03/06/1986,Bank of Ireland,Bank of Ireland,Professional Certificate in Financial Services,Merit,01/01/2026
+030002,0300002,Mr,Oisin,O'Sullivan,26/10/1992,Bank of Ireland,Bank of Ireland,Professional Diploma in Compliance,Distinction,14/05/2026
+030003,0300003,Mrs,Roisin,Power,12/01/1983,Bank of Ireland,Bank of Ireland,Certificate in Digital Banking,Pass,14/05/2026
+030004,0300004,Mr,Seamus,Quinn,07/07/1990,Bank of Ireland,Bank of Ireland,Certified Credit Union Advisor,Pass,22/07/2026
+030005,0300005,Ms,Tara,Reilly,21/03/1996,BOI Insurance,Bank of Ireland,Professional Certificate in Financial Services,Pass with Distinction,22/07/2026
+030006,0300006,Mr,Ultan,Ryan,15/11/1988,BOI Insurance,Bank of Ireland,Professional Diploma in Compliance,Merit,31/12/2025
+030007,0300007,Ms,Una,Sheehan,08/08/1991,BOI Insurance,Bank of Ireland,Certificate in Digital Banking,Pass,01/10/2026
+040001,0400001,Mr,Aidan,Tobin,29/02/1992,PTSB,PTSB,Professional Certificate in Financial Services,Pass,10/02/2026
+040002,0400002,Ms,Brid,Walsh,13/09/1984,PTSB,PTSB,Certified Credit Union Advisor,Distinction,10/02/2026
+040003,0400003,Mr,Colm,Whelan,04/04/1997,PTSB,PTSB,Professional Diploma in Compliance,Merit,18/08/2026
+040004,0400004,Ms,Deirdre,Burke,25/12/1980,PTSB,PTSB,Certificate in Digital Banking,Pass with Distinction,18/08/2026
+050001,0500001,Mr,Enda,Clarke,16/06/1990,Credit Union Partners,,Certified Credit Union Advisor,Pass,05/05/2026
+050002,0500002,Ms,Fiona,Daly,01/01/1993,Credit Union Partners,,Professional Certificate in Financial Services,Merit,05/05/2026

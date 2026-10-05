@@ -180,6 +180,41 @@ pub fn build_grant_right(
 }
 
 // ============================================================================
+// revoke_grant
+// ============================================================================
+
+/// Build the `revoke_grant` instruction (closes the Grant PDA, refunding its
+/// rent to the pool owner).
+///
+/// Accounts (in IDL order): owner (writable, signer), pool, drt_config,
+/// grant (writable, PDA from commitment).
+pub fn build_revoke_grant(
+    owner: &Pubkey,
+    pool_pda: &Pubkey,
+    drt_config_pda: &Pubkey,
+    commitment: &[u8; 32],
+) -> Instruction {
+    let (grant_pda, _) = derive_grant_pda(commitment);
+
+    let mut data = Vec::with_capacity(8 + 32);
+    data.extend_from_slice(&DISC_REVOKE_GRANT);
+    data.extend_from_slice(commitment);
+
+    let accounts = vec![
+        AccountMeta::new(*owner, true),
+        AccountMeta::new_readonly(*pool_pda, false),
+        AccountMeta::new_readonly(*drt_config_pda, false),
+        AccountMeta::new(grant_pda, false),
+    ];
+
+    Instruction {
+        program_id: drt_program_id(),
+        accounts,
+        data,
+    }
+}
+
+// ============================================================================
 // seal_pool
 // ============================================================================
 
@@ -212,6 +247,63 @@ mod tests {
     use super::*;
     use crate::blockchain::rpc::JsonRpcClient;
     use crate::config::DEFAULT_SOLANA_RPC_URL;
+
+    /// Every builder lays out its accounts in the IDL's order, with its
+    /// writable and signer flags, after the IDL's discriminator.
+    #[test]
+    fn builders_follow_the_idl() {
+        let idl: Value =
+            serde_json::from_str(include_str!("../../../idl/digital_rights_tokens.json")).unwrap();
+        let spec = |name: &str| {
+            let ix = idl["instructions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|ix| ix["name"] == name)
+                .unwrap_or_else(|| panic!("{name} is in the IDL"));
+            let flags: Vec<(bool, bool)> = ix["accounts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|a| {
+                    let flag = |key: &str| a[key].as_bool().unwrap_or(false);
+                    (flag("writable"), flag("signer"))
+                })
+                .collect();
+            let disc: Vec<u8> = serde_json::from_value(ix["discriminator"].clone()).unwrap();
+            (disc, flags)
+        };
+        let built = |ix: Instruction| {
+            let flags = ix
+                .accounts
+                .iter()
+                .map(|a| (a.is_writable, a.is_signer))
+                .collect();
+            (ix.data[..8].to_vec(), flags)
+        };
+        let [owner, pool, config, mint] = [1u8, 2, 3, 4].map(|n| Pubkey::new_from_array([n; 32]));
+        let commitment = [5; 32];
+        let register =
+            build_register_drt(&owner, &pool, &owner, &[6; 16], "https://x", &[7; 32], 1).unwrap();
+        for (name, ix) in [
+            ("create_pool", build_create_pool(&owner, &pool, &[6; 16])),
+            ("register_drt", register),
+            (
+                "grant_right",
+                build_grant_right(&pool, &config, &mint, &owner, &commitment),
+            ),
+            (
+                "revoke_grant",
+                build_revoke_grant(&owner, &pool, &config, &commitment),
+            ),
+            ("seal_pool", build_seal_pool(&owner, &pool)),
+        ] {
+            assert_eq!(built(ix), spec(name), "{name}");
+        }
+        let revoke = build_revoke_grant(&owner, &pool, &config, &commitment);
+        assert_eq!(revoke.accounts[3].pubkey, derive_grant_pda(&commitment).0);
+        assert_eq!(revoke.data[8..], commitment);
+    }
 
     /// A devnet pool with landed issuance burns; `GRANT_GUARD_POOL` names another.
     const DEVNET_POOL: &str = "3QhZF66CnE8prTFYwoETNuLdtya2mB8CtnJZ4EsML7XH";
@@ -260,7 +352,8 @@ mod tests {
 
     /// The program refuses a second `grant_right` under a commitment whose
     /// Grant PDA exists, while the same instruction under a fresh commitment
-    /// passes, so the commitment alone decides. Simulated without signature
+    /// passes, so the commitment alone decides; and `revoke_grant` from the
+    /// pool's owner closes that Grant PDA. Simulated without signature
     /// checks, so it needs no keys and spends nothing.
     #[tokio::test]
     #[ignore = "calls devnet: run with `just grant-guard`"]
@@ -301,6 +394,14 @@ mod tests {
         assert!(
             failed.is_none(),
             "a fresh commitment failed too, so the test shows nothing: {failed:?} {control_logs:#?}"
+        );
+
+        // An issuance's holder is the pool's owner.
+        let revoke = build_revoke_grant(&holder, &pool, &drt_config, &landed.commitment);
+        let (refused_close, close_logs) = simulate(&rpc, revoke, &holder).await;
+        assert!(
+            refused_close.is_none(),
+            "revoke_grant failed: {refused_close:?} {close_logs:#?}"
         );
 
         eprintln!(

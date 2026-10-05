@@ -149,6 +149,13 @@ impl<'a> Identities<'a> {
             .list_json("identities/", |p| p.ends_with(".json"))
             .await
     }
+
+    /// The identity whose `user_id` this is. Identities are named by their
+    /// Entra IDs, so this reads them all: fine for the pilot's users, whose
+    /// unchanged documents come from the cache.
+    pub async fn by_user_id(&self, user_id: &str) -> Result<Option<Identity>, StoreError> {
+        Ok(self.all().await?.into_iter().find(|i| i.user_id == user_id))
+    }
 }
 
 #[cfg(test)]
@@ -191,6 +198,9 @@ mod tests {
             .unwrap()
             .is_none());
         assert_eq!(a.identities().all().await.unwrap().len(), 1);
+        let by_id = b.identities().by_user_id(&x.user_id).await.unwrap();
+        assert_eq!(by_id.map(|i| i.email), Some("Ada@Example.com".to_string()));
+        assert!(b.identities().by_user_id("nobody").await.unwrap().is_none());
 
         // Object names carry neither the object ID nor the email.
         let names: Vec<_> = crate::store::ObjectStore::list(files.as_ref(), "identities/email/")

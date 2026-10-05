@@ -65,7 +65,10 @@ pub struct PoolSummaryResponse {
     pub pool_name: String,
     pub owner: String,
     pub schema_id: String,
-    pub validation_mode: crate::data_validation::ValidationMode,
+    /// The analysis the pool's Execute DRT pins; none for pools created
+    /// before analyses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub analysis: Option<crate::storage::pools::AnalysisRef>,
     pub state: String,
     /// Total CSV rows that have been uploaded into this pool across all
     /// initialize + issue calls.
@@ -309,7 +312,7 @@ pub async fn pool_summary(
         pool_name: doc.pool_name,
         owner: pool.owner.to_string(),
         schema_id: doc.schema_id,
-        validation_mode: doc.validation_mode,
+        analysis: doc.analysis,
         total_rows: totals.rows,
         revoked_count: totals.revoked,
         created_at: doc.created_at.to_rfc3339(),
