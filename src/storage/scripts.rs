@@ -52,7 +52,25 @@ impl<'a> Scripts<'a> {
 
 #[cfg(test)]
 mod tests {
+    use sha2::{Digest, Sha256};
+
     use crate::storage::tests::files_storage;
+    use crate::storage::StoreError;
+
+    #[tokio::test]
+    async fn a_definition_that_no_longer_hashes_to_its_name_is_refused() {
+        let storage = files_storage();
+        let hash = hex::encode(Sha256::digest(b"analysis_id = \"x\""));
+        storage
+            .state()
+            .create(&format!("scripts/{hash}"), b"analysis_id = \"y\"")
+            .await
+            .unwrap();
+        assert!(matches!(
+            storage.scripts().get(&hash).await,
+            Err(StoreError::Integrity(_))
+        ));
+    }
 
     #[tokio::test]
     async fn definitions_are_stored_and_read_by_their_hash() {
