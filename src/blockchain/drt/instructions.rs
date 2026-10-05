@@ -200,3 +200,115 @@ pub fn build_seal_pool(owner: &Pubkey, pool_pda: &Pubkey) -> Instruction {
         data,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use base64::engine::general_purpose::STANDARD as BASE64;
+    use base64::Engine;
+    use serde_json::Value;
+    use solana_message::Message;
+    use solana_transaction::Transaction;
+
+    use super::*;
+    use crate::blockchain::rpc::JsonRpcClient;
+    use crate::config::DEFAULT_SOLANA_RPC_URL;
+
+    /// A devnet pool with landed issuance burns; `GRANT_GUARD_POOL` names another.
+    const DEVNET_POOL: &str = "3QhZF66CnE8prTFYwoETNuLdtya2mB8CtnJZ4EsML7XH";
+
+    /// A `grant_right` that landed: its transaction, accounts and commitment.
+    struct LandedGrant {
+        signature: String,
+        accounts: Vec<Pubkey>,
+        commitment: [u8; 32],
+    }
+
+    /// The newest `grant_right` among the last 100 transactions that touched `pool`.
+    async fn landed_grant(rpc: &JsonRpcClient, pool: &Pubkey) -> LandedGrant {
+        let history = rpc
+            .get_signatures_for_address(pool, None, None, Some(100), "finalized")
+            .await
+            .unwrap();
+        for entry in history.iter().filter(|s| s.err.is_none()) {
+            let tx = rpc.get_legacy_transaction(&entry.signature).await.unwrap();
+            let keys = &tx.message.account_keys;
+            let grant = tx.message.instructions.iter().find(|ix| {
+                keys[usize::from(ix.program_id_index)] == drt_program_id()
+                    && ix.data.starts_with(&DISC_GRANT_RIGHT)
+            });
+            if let Some(ix) = grant {
+                return LandedGrant {
+                    signature: entry.signature.clone(),
+                    accounts: ix.accounts.iter().map(|&i| keys[usize::from(i)]).collect(),
+                    commitment: ix.data[8..40].try_into().unwrap(),
+                };
+            }
+        }
+        panic!("no grant_right among the last 100 transactions of {pool}");
+    }
+
+    /// `ix` in an unsigned transaction paid by `payer`, simulated.
+    async fn simulate(
+        rpc: &JsonRpcClient,
+        ix: Instruction,
+        payer: &Pubkey,
+    ) -> (Option<Value>, Vec<String>) {
+        let tx = Transaction::new_unsigned(Message::new(&[ix], Some(payer)));
+        let encoded = BASE64.encode(bincode::serialize(&tx).unwrap());
+        rpc.simulate_transaction(&encoded).await.unwrap()
+    }
+
+    /// The program refuses a second `grant_right` under a commitment whose
+    /// Grant PDA exists, while the same instruction under a fresh commitment
+    /// passes, so the commitment alone decides. Simulated without signature
+    /// checks, so it needs no keys and spends nothing.
+    #[tokio::test]
+    #[ignore = "calls devnet: run with `just grant-guard`"]
+    async fn devnet_refuses_a_second_grant_under_one_commitment() {
+        let url = std::env::var("SOLANA_RPC_URL").unwrap_or_else(|_| DEFAULT_SOLANA_RPC_URL.into());
+        let rpc = JsonRpcClient::new(&url, "confirmed");
+        let pool: Pubkey = std::env::var("GRANT_GUARD_POOL")
+            .unwrap_or_else(|_| DEVNET_POOL.into())
+            .parse()
+            .unwrap();
+
+        let landed = landed_grant(&rpc, &pool).await;
+        let [pool, drt_config, mint, holder] = [0, 1, 2, 3].map(|i| landed.accounts[i]);
+        let again = build_grant_right(&pool, &drt_config, &mint, &holder, &landed.commitment);
+        let names: Vec<Pubkey> = again.accounts.iter().map(|a| a.pubkey).collect();
+        assert_eq!(
+            names, landed.accounts,
+            "the rebuilt instruction is the landed one"
+        );
+        let (grant_pda, _) = derive_grant_pda(&landed.commitment);
+        assert!(rpc.account_exists(&grant_pda, "finalized").await.unwrap());
+
+        let (refused, logs) = simulate(&rpc, again, &holder).await;
+        let Some(refusal) = refused else {
+            panic!(
+                "a second grant under {}'s commitment passed: {logs:#?}",
+                landed.signature
+            );
+        };
+
+        let ids = [
+            *uuid::Uuid::new_v4().as_bytes(),
+            *uuid::Uuid::new_v4().as_bytes(),
+        ];
+        let fresh: [u8; 32] = ids.concat().try_into().unwrap();
+        let control = build_grant_right(&pool, &drt_config, &mint, &holder, &fresh);
+        let (failed, control_logs) = simulate(&rpc, control, &holder).await;
+        assert!(
+            failed.is_none(),
+            "a fresh commitment failed too, so the test shows nothing: {failed:?} {control_logs:#?}"
+        );
+
+        eprintln!(
+            "{} again, under the same commitment: {refusal}",
+            landed.signature
+        );
+        for line in &logs {
+            eprintln!("  {line}");
+        }
+    }
+}

@@ -394,6 +394,67 @@ impl JsonRpcClient {
         )
         .await
     }
+
+    /// `simulateTransaction` of a transaction, bincode-serialized and
+    /// base64-encoded, without checking its signatures and with the latest
+    /// blockhash in place of its own, so it needn't be signed: the
+    /// simulation's error, if it failed, and its logs.
+    #[cfg(test)]
+    pub async fn simulate_transaction(
+        &self,
+        encoded: &str,
+    ) -> Result<(Option<Value>, Vec<String>), RpcError> {
+        let ctx: RpcContext<Value> = self
+            .call_typed(
+                "simulateTransaction",
+                json!([
+                    encoded,
+                    {
+                        "encoding": "base64",
+                        "sigVerify": false,
+                        "replaceRecentBlockhash": true,
+                        "commitment": self.commitment,
+                    }
+                ]),
+            )
+            .await?;
+        let err = Some(ctx.value["err"].clone()).filter(|e| !e.is_null());
+        let logs = ctx.value["logs"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|line| line.as_str().map(String::from))
+            .collect();
+        Ok((err, logs))
+    }
+
+    /// `getTransaction` of a finalized legacy transaction, decoded.
+    #[cfg(test)]
+    pub async fn get_legacy_transaction(
+        &self,
+        signature: &str,
+    ) -> Result<solana_transaction::Transaction, RpcError> {
+        let result = self
+            .call(
+                "getTransaction",
+                json!([
+                    signature,
+                    {
+                        "encoding": "base64",
+                        "commitment": "finalized",
+                        "maxSupportedTransactionVersion": 0,
+                    }
+                ]),
+            )
+            .await?;
+        let encoded = result["transaction"][0]
+            .as_str()
+            .ok_or_else(|| RpcError::new(format!("transaction {signature} not found")))?;
+        let bytes = BASE64
+            .decode(encoded)
+            .map_err(|e| RpcError::new(format!("base64 decode: {e}")))?;
+        bincode::deserialize(&bytes).map_err(|e| RpcError::new(format!("deserialize: {e}")))
+    }
 }
 
 // ============================================================================
