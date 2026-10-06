@@ -37,6 +37,7 @@
         "sku": "Confidential",
         "osType": "Linux",
         "restartPolicy": "Always",
+        "shutdownGracePeriod": "PT60S",
         "confidentialComputeProperties": {
           "ccePolicy": ""
         },
