@@ -2,10 +2,11 @@
 // Copyright (C) 2026 Relational Network
 
 //! Running analyses on a worker. Definitions are cached by hash, decrypted
-//! datasets by upload, and scoped tables by pool version and scope, each
-//! loaded once and kept within a memory budget, so a warm query reads no
-//! dataset and a new upload loads only its own. SQLite work runs on
-//! blocking threads, about one per CPU at a time.
+//! datasets by upload, scoped tables by pool version and scope, and the
+//! counts of scope values by pool version, each loaded once and kept within
+//! a memory budget, so a warm query reads no dataset and a new upload loads
+//! only its own. SQLite and counting work runs on blocking threads, about
+//! one per CPU at a time.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -18,7 +19,7 @@ use zeroize::Zeroizing;
 
 use super::cache::{Cache, Weigh};
 use super::definition::Definition;
-use super::table::{Scope, Table};
+use super::table::{Scope, ScopeCounts, Table};
 use crate::error::ApiError;
 use crate::storage::pools::{PoolDoc, Upload};
 use crate::storage::{Storage, StoreError};
@@ -27,6 +28,8 @@ use crate::storage::{Storage, StoreError};
 const DATASET_BUDGET: usize = 512 << 20;
 /// Memory for scoped tables.
 const TABLE_BUDGET: usize = 1 << 30;
+/// Memory for counts of scope values.
+const COUNTS_BUDGET: usize = 64 << 20;
 /// How long a request waits for a free thread before it gets 503.
 const QUEUE_WAIT: Duration = Duration::from_secs(1);
 
@@ -47,20 +50,56 @@ impl Weigh for Table {
     }
 }
 
-/// What a table holds: the rows of these uploads that this scope allows,
-/// read with this definition.
+impl Weigh for ScopeCounts {
+    fn bytes(&self) -> usize {
+        self.combinations
+            .iter()
+            .map(|c| {
+                32 + c
+                    .values
+                    .iter()
+                    .map(|v| 24 + v.as_ref().map_or(0, String::len))
+                    .sum::<usize>()
+            })
+            .sum()
+    }
+}
+
+/// A pool version: the uploads that count, read with this definition.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct TableKey {
+struct Version {
     pool_pda: String,
     definition: [u8; 32],
     uploads: Vec<String>,
+}
+
+/// What a table holds: the rows of a pool version that this scope allows.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct TableKey {
+    version: Version,
     scope: Scope,
+}
+
+/// `doc`'s uploads that count (revoked ones don't), and the pool version
+/// they make with `definition`.
+fn version<'a>(doc: &'a PoolDoc, definition: &Definition) -> (Version, Vec<&'a Upload>) {
+    let uploads: Vec<&Upload> = doc
+        .uploads()
+        .filter(|u| !doc.is_revoked(&u.record_id))
+        .collect();
+    let version = Version {
+        pool_pda: doc.pool_pda.clone(),
+        definition: definition.sha256,
+        uploads: uploads.iter().map(|u| u.upload_id.clone()).collect(),
+    };
+    (version, uploads)
 }
 
 pub struct Analyses {
     definitions: Mutex<HashMap<String, Arc<Definition>>>,
     datasets: Cache<(String, String), Dataset>,
     tables: Cache<TableKey, Table>,
+    counts: Cache<Version, ScopeCounts>,
     threads: Arc<Semaphore>,
 }
 
@@ -71,6 +110,7 @@ impl Default for Analyses {
             definitions: Mutex::default(),
             datasets: Cache::new(DATASET_BUDGET),
             tables: Cache::new(TABLE_BUDGET),
+            counts: Cache::new(COUNTS_BUDGET),
             threads: Arc::new(Semaphore::new(cpus)),
         }
     }
@@ -125,22 +165,14 @@ impl Analyses {
         definition: &Arc<Definition>,
         scope: &Scope,
     ) -> Result<Arc<Table>, ApiError> {
-        let uploads: Vec<&Upload> = doc
-            .uploads()
-            .filter(|u| !doc.is_revoked(&u.record_id))
-            .collect();
+        let (version, uploads) = version(doc, definition);
         let key = TableKey {
-            pool_pda: doc.pool_pda.clone(),
-            definition: definition.sha256,
-            uploads: uploads.iter().map(|u| u.upload_id.clone()).collect(),
+            version,
             scope: scope.clone(),
         };
         self.tables
             .get_or_load(key, || async {
-                let mut datasets = Vec::with_capacity(uploads.len());
-                for upload in &uploads {
-                    datasets.push(self.dataset(storage, &doc.pool_pda, upload).await?);
-                }
+                let datasets = self.datasets(storage, &doc.pool_pda, &uploads).await?;
                 let (definition, scope) = (definition.clone(), scope.clone());
                 let pool_pda = doc.pool_pda.clone();
                 self.blocking(move || {
@@ -155,6 +187,44 @@ impl Analyses {
                 .await
             })
             .await
+    }
+
+    /// How many rows of `doc`'s uploads hold each combination of
+    /// `definition`'s scope values. Revoked uploads' rows are left out, as
+    /// tables leave them out.
+    pub async fn scope_counts(
+        &self,
+        storage: &Storage,
+        doc: &PoolDoc,
+        definition: &Arc<Definition>,
+    ) -> Result<Arc<ScopeCounts>, ApiError> {
+        let (version, uploads) = version(doc, definition);
+        self.counts
+            .get_or_load(version, || async {
+                let datasets = self.datasets(storage, &doc.pool_pda, &uploads).await?;
+                let definition = definition.clone();
+                self.blocking(move || {
+                    let csvs: Vec<&[u8]> = datasets.iter().map(|d| d.0.as_slice()).collect();
+                    ScopeCounts::count(&definition, &csvs).map_err(|e| {
+                        ApiError::internal(format!("counting the pool's scope values failed: {e}"))
+                    })
+                })
+                .await
+            })
+            .await
+    }
+
+    async fn datasets(
+        &self,
+        storage: &Storage,
+        pool_pda: &str,
+        uploads: &[&Upload],
+    ) -> Result<Vec<Arc<Dataset>>, ApiError> {
+        let mut datasets = Vec::with_capacity(uploads.len());
+        for upload in uploads {
+            datasets.push(self.dataset(storage, pool_pda, upload).await?);
+        }
+        Ok(datasets)
     }
 
     async fn dataset(
@@ -380,6 +450,19 @@ mod tests {
             .unwrap();
         assert!(Arc::ptr_eq(&shrunk, first), "the same uploads as at first");
         assert_eq!(reads(), 2);
+
+        // Scope counts read the cached datasets and leave the revoked
+        // upload out, as tables do, once.
+        let counts = analyses
+            .scope_counts(&storage, &doc, &definition)
+            .await
+            .unwrap();
+        assert_eq!((counts.rows(), reads()), (2, 2));
+        let again = analyses
+            .scope_counts(&storage, &doc, &definition)
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&again, &counts));
         let ((dataset_bytes, datasets), (_, tables)) = analyses.usage();
         assert!(dataset_bytes > 0);
         assert_eq!((datasets, tables), (2, 3));

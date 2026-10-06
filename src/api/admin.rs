@@ -9,9 +9,9 @@
 //! - `GET  /v1/admin/wallets`                   — list all wallets (any owner)
 //! - `POST /v1/admin/wallets/{id}/suspend`      — suspend a wallet
 //! - `POST /v1/admin/wallets/{id}/activate`     — reactivate a wallet
-//! - `GET  /v1/admin/employer-scopes`           — the employer-scope mapping
-//! - `PUT  /v1/admin/employer-scopes`           — replace it
 //! - `GET  /v1/admin/analysis-log`              — a pool's analysis requests on a day
+//!
+//! The employer-scope mapping's endpoints are in [`super::employer_scopes`].
 
 use axum::{
     extract::{Path, Query, State},
@@ -25,10 +25,9 @@ use utoipa::{IntoParams, ToSchema};
 
 use crate::auth::Caller;
 use crate::error::ApiError;
-use crate::idempotency::{Idempotent, JsonBody, Operation};
+use crate::idempotency::{Idempotent, Operation};
 use crate::state::AppState;
 use crate::storage::analysis_log::AnalysisRecord;
-use crate::storage::scopes::{self, EmployerScope, EmployerScopes};
 use crate::storage::wallets::{WalletResponse, WalletStatus};
 
 use super::{load_wallet, page, CursorQuery};
@@ -87,15 +86,6 @@ pub struct AnalysisLogResponse {
     pub pool_pda: String,
     pub date: String,
     pub records: Vec<AnalysisRecord>,
-}
-
-/// A new employer-scope mapping, replacing the current one whole.
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ReplaceEmployerScopesRequest {
-    /// The `version` of the mapping this edit started from: 0 for the first.
-    pub version: u64,
-    pub scopes: Vec<EmployerScope>,
 }
 
 // ============================================================================
@@ -317,85 +307,6 @@ pub async fn activate_wallet(
         },
     )
     .await
-}
-
-/// Read the employer-scope mapping.
-#[utoipa::path(
-    get,
-    path = "/v1/admin/employer-scopes",
-    tag = "Admin",
-    summary = "Employer scopes",
-    description = "Which rows of an analysis the members of each Entra security group may see: each entry maps a group, by the value its `groups` claim carries (the object ID), to an employer group or an employer. An analyst sees the rows of every entry for their groups; admins see every row. Before the first replacement the mapping is empty, at version 0. Admin only.",
-    security(("bearer_auth" = [])),
-    responses(
-        (status = 200, description = "The mapping", body = EmployerScopes),
-        (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Admin role required"),
-    )
-)]
-pub async fn get_employer_scopes(
-    caller: Caller,
-    State(state): State<AppState>,
-) -> Result<Json<EmployerScopes>, ApiError> {
-    caller.require_admin()?;
-    Ok(Json(state.storage.employer_scopes().get().await?))
-}
-
-/// Replace the employer-scope mapping.
-#[utoipa::path(
-    put,
-    path = "/v1/admin/employer-scopes",
-    tag = "Admin",
-    summary = "Replace employer scopes",
-    description = "Replace the whole mapping. `version` is the version the edit started from; if another replacement came first, this one is refused with 409, so read the mapping again. Names are matched exactly as the data holds them. A mapping that already holds these entries is returned unchanged. Admin only.",
-    security(("bearer_auth" = [])),
-    params(
-        ("Idempotency-Key" = String, Header, description = "A UUID naming this user action; reuse it on every retry"),
-    ),
-    request_body = ReplaceEmployerScopesRequest,
-    responses(
-        (status = 200, description = "The new mapping", body = EmployerScopes),
-        (status = 400, description = "An invalid entry, or no Idempotency-Key"),
-        (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Admin role required"),
-        (status = 409, description = "The mapping changed since `version`"),
-        (status = 422, description = "The Idempotency-Key was used for a different request"),
-    )
-)]
-pub async fn replace_employer_scopes(
-    caller: Caller,
-    request: Idempotent,
-    State(state): State<AppState>,
-    JsonBody {
-        value: payload,
-        bytes,
-    }: JsonBody<ReplaceEmployerScopesRequest>,
-) -> Result<Response, ApiError> {
-    caller.require_admin()?;
-    let mut op = open_or_replay!(state, &caller.user_id, request, &bytes);
-    scopes::check(&payload.scopes).map_err(ApiError::bad_request)?;
-
-    op.begin().await?;
-    let mapping = state
-        .storage
-        .employer_scopes()
-        .replace(payload.version, payload.scopes, &caller.user_id)
-        .await?
-        .ok_or_else(|| {
-            ApiError::conflict(format!(
-                "the employer scopes changed since version {}; read them again",
-                payload.version
-            ))
-            .with_code("version_conflict")
-        })?;
-
-    info!(
-        version = mapping.version,
-        entries = mapping.scopes.len(),
-        admin = %caller.user_id,
-        "Employer scopes replaced"
-    );
-    op.finish(StatusCode::OK, &mapping).await
 }
 
 /// A pool's analysis requests on one day.

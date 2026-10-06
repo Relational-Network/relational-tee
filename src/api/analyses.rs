@@ -798,7 +798,7 @@ pub async fn run_query(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use sha2::{Digest, Sha256};
@@ -831,7 +831,7 @@ mod tests {
     ];
 
     /// An Awards Report pool of `owner`'s whose first upload holds `ROWS`.
-    async fn awards_pool(worker: &Worker, owner: &Admin) -> Pubkey {
+    pub(crate) async fn awards_pool(worker: &Worker, owner: &Admin) -> Pubkey {
         let pool_pda = analysis_pool(worker, owner, 1).await;
         let pda = pool_pda.to_string();
         worker
@@ -873,7 +873,7 @@ mod tests {
     }
 
     /// `analyst` holds an active grant to the pool's analysis.
-    async fn grant(worker: &Worker, pool_pda: &Pubkey, analyst: &str) {
+    pub(crate) async fn grant(worker: &Worker, pool_pda: &Pubkey, analyst: &str) {
         worker
             .storage
             .pools()

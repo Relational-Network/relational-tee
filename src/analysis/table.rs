@@ -6,14 +6,14 @@
 //! pool version and scope. Rows outside the scope are never inserted, so no
 //! statement can reach them.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
 use rusqlite::{Connection, ToSql};
 
 use super::dates;
-use super::definition::{ColumnType, Definition, RECORD_ID};
+use super::definition::{Column, ColumnType, Definition, RECORD_ID};
 use super::query::{filter_options, FilterOptions, DEADLINE_STEPS};
 use super::runner::DEADLINE;
 
@@ -155,22 +155,13 @@ impl Table {
                     .has_headers(true)
                     .from_reader(*data);
                 let headers = reader.headers()?.clone();
-                let index = def
-                    .columns
-                    .iter()
-                    .map(|c| {
-                        headers
-                            .iter()
-                            .position(|h| h.trim() == c.header)
-                            .ok_or_else(|| TableError::MissingHeader(c.header.clone()))
-                    })
-                    .collect::<Result<Vec<usize>, _>>()?;
+                let index = header_positions(&headers, &def.columns)?;
                 for record in reader.records() {
                     let record = record?;
                     record_id += 1;
                     values.clear();
                     for (column, &i) in def.columns.iter().zip(&index) {
-                        let raw = record.get(i).map(str::trim).filter(|v| !v.is_empty());
+                        let raw = cell(&record, i);
                         values.push(match column.kind {
                             ColumnType::Text => raw.map(String::from),
                             ColumnType::Date => raw.and_then(dates::to_sql),
@@ -215,9 +206,152 @@ impl Table {
     }
 }
 
+/// Where each of `columns` is in an upload with these headers.
+fn header_positions<'a>(
+    headers: &csv::StringRecord,
+    columns: impl IntoIterator<Item = &'a Column>,
+) -> Result<Vec<usize>, TableError> {
+    columns
+        .into_iter()
+        .map(|c| {
+            headers
+                .iter()
+                .position(|h| h.trim() == c.header)
+                .ok_or_else(|| TableError::MissingHeader(c.header.clone()))
+        })
+        .collect()
+}
+
+/// A cell as a table holds it: trimmed, and none if that leaves nothing.
+fn cell(record: &csv::StringRecord, i: usize) -> Option<&str> {
+    record.get(i).map(str::trim).filter(|v| !v.is_empty())
+}
+
+/// The rows that hold one combination of scope values, in the order of
+/// [`ScopeCounts::keys`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Combination {
+    pub values: Vec<Option<String>>,
+    pub rows: u64,
+}
+
+/// How many rows of some uploads hold each combination of a definition's
+/// scope values. Values are read as a table reads them, so a scope decides
+/// a combination as it decides each of that combination's rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopeCounts {
+    /// The definition's scope keys, in order.
+    pub keys: Vec<String>,
+    /// Every combination that occurs, in order.
+    pub combinations: Vec<Combination>,
+}
+
+impl ScopeCounts {
+    pub fn count(def: &Definition, datasets: &[&[u8]]) -> Result<Self, TableError> {
+        let columns = def
+            .scope
+            .values()
+            .map(|name| {
+                def.column(name)
+                    .ok_or_else(|| TableError::MissingHeader(name.clone()))
+            })
+            .collect::<Result<Vec<&Column>, _>>()?;
+        let mut counts: HashMap<Vec<Option<String>>, u64> = HashMap::new();
+        for data in datasets {
+            let mut reader = csv::ReaderBuilder::new()
+                .has_headers(true)
+                .from_reader(*data);
+            let headers = reader.headers()?.clone();
+            let index = header_positions(&headers, columns.iter().copied())?;
+            for record in reader.records() {
+                let record = record?;
+                let values = index
+                    .iter()
+                    .map(|&i| cell(&record, i).map(String::from))
+                    .collect();
+                *counts.entry(values).or_default() += 1;
+            }
+        }
+        let mut combinations: Vec<Combination> = counts
+            .into_iter()
+            .map(|(values, rows)| Combination { values, rows })
+            .collect();
+        combinations.sort_unstable_by(|a, b| a.values.cmp(&b.values));
+        Ok(Self {
+            keys: def.scope.keys().cloned().collect(),
+            combinations,
+        })
+    }
+
+    /// Every row counted.
+    pub fn rows(&self) -> u64 {
+        self.combinations.iter().map(|c| c.rows).sum()
+    }
+
+    /// The combinations `scope` lets into a table, and those it keeps out.
+    pub fn split(&self, scope: &Scope) -> (Vec<&Combination>, Vec<&Combination>) {
+        let positions: BTreeMap<&str, usize> = self
+            .keys
+            .iter()
+            .enumerate()
+            .map(|(i, key)| (key.as_str(), i))
+            .collect();
+        self.combinations
+            .iter()
+            .partition(|c| scope.allows(&positions, &c.values))
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::analysis::definition::tests::awards_report;
+    use crate::data_validation::tests::AWARDS_HEADER;
+
+    #[test]
+    fn scope_counts_read_values_as_tables_do_and_scopes_decide_them_alike() {
+        let def = awards_report();
+        let first = format!(
+            "{AWARDS_HEADER}\n\
+             1,M1,Mx,Sam,Alpha,01/01/1990,Bank A,Group A,Certificate,Pass,01/01/2026\n\
+             2,M2,Mx,Sam,Bravo,01/01/1990, Bank A ,Group A,Diploma,Pass,02/01/2026\n\
+             3,M3,Mx,Sam,Charlie,01/01/1990,Bank A Network,Group A,Certificate,Pass,03/01/2026\n\
+             4,M4,Mx,Sam,Delta,01/01/1990,Bank B,,Certificate,Pass,04/01/2026\n"
+        );
+        let second = "Employer Group,Staff Number,Membership Number,Title,First Name,Surname,\
+                      Date of Birth,Employer,Award,Award Grade,Exam Board Date\n\
+                      Group B,5,M5,Mx,Sam,Echo,01/01/1990,Bank B,Certificate,Pass,05/01/2026\n";
+        let datasets = [first.as_bytes(), second.as_bytes()];
+        let counts = ScopeCounts::count(&def, &datasets).unwrap();
+        assert_eq!(counts.keys, ["employer", "employer_group"]);
+        let combination = |employer: &str, group: Option<&str>, rows| Combination {
+            values: vec![Some(employer.into()), group.map(String::from)],
+            rows,
+        };
+        assert_eq!(
+            counts.combinations,
+            [
+                combination("Bank A", Some("Group A"), 2),
+                combination("Bank A Network", Some("Group A"), 1),
+                combination("Bank B", None, 1),
+                combination("Bank B", Some("Group B"), 1),
+            ]
+        );
+        assert_eq!(counts.rows(), 5);
+
+        let scope = only(&[
+            &[("employer_group", "Group A")],
+            &[("employer", "Bank B"), ("employer_group", "Group B")],
+        ]);
+        let (allowed, kept_out) = counts.split(&scope);
+        let table = Table::build(&def, &datasets, &scope).unwrap();
+        assert_eq!(
+            allowed.iter().map(|c| c.rows).sum::<u64>(),
+            table.rows as u64
+        );
+        assert_eq!(kept_out, [&combination("Bank B", None, 1)]);
+        assert!(counts.split(&Scope::All).1.is_empty());
+    }
 
     /// The scope of these entries, each a list of conditions.
     pub(crate) fn only(entries: &[&[(&str, &str)]]) -> Scope {

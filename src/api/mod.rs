@@ -23,6 +23,7 @@ pub mod admin;
 pub mod analyses;
 pub mod balance;
 pub mod credentials;
+pub mod employer_scopes;
 pub mod grants;
 pub mod pools;
 pub mod transactions;
@@ -209,7 +210,19 @@ pub fn wallet_router() -> Router<AppState> {
         )
         .route(
             "/v1/admin/employer-scopes",
-            get(admin::get_employer_scopes).put(admin::replace_employer_scopes),
+            get(employer_scopes::get_employer_scopes).put(employer_scopes::replace_employer_scopes),
+        )
+        .route(
+            "/v1/admin/employer-scopes/check",
+            post(employer_scopes::check_employer_scopes),
+        )
+        .route(
+            "/v1/admin/employer-scopes/versions",
+            get(employer_scopes::list_scope_versions),
+        )
+        .route(
+            "/v1/admin/employer-scopes/versions/{version}",
+            get(employer_scopes::get_scope_version),
         )
         .route("/v1/admin/analysis-log", get(admin::get_analysis_log))
 }

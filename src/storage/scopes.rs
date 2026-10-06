@@ -6,6 +6,11 @@
 //! `config/employer-scopes.json`, which admins replace whole. Its `version`
 //! goes up by one with each replacement, and a replacement names the version
 //! it was edited from, so an edit made from a stale copy is refused.
+//!
+//! Every version is also kept, create-only, under
+//! `config/employer-scope-versions/`. A replacement records the version it
+//! makes, and first the one it replaces if that isn't recorded yet, so a
+//! version whose record failed is recorded before it stops being current.
 
 use std::collections::BTreeSet;
 
@@ -19,6 +24,12 @@ use crate::analysis::table::{Conditions, Scope};
 use crate::store::{Created, Replaced};
 
 const PATH: &str = "config/employer-scopes.json";
+const VERSIONS: &str = "config/employer-scope-versions/";
+
+/// Where a version is kept: zero-padded, so name order is version order.
+fn version_path(version: u64) -> String {
+    format!("{VERSIONS}{version:012}.json")
+}
 
 /// The most entries a mapping holds.
 pub const MAX_SCOPES: usize = 1000;
@@ -153,11 +164,13 @@ impl<'a> Scopes<'a> {
                 None => (EmployerScopes::default(), None),
             };
             if current.scopes == scopes {
+                self.record(&current).await?;
                 return Ok(Some(current));
             }
             if current.version != version {
                 return Ok(None);
             }
+            self.record(&current).await?;
             let next = EmployerScopes {
                 version: version + 1,
                 scopes: scopes.clone(),
@@ -172,10 +185,62 @@ impl<'a> Scopes<'a> {
                 ),
             };
             if written {
+                self.record(&next).await?;
                 return Ok(Some(next));
             }
         }
         Err(StoreError::Contended)
+    }
+
+    /// Keep `mapping` as its version, unless it's kept already. A version
+    /// number names one mapping only, since only one replacement can make it.
+    async fn record(&self, mapping: &EmployerScopes) -> Result<(), StoreError> {
+        if mapping.version > 0 {
+            self.s
+                .state()
+                .create_json(&version_path(mapping.version), mapping)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Every version there has been, newest first, the current one included
+    /// even if its record is missing.
+    pub async fn versions(&self) -> Result<Vec<u64>, StoreError> {
+        let mut versions: Vec<u64> = self
+            .s
+            .state()
+            .list(VERSIONS)
+            .await?
+            .iter()
+            .filter_map(|listed| {
+                listed
+                    .path
+                    .strip_prefix(VERSIONS)?
+                    .strip_suffix(".json")?
+                    .parse()
+                    .ok()
+            })
+            .collect();
+        let current = self.get().await?.version;
+        if current > 0 && !versions.contains(&current) {
+            versions.push(current);
+        }
+        versions.sort_unstable_by(|a, b| b.cmp(a));
+        Ok(versions)
+    }
+
+    /// The mapping as `version` made it.
+    pub async fn version(&self, version: u64) -> Result<Option<EmployerScopes>, StoreError> {
+        if version == 0 {
+            return Ok(None);
+        }
+        let state = self.s.state();
+        if let Some(mapping) = state.get_immutable_json(&version_path(version)).await? {
+            return Ok(Some(mapping));
+        }
+        let current = self.get().await?;
+        Ok((current.version == version).then_some(current))
     }
 }
 
@@ -357,6 +422,63 @@ pub(crate) mod tests {
             .unwrap()
             .unwrap();
         assert_eq!((second.version, second.scopes), (2, group_a_only));
+    }
+
+    #[tokio::test]
+    async fn every_replacement_is_kept_as_a_version() {
+        let (a, b, _files) = two_workers();
+        assert!(a.employer_scopes().versions().await.unwrap().is_empty());
+        assert_eq!(a.employer_scopes().version(0).await.unwrap(), None);
+
+        let first = a
+            .employer_scopes()
+            .replace(0, fixture(), "admin-1")
+            .await
+            .unwrap()
+            .unwrap();
+        let second = b
+            .employer_scopes()
+            .replace(1, fixture()[..1].to_vec(), "admin-2")
+            .await
+            .unwrap()
+            .unwrap();
+        // A retry of a replacement that landed adds no version.
+        b.employer_scopes()
+            .replace(1, fixture()[..1].to_vec(), "admin-2")
+            .await
+            .unwrap();
+        assert_eq!(a.employer_scopes().versions().await.unwrap(), [2, 1]);
+        assert_eq!(a.employer_scopes().version(1).await.unwrap(), Some(first));
+        assert_eq!(a.employer_scopes().version(2).await.unwrap(), Some(second));
+        assert_eq!(a.employer_scopes().version(3).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_version_whose_record_failed_is_listed_and_recorded_before_it_is_replaced() {
+        let (a, _b, _files) = two_workers();
+        let first = EmployerScopes {
+            version: 1,
+            scopes: fixture(),
+            updated_at: Some(Utc::now()),
+            updated_by: Some("admin-1".into()),
+        };
+        a.state().create_json(PATH, &first).await.unwrap();
+        let scopes = a.employer_scopes();
+        assert_eq!(scopes.versions().await.unwrap(), [1]);
+        assert_eq!(scopes.version(1).await.unwrap(), Some(first.clone()));
+
+        scopes
+            .replace(1, Vec::new(), "admin-2")
+            .await
+            .unwrap()
+            .unwrap();
+        let recorded: Option<EmployerScopes> = a
+            .state()
+            .get_immutable_json(&version_path(1))
+            .await
+            .unwrap();
+        assert_eq!(recorded, Some(first));
+        assert_eq!(scopes.versions().await.unwrap(), [2, 1]);
     }
 
     #[tokio::test]
