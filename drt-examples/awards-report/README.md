@@ -5,7 +5,7 @@ Date, filtered by exam board date range, award, staff number and membership
 number, sorted on any field and paged (100 rows by default, 500 at most).
 Analysts see only the rows their employer scope allows; admins see every row.
 
-The columns match IOB's awards export header exactly:
+The columns match the awards export's header exactly:
 
 ```
 Staff Number,Membership Number,Title,First Name,Surname,Date of Birth,Employer,Employer Group,Award,Award Grade,Exam Board Date

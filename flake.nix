@@ -4,7 +4,7 @@
 # Nix is used at build time only: it pins every input and builds the static
 # server binary and the OCI image, but never ships inside the image.
 {
-  description = "relational-tee: the IOB MicRes worker";
+  description = "relational-tee: a confidential worker for credential pools, their analyses and custodial wallets";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";

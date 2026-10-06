@@ -59,3 +59,18 @@ registry.
 | `[output]` | `columns` returned in order, `default_sort`, and `page_size` (`default`, `max`). Any output column may be sorted on |
 | `sql.rows` | Every matching row, selecting `_record_id` and every output column, with each filter as `(:param IS NULL OR …)`. It is the reference for pages: the worker builds each page from `relation`, the output columns and only the filters a request sets, so SQLite can read it from the table's indexes, then sorts (then `_record_id`), pages and counts. A test holds those pages to the Awards Report's query; a definition whose rows query does more than select its columns under its filters needs a worker change, and a test of its own, first |
 | `sql.options.<filter>` | For a `date_range`, one row of `min` and `max`; for a `multi_select`, `value` and `count`; for a `search_select`, `value`, using `:search` (a prefix, already escaped for `LIKE ... ESCAPE '\'`) and `:limit`. Each runs as written: once per table, and on the rows the other filters a request sets match, which the worker gives it as `relation` in a `WITH` of its own, so an option query may not start with `WITH`. A filter's parameters may not be `:search` or `:limit`, nor another filter's |
+
+## Adding an analysis
+
+A new use case, or another deployment's report, is a new directory here:
+the definition, a README saying what it shows and which rows each caller
+sees, and synthetic fixtures with the export's exact headers. Name it for
+what it does, not for whom: its `analysis_id` is also a name on-chain.
+Fixtures and examples use made-up values only (Bank A, Group A, Subject A
+and so on), never a real organisation or person. Once it's committed, the
+dashboard's registry takes its URL at that commit and its hash.
+
+The worker needs a change only when a definition needs something the format
+can't express, such as a new filter kind, or a rows query that does more
+than select its columns under its filters. Such a change extends the format
+for every definition, with tests of its own.

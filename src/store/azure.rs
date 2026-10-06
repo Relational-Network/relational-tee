@@ -75,7 +75,7 @@ pub enum CredentialConfig {
 /// Where the storage account is and how to reach it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AzureConfig {
-    /// For example `https://stiobmicrespilot.blob.core.windows.net`, or
+    /// For example `https://stexample.blob.core.windows.net`, or
     /// `http://127.0.0.1:10000/devstoreaccount1` for Azurite.
     pub blob_url: String,
     pub credential: CredentialConfig,

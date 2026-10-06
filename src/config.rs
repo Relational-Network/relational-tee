@@ -1008,10 +1008,7 @@ mod tests {
             ("KEY_PROVIDER", "skr"),
             ("SKR_ENDPOINT", "http://127.0.0.1:9000"),
             ("MAA_ENDPOINT", "https://sharedweu.weu.attest.azure.net/"),
-            (
-                "KEY_VAULT_URL",
-                "https://kv-iob-micres-pilot.vault.azure.net",
-            ),
+            ("KEY_VAULT_URL", "https://kv-example.vault.azure.net"),
             ("KEY_NAMES", "t,s, tls ,c"),
         ])
         .expect("valid config");
@@ -1022,7 +1019,7 @@ mod tests {
         };
         assert_eq!(skr.endpoint, "http://127.0.0.1:9000");
         assert_eq!(skr.maa_endpoint, "sharedweu.weu.attest.azure.net");
-        assert_eq!(skr.akv_endpoint, "kv-iob-micres-pilot.vault.azure.net");
+        assert_eq!(skr.akv_endpoint, "kv-example.vault.azure.net");
         assert_eq!(skr.key_names, ["t", "s", "tls", "c"].map(String::from));
     }
 

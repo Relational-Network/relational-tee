@@ -1,6 +1,8 @@
 # relational-tee
 
-The worker behind IOB MicRes: an Axum server that runs credential pools on Solana (create a Malta pool from an approved analysis, initialise it, issue and revoke credentials, read the issuance log and audit trail), the pools' analyses (grant analysts access, and run an analysis over the rows an analyst's employer may see) and custodial Solana wallets (create, balance, fee estimate, send, history, admin suspend and activate).
+A confidential worker: an Axum server that runs credential pools on Solana (create a Malta pool from an approved analysis, initialise it, issue and revoke credentials, read the issuance log and audit trail), the pools' analyses (grant analysts access, and run an analysis over the rows an analyst's employer may see) and custodial Solana wallets (create, balance, fee estimate, send, history, admin suspend and activate).
+
+Deployments differ in data, not in code. A deployment's analyses are definitions under [`drt-examples/`](drt-examples/), each holding a pool's columns, filters, row scope and SQL; its tenant, Azure resources and employer scopes are its own configuration. A new use case is a new definition, and the worker changes only when a definition needs something the format can't express yet.
 
 > **Migration in progress.** This repo was imported from `relational-sdk`, a Gramine SGX enclave, and is being moved to Azure Confidential Containers (AMD SEV-SNP). Gramine, RA-TLS, the SGX build and the old SSH deployment are gone, and the server now builds and runs natively. Still to come: key release and attestation on real Azure hardware. Until then, parts of the server are interim, as described below.
 
@@ -40,7 +42,7 @@ just            # list the recipes
 | `just grant-guard` | Check on devnet that the DRT program refuses a second `grant_right` under one commitment: it simulates a landed grant again, which fails because its Grant PDA exists, and the same grant under a fresh commitment, which passes. It needs no keys and spends nothing; `GRANT_GUARD_POOL` picks another pool |
 | `just check` | Run every gate: rustfmt, clippy (`-D warnings`, with and without all features), the tests, the banned-crate check and `cargo audit` |
 | `just openapi` | Print the OpenAPI document (`relational-tee openapi`), which CI publishes as each run's `openapi` artifact |
-| `just spa` | Run the dashboard dev server from `../iob-pilot` (override with `IOB_PILOT_DIR`), using the host's Node and pnpm |
+| `just spa` | Run the dashboard dev server from `../dashboard` (override with `DASHBOARD_DIR`), using the host's Node and pnpm |
 | `just image` | Build the canonical x86_64-linux image with Nix and load it into Docker as `relational-tee:latest` |
 | `just image-dev` | Build the aarch64-linux dev image and load it into Docker as `relational-tee:dev` |
 | `just stack-up` | Start the local stack (needs `just image-dev`): Azurite, the fake SKR sidecar, three workers and a round-robin proxy on `127.0.0.1:8443`; `just stack-down` stops it |

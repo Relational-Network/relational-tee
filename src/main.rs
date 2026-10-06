@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Relational Network
 
-//! relational-tee: the IOB MicRes worker.
+//! relational-tee: a confidential worker.
 //!
-//! An Axum server for Use Case 1 credential pools and custodial Solana
+//! An Axum server for credential pools, their analyses and custodial Solana
 //! wallets, being migrated to Azure Confidential Containers. It provides:
 //! - Entra ID access token validation, and permissions from app roles
 //! - Sealed CSV uploads decrypted inside the worker
@@ -84,7 +84,7 @@ static STARTED_AT: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
     info(
         title = "relational-tee API",
         version = "0.1.0",
-        description = r#"IOB MicRes worker: Use Case 1 credential pools and custodial wallets.
+        description = r#"A confidential worker for credential pools, their analyses and custodial wallets.
 
 ## Authentication
 

@@ -10,7 +10,7 @@
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
 # Dashboard checkout used by `just spa`.
-pilot := env_var_or_default("IOB_PILOT_DIR", "../iob-pilot")
+dashboard := env_var_or_default("DASHBOARD_DIR", "../dashboard")
 
 # Azurite, the local Azure Storage emulator (its Blob service), runs in Docker.
 azurite_image := "mcr.microsoft.com/azure-storage/azurite:latest"
@@ -147,9 +147,9 @@ audit:
 openapi:
     @cargo run --quiet -- openapi
 
-# Run the dashboard dev server (override the path with IOB_PILOT_DIR).
+# Run the dashboard dev server (override the path with DASHBOARD_DIR).
 spa:
-    cd {{ pilot }} && pnpm install --frozen-lockfile && pnpm dev
+    cd {{ dashboard }} && pnpm install --frozen-lockfile && pnpm dev
 
 # Start the local stack: Azurite, the fake SKR sidecar, three workers and a
 # round-robin proxy on 127.0.0.1:8443, then sign a dev reference-values

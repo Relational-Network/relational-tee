@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 Relational Network
 #
-# Awards Report: an approved analysis for MICRES awards pools.
+# Awards Report: an approved analysis for awards pools.
 #
 # A pool's Execute DRT records this file's URL and SHA-256 on-chain. The
 # worker runs it only while its bytes hash to that value, so any change to

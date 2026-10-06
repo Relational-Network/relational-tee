@@ -33,7 +33,7 @@ pub struct SkrConfig {
     pub endpoint: String,
     /// MAA host, without a scheme, for example `sharedweu.weu.attest.azure.net`.
     pub maa_endpoint: String,
-    /// Key Vault host, without a scheme, for example `kv-iob-micres-pilot.vault.azure.net`.
+    /// Key Vault host, without a scheme, for example `kv-example.vault.azure.net`.
     pub akv_endpoint: String,
     /// Key Vault key names, indexed like [`KeyName::ALL`].
     pub key_names: [String; 4],
