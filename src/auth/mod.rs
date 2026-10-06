@@ -210,7 +210,8 @@ impl FromRequestParts<AppState> for Caller {
 mod tests {
     use super::*;
 
-    use crate::storage::scopes::tests::{fixture, AIB_GROUP};
+    use crate::analysis::table::tests::only;
+    use crate::storage::scopes::tests::{fixture, GROUP_A_ANALYSTS};
 
     #[test]
     fn admin_grants_every_permission_analyst_one_and_no_role_none() {
@@ -255,7 +256,7 @@ mod tests {
             scopes: fixture(),
             ..Default::default()
         };
-        let aib = Groups::Listed(vec![AIB_GROUP.into()]);
+        let group_a = Groups::Listed(vec![GROUP_A_ANALYSTS.into()]);
         assert_eq!(
             caller(&["Admin"], Groups::Overage)
                 .row_scope(&mapping)
@@ -269,13 +270,10 @@ mod tests {
             Scope::All
         );
         assert_eq!(
-            caller(&["Analyst"], aib.clone())
+            caller(&["Analyst"], group_a.clone())
                 .row_scope(&mapping)
                 .unwrap(),
-            Scope::Only {
-                employer_groups: ["AIB".to_string()].into(),
-                employers: Default::default(),
-            }
+            only(&[&[("employer_group", "Group A")]])
         );
 
         // Fail closed: unknown groups, unmapped groups, or no mapping.
@@ -296,7 +294,7 @@ mod tests {
             "no_employer_scope"
         );
         assert_eq!(
-            refused(caller(&["Analyst"], aib), &EmployerScopes::default()),
+            refused(caller(&["Analyst"], group_a), &EmployerScopes::default()),
             "no_employer_scope"
         );
     }

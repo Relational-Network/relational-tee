@@ -6,38 +6,64 @@
 //! pool version and scope. Rows outside the scope are never inserted, so no
 //! statement can reach them.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::time::Instant;
 
 use rusqlite::{Connection, ToSql};
 
 use super::dates;
 use super::definition::{ColumnType, Definition, RECORD_ID};
+use super::query::{filter_options, FilterOptions, DEADLINE_STEPS};
+use super::runner::DEADLINE;
+
+/// Scope keys, such as `employer_group`, each with the value a row's column
+/// for that key must hold exactly. A row matches when it meets them all.
+pub type Conditions = BTreeMap<String, String>;
 
 /// The rows a caller may see.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Scope {
     /// Every row: admins.
     All,
-    /// Rows whose employer group is one of `employer_groups`, or whose
-    /// employer is one of `employers`. Both empty matches nothing.
-    Only {
-        employer_groups: BTreeSet<String>,
-        employers: BTreeSet<String>,
-    },
+    /// The rows that match any of these. None matches nothing, and neither
+    /// do empty conditions or conditions on a key the definition doesn't
+    /// declare.
+    Only(BTreeSet<Conditions>),
 }
 
 impl Scope {
-    fn allows(&self, employer: Option<&str>, employer_group: Option<&str>) -> bool {
+    /// The part of this scope `def` can apply, or `None` if nothing is left.
+    /// Conditions on a key `def` doesn't declare can't be met by its rows,
+    /// so they go, whole.
+    pub fn for_definition(&self, def: &Definition) -> Option<Self> {
+        match self {
+            Self::All => Some(Self::All),
+            Self::Only(entries) => {
+                let kept: BTreeSet<Conditions> = entries
+                    .iter()
+                    .filter(|c| !c.is_empty() && c.keys().all(|k| def.scope.contains_key(k)))
+                    .cloned()
+                    .collect();
+                (!kept.is_empty()).then_some(Self::Only(kept))
+            }
+        }
+    }
+
+    /// Whether a row is in scope. `positions` gives each scope key's
+    /// column in `values`.
+    fn allows(&self, positions: &BTreeMap<&str, usize>, values: &[Option<String>]) -> bool {
         match self {
             Self::All => true,
-            Self::Only {
-                employer_groups,
-                employers,
-            } => {
-                employer_group.is_some_and(|g| employer_groups.contains(g))
-                    || employer.is_some_and(|e| employers.contains(e))
-            }
+            Self::Only(entries) => entries.iter().any(|conditions| {
+                !conditions.is_empty()
+                    && conditions.iter().all(|(key, value)| {
+                        positions
+                            .get(key.as_str())
+                            .and_then(|&i| values[i].as_deref())
+                            .is_some_and(|v| v == value)
+                    })
+            }),
         }
     }
 }
@@ -80,14 +106,16 @@ pub struct Table {
     conn: Mutex<Connection>,
     /// How many rows it holds.
     pub rows: usize,
-    /// Roughly how much memory it holds.
+    /// The memory SQLite holds for it, indexes included.
     pub bytes: usize,
+    options: BTreeMap<String, FilterOptions>,
 }
 
 impl Table {
-    /// The rows of `datasets` that `scope` allows. Every row, in or out of
-    /// scope, numbers `_record_id` in the order the uploads and their rows
-    /// come, so a row has the same key in every scope's table.
+    /// The rows of `datasets` that `scope` allows, indexed for every sort
+    /// and filter, with each filter's options computed once. Every row, in
+    /// or out of scope, numbers `_record_id` in the order the uploads and
+    /// their rows come, so a row has the same key in every scope's table.
     pub fn build(def: &Definition, datasets: &[&[u8]], scope: &Scope) -> Result<Self, TableError> {
         let position = |name: &str| {
             def.columns
@@ -95,7 +123,11 @@ impl Table {
                 .position(|c| c.name == name)
                 .ok_or_else(|| TableError::MissingHeader(name.to_string()))
         };
-        let (employer, employer_group) = (position(&def.employer)?, position(&def.employer_group)?);
+        let positions = def
+            .scope
+            .iter()
+            .map(|(key, column)| Ok((key.as_str(), position(column)?)))
+            .collect::<Result<BTreeMap<&str, usize>, TableError>>()?;
         let names: Vec<String> = def
             .columns
             .iter()
@@ -113,7 +145,7 @@ impl Table {
 
         let mut conn = Connection::open_in_memory()?;
         conn.execute_batch(&def.create_table_sql())?;
-        let (mut record_id, mut rows, mut bytes) = (0i64, 0usize, 0usize);
+        let (mut record_id, mut rows) = (0i64, 0usize);
         let tx = conn.transaction()?;
         {
             let mut statement = tx.prepare(&insert)?;
@@ -144,10 +176,7 @@ impl Table {
                             ColumnType::Date => raw.and_then(dates::to_sql),
                         });
                     }
-                    if !scope.allows(
-                        values[employer].as_deref(),
-                        values[employer_group].as_deref(),
-                    ) {
+                    if !scope.allows(&positions, &values) {
                         continue;
                     }
                     let params: Vec<&dyn ToSql> = std::iter::once(&record_id as &dyn ToSql)
@@ -155,24 +184,53 @@ impl Table {
                         .collect();
                     statement.execute(params.as_slice())?;
                     rows += 1;
-                    bytes += 64
-                        + values
-                            .iter()
-                            .map(|v| 16 + v.as_ref().map_or(0, String::len))
-                            .sum::<usize>();
                 }
             }
         }
         tx.commit()?;
+        conn.execute_batch(&def.create_index_sql())?;
+        let page_count: i64 = conn.pragma_query_value(None, "page_count", |row| row.get(0))?;
+        let page_size: i64 = conn.pragma_query_value(None, "page_size", |row| row.get(0))?;
         conn.pragma_update(None, "query_only", true)?;
+
+        let deadline = Instant::now() + DEADLINE;
+        conn.progress_handler(DEADLINE_STEPS, Some(move || Instant::now() >= deadline))?;
+        let options = filter_options(&conn, def)?;
+        conn.progress_handler(0, None::<fn() -> bool>)?;
         Ok(Self {
             conn: Mutex::new(conn),
             rows,
-            bytes,
+            bytes: usize::try_from(page_count.saturating_mul(page_size)).unwrap_or(usize::MAX),
+            options,
         })
+    }
+
+    /// Each filter's options but the searches', from this table's rows.
+    pub fn options(&self) -> &BTreeMap<String, FilterOptions> {
+        &self.options
     }
 
     pub(super) fn connection(&self) -> MutexGuard<'_, Connection> {
         self.conn.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+
+    /// The scope of these entries, each a list of conditions.
+    pub(crate) fn only(entries: &[&[(&str, &str)]]) -> Scope {
+        Scope::Only(
+            entries
+                .iter()
+                .map(|conditions| {
+                    conditions
+                        .iter()
+                        .map(|(key, value)| (key.to_string(), value.to_string()))
+                        .collect()
+                })
+                .collect(),
+        )
     }
 }

@@ -212,7 +212,6 @@ impl Analyses {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
     use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 
     use bytes::Bytes;
@@ -220,6 +219,7 @@ mod tests {
 
     use super::*;
     use crate::analysis::definition::tests::AWARDS_REPORT;
+    use crate::analysis::table::tests::only;
     use crate::data_validation::tests::AWARDS_HEADER;
     use crate::storage::pools::tests::pool;
     use crate::storage::pools::{Revocation, INITIAL};
@@ -279,7 +279,7 @@ mod tests {
         let mut csv = format!("{AWARDS_HEADER}\n");
         for (i, (employer, group)) in rows.iter().enumerate() {
             csv.push_str(&format!(
-                "{i:06},M{i},Mx,Sam,Doyle,01/01/1990,{employer},{group},Certificate,Pass,01/01/2026\n"
+                "{i:06},M{i},Mx,Sam,Example,01/01/1990,{employer},{group},Certificate,Pass,01/01/2026\n"
             ));
         }
         let upload_id = format!("u-{record_id}");
@@ -314,18 +314,22 @@ mod tests {
             .await
             .unwrap();
         let mut doc = pool("P1", "w1");
-        doc.initial = Some(upload(&storage, INITIAL, &[("AIB", "AIB"), ("PTSB", "PTSB")]).await);
+        doc.initial = Some(
+            upload(
+                &storage,
+                INITIAL,
+                &[("Bank A", "Group A"), ("Bank C", "Group C")],
+            )
+            .await,
+        );
         let analyses = Analyses::default();
         let definition = analyses.definition(&storage, &hash).await.unwrap();
-        let aib = Scope::Only {
-            employer_groups: BTreeSet::from(["AIB".to_string()]),
-            employers: BTreeSet::new(),
-        };
+        let group_a = only(&[&[("employer_group", "Group A")]]);
         let reads = || store.dataset_reads.load(SeqCst);
 
         // Ten concurrent first queries build one table from one read.
         let tables = futures_util::future::join_all(
-            (0..10).map(|_| analyses.table(&storage, &doc, &definition, &aib)),
+            (0..10).map(|_| analyses.table(&storage, &doc, &definition, &group_a)),
         )
         .await;
         let first = tables[0].as_ref().unwrap();
@@ -336,7 +340,7 @@ mod tests {
 
         // Warm, nothing is read; another scope reuses the dataset.
         let again = analyses
-            .table(&storage, &doc, &definition, &aib)
+            .table(&storage, &doc, &definition, &group_a)
             .await
             .unwrap();
         assert!(Arc::ptr_eq(&again, first));
@@ -350,7 +354,7 @@ mod tests {
         doc.grants
             .push(crate::storage::pools::tests::grant("g-1", "ana", 1));
         let granted = analyses
-            .table(&storage, &doc, &definition, &aib)
+            .table(&storage, &doc, &definition, &group_a)
             .await
             .unwrap();
         assert!(Arc::ptr_eq(&granted, first));
@@ -358,9 +362,9 @@ mod tests {
         // A new upload loads only its own dataset; a revocation drops its
         // rows and loads nothing.
         doc.issuances
-            .push(upload(&storage, "r-2", &[("EBS Network", "AIB")]).await);
+            .push(upload(&storage, "r-2", &[("Bank A Network", "Group A")]).await);
         let grown = analyses
-            .table(&storage, &doc, &definition, &aib)
+            .table(&storage, &doc, &definition, &group_a)
             .await
             .unwrap();
         assert_eq!((grown.rows, reads()), (2, 2));
@@ -371,7 +375,7 @@ mod tests {
             reason: None,
         });
         let shrunk = analyses
-            .table(&storage, &doc, &definition, &aib)
+            .table(&storage, &doc, &definition, &group_a)
             .await
             .unwrap();
         assert!(Arc::ptr_eq(&shrunk, first), "the same uploads as at first");
@@ -384,10 +388,10 @@ mod tests {
         let mut tampered = doc.clone();
         tampered
             .issuances
-            .push(upload(&storage, "r-3", &[("AIB", "AIB")]).await);
+            .push(upload(&storage, "r-3", &[("Bank A", "Group A")]).await);
         tampered.issuances[1].sha256 = "00".repeat(32);
         let refused = analyses
-            .table(&storage, &tampered, &definition, &aib)
+            .table(&storage, &tampered, &definition, &group_a)
             .await
             .err()
             .unwrap();

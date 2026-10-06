@@ -386,10 +386,10 @@ pub(crate) mod tests {
     async fn groups_are_listed_unless_the_token_has_an_overage_marker() {
         let mut spec = Spec::valid(&config());
         assert_eq!(check(&spec).await.unwrap().groups, Groups::Listed(vec![]));
-        spec.groups = vec!["group-aib".into(), "group-ebs".into()];
+        spec.groups = vec!["group-a".into(), "group-b".into()];
         assert_eq!(
             check(&spec).await.unwrap().groups,
-            Groups::Listed(vec!["group-aib".into(), "group-ebs".into()])
+            Groups::Listed(vec!["group-a".into(), "group-b".into()])
         );
 
         spec.groups_overage = true;
@@ -397,7 +397,7 @@ pub(crate) mod tests {
 
         // An implicit-flow marker counts too, even next to a groups claim.
         let mut claims = Spec::valid(&config()).claims();
-        claims["groups"] = serde_json::json!(["group-aib"]);
+        claims["groups"] = serde_json::json!(["group-a"]);
         claims["hasgroups"] = serde_json::json!(true);
         let token = entra_key().sign(serde_json::json!({}), &claims).unwrap();
         assert_eq!(

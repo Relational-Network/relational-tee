@@ -14,7 +14,8 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use super::{Storage, StoreError};
-use crate::analysis::table::Scope;
+use crate::analysis::definition::is_sql_name;
+use crate::analysis::table::{Conditions, Scope};
 use crate::store::{Created, Replaced};
 
 const PATH: &str = "config/employer-scopes.json";
@@ -22,23 +23,25 @@ const PATH: &str = "config/employer-scopes.json";
 /// The most entries a mapping holds.
 pub const MAX_SCOPES: usize = 1000;
 
-/// The longest group ID, label or employer name, in bytes.
+/// The most conditions one entry holds.
+pub const MAX_CONDITIONS: usize = 8;
+
+/// The longest group ID, label or value, in bytes.
 const MAX_TEXT: usize = 256;
 
 /// The rows one group's members may see.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
 pub struct EmployerScope {
     /// The group as the token's `groups` claim names it: its object ID.
     pub group_id: String,
-    /// The group's name, for people, such as `UAT_EDQ_CP_AIB`.
+    /// The group's name, for people, such as `GROUP_A_ANALYSTS`.
     pub label: String,
-    /// Rows whose employer group is exactly this. Set this or `employer`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub employer_group: Option<String>,
-    /// Rows whose employer is exactly this.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub employer: Option<String>,
+    /// Every other field is a condition: a scope key analyses declare, such
+    /// as `employer_group` or `employer`, and the value a row's column for
+    /// it must hold exactly. The entry grants the rows that meet them all.
+    #[serde(flatten)]
+    #[schema(inline)]
+    pub conditions: Conditions,
 }
 
 /// The whole mapping.
@@ -55,19 +58,16 @@ pub struct EmployerScopes {
 }
 
 impl EmployerScopes {
-    /// The rows members of `groups` may see: every scope mapped to any of
-    /// them. `None` if none of them is mapped.
+    /// The rows members of `groups` may see: those of every entry mapped to
+    /// any of them. `None` if none of them is mapped.
     pub fn rows_for(&self, groups: &[String]) -> Option<Scope> {
-        let mut employer_groups = BTreeSet::new();
-        let mut employers = BTreeSet::new();
-        for scope in self.scopes.iter().filter(|s| groups.contains(&s.group_id)) {
-            employer_groups.extend(scope.employer_group.clone());
-            employers.extend(scope.employer.clone());
-        }
-        (!employer_groups.is_empty() || !employers.is_empty()).then_some(Scope::Only {
-            employer_groups,
-            employers,
-        })
+        let entries: BTreeSet<Conditions> = self
+            .scopes
+            .iter()
+            .filter(|s| groups.contains(&s.group_id))
+            .map(|s| s.conditions.clone())
+            .collect();
+        (!entries.is_empty()).then_some(Scope::Only(entries))
     }
 }
 
@@ -94,16 +94,20 @@ pub fn check(scopes: &[EmployerScope]) -> Result<(), String> {
     for (i, scope) in scopes.iter().enumerate() {
         check_text(&format!("scopes[{i}].group_id"), &scope.group_id)?;
         check_text(&format!("scopes[{i}].label"), &scope.label)?;
-        match (&scope.employer_group, &scope.employer) {
-            (Some(group), None) => check_text(&format!("scopes[{i}].employer_group"), group)?,
-            (None, Some(employer)) => check_text(&format!("scopes[{i}].employer"), employer)?,
-            _ => {
-                return Err(format!(
-                    "scopes[{i}] needs exactly one of employer_group and employer"
-                ))
-            }
+        if scope.conditions.is_empty() || scope.conditions.len() > MAX_CONDITIONS {
+            return Err(format!(
+                "scopes[{i}] needs 1 to {MAX_CONDITIONS} conditions, such as \"employer_group\": \"Group A\""
+            ));
         }
-        if !seen.insert((&scope.group_id, &scope.employer_group, &scope.employer)) {
+        for (key, value) in &scope.conditions {
+            if !is_sql_name(key) {
+                return Err(format!(
+                    "scopes[{i}].{key:?} isn't a scope key: lowercase letters, digits and underscores"
+                ));
+            }
+            check_text(&format!("scopes[{i}].{key}"), value)?;
+        }
+        if !seen.insert((&scope.group_id, &scope.conditions)) {
             return Err(format!("scopes[{i}] repeats an earlier entry"));
         }
     }
@@ -177,36 +181,42 @@ impl<'a> Scopes<'a> {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use serde_json::json;
+
     use super::*;
+    use crate::analysis::table::tests::only;
     use crate::storage::tests::two_workers;
 
-    pub(crate) const AIB_GROUP: &str = "3f0c5a6e-0000-4000-8000-00000000a1b0";
-    pub(crate) const EBS_GROUP: &str = "3f0c5a6e-0000-4000-8000-00000000eb50";
+    pub(crate) const GROUP_A_ANALYSTS: &str = "3f0c5a6e-0000-4000-8000-00000000000a";
+    pub(crate) const NETWORK_ANALYSTS: &str = "3f0c5a6e-0000-4000-8000-00000000000b";
 
-    /// The test fixture: `UAT_EDQ_CP_AIB` sees employer group AIB, and
-    /// `UAT_EDQ_EBS_NETWORK` sees employer EBS Network.
-    pub(crate) fn fixture() -> Vec<EmployerScope> {
-        vec![
-            EmployerScope {
-                group_id: AIB_GROUP.into(),
-                label: "UAT_EDQ_CP_AIB".into(),
-                employer_group: Some("AIB".into()),
-                employer: None,
-            },
-            EmployerScope {
-                group_id: EBS_GROUP.into(),
-                label: "UAT_EDQ_EBS_NETWORK".into(),
-                employer_group: None,
-                employer: Some("EBS Network".into()),
-            },
-        ]
+    /// An entry for `group_id` with these conditions.
+    pub(crate) fn entry(group_id: &str, label: &str, conditions: &[(&str, &str)]) -> EmployerScope {
+        EmployerScope {
+            group_id: group_id.into(),
+            label: label.into(),
+            conditions: conditions
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
+        }
     }
 
-    fn only(groups: &[&str], employers: &[&str]) -> Option<Scope> {
-        Some(Scope::Only {
-            employer_groups: groups.iter().map(|g| g.to_string()).collect(),
-            employers: employers.iter().map(|e| e.to_string()).collect(),
-        })
+    /// The test fixture: `GROUP_A_ANALYSTS` see employer group Group A, and
+    /// `NETWORK_ANALYSTS` see employer Bank A Network.
+    pub(crate) fn fixture() -> Vec<EmployerScope> {
+        vec![
+            entry(
+                GROUP_A_ANALYSTS,
+                "GROUP_A_ANALYSTS",
+                &[("employer_group", "Group A")],
+            ),
+            entry(
+                NETWORK_ANALYSTS,
+                "NETWORK_ANALYSTS",
+                &[("employer", "Bank A Network")],
+            ),
+        ]
     }
 
     #[test]
@@ -216,25 +226,45 @@ pub(crate) mod tests {
             ..Default::default()
         };
         let groups = |list: &[&str]| list.iter().map(|g| g.to_string()).collect::<Vec<_>>();
-        assert_eq!(mapping.rows_for(&groups(&[AIB_GROUP])), only(&["AIB"], &[]));
         assert_eq!(
-            mapping.rows_for(&groups(&["unmapped", EBS_GROUP])),
-            only(&[], &["EBS Network"])
+            mapping.rows_for(&groups(&[GROUP_A_ANALYSTS])),
+            Some(only(&[&[("employer_group", "Group A")]]))
         );
         assert_eq!(
-            mapping.rows_for(&groups(&[EBS_GROUP, AIB_GROUP])),
-            only(&["AIB"], &["EBS Network"])
+            mapping.rows_for(&groups(&["unmapped", NETWORK_ANALYSTS])),
+            Some(only(&[&[("employer", "Bank A Network")]]))
+        );
+        assert_eq!(
+            mapping.rows_for(&groups(&[NETWORK_ANALYSTS, GROUP_A_ANALYSTS])),
+            Some(only(&[
+                &[("employer_group", "Group A")],
+                &[("employer", "Bank A Network")]
+            ]))
         );
         assert_eq!(mapping.rows_for(&groups(&["unmapped"])), None);
         assert_eq!(mapping.rows_for(&[]), None);
         assert_eq!(
-            EmployerScopes::default().rows_for(&groups(&[AIB_GROUP])),
+            EmployerScopes::default().rows_for(&groups(&[GROUP_A_ANALYSTS])),
             None
         );
     }
 
     #[test]
-    fn a_mapping_names_one_target_per_entry_exactly() {
+    fn an_entry_keeps_its_conditions_beside_its_group() {
+        let stored = json!({
+            "group_id": GROUP_A_ANALYSTS,
+            "label": "GROUP_A_ANALYSTS",
+            "employer_group": "Group A",
+        });
+        let read: EmployerScope = serde_json::from_value(stored.clone()).unwrap();
+        assert_eq!(read, fixture()[0]);
+        assert_eq!(serde_json::to_value(&read).unwrap(), stored);
+        let not_text = json!({ "group_id": "g", "label": "G", "employer": 1 });
+        assert!(serde_json::from_value::<EmployerScope>(not_text).is_err());
+    }
+
+    #[test]
+    fn an_entry_names_its_conditions_exactly() {
         assert_eq!(check(&fixture()), Ok(()));
         assert_eq!(check(&[]), Ok(()));
         let spoiled = |spoil: fn(&mut EmployerScope)| {
@@ -242,24 +272,47 @@ pub(crate) mod tests {
             spoil(&mut scopes[1]);
             check(&scopes)
         };
-        assert!(spoiled(|s| s.employer_group = Some("AIB".into())).is_err());
-        assert!(spoiled(|s| s.employer = None).is_err());
-        assert!(spoiled(|s| s.employer = Some(" EBS Network".into())).is_err());
-        assert!(spoiled(|s| s.employer = Some(String::new())).is_err());
+        assert!(spoiled(|s| s.conditions.clear()).is_err());
+        assert!(spoiled(|s| {
+            s.conditions
+                .insert("Employer Group".into(), "Group A".into());
+        })
+        .is_err());
+        assert!(spoiled(|s| {
+            s.conditions
+                .insert("employer".into(), " Bank A Network".into());
+        })
+        .is_err());
+        assert!(spoiled(|s| {
+            s.conditions.insert("employer".into(), String::new());
+        })
+        .is_err());
+        assert!(spoiled(|s| {
+            s.conditions = (0..=MAX_CONDITIONS)
+                .map(|i| (format!("key_{i}"), "v".into()))
+                .collect();
+        })
+        .is_err());
         assert!(spoiled(|s| s.group_id = "a\nb".into()).is_err());
         assert!(spoiled(|s| s.label = "x".repeat(MAX_TEXT + 1)).is_err());
         let mut repeated = fixture();
         repeated.push(repeated[0].clone());
         assert!(check(&repeated).is_err());
 
-        // A group may see more than one employer.
-        let mut both = fixture();
-        both.push(EmployerScope {
-            employer_group: None,
-            employer: Some("EBS Network".into()),
-            ..both[0].clone()
-        });
-        assert_eq!(check(&both), Ok(()));
+        // A group may see several slices, and a slice may need several
+        // conditions at once.
+        let mut more = fixture();
+        more.push(entry(
+            GROUP_A_ANALYSTS,
+            "GROUP_A_ANALYSTS",
+            &[("employer", "Bank A Network")],
+        ));
+        more.push(entry(
+            GROUP_A_ANALYSTS,
+            "GROUP_A_ANALYSTS",
+            &[("employer_group", "Group C"), ("region", "Region D")],
+        ));
+        assert_eq!(check(&more), Ok(()));
     }
 
     #[tokio::test]
@@ -289,31 +342,31 @@ pub(crate) mod tests {
         assert_eq!(again, Some(first.clone()));
 
         // An edit from the stale version 0 is refused; one from 1 lands.
-        let aib_only = fixture()[..1].to_vec();
+        let group_a_only = fixture()[..1].to_vec();
         assert_eq!(
             b.employer_scopes()
-                .replace(0, aib_only.clone(), "admin-2")
+                .replace(0, group_a_only.clone(), "admin-2")
                 .await
                 .unwrap(),
             None
         );
         let second = b
             .employer_scopes()
-            .replace(1, aib_only.clone(), "admin-2")
+            .replace(1, group_a_only.clone(), "admin-2")
             .await
             .unwrap()
             .unwrap();
-        assert_eq!((second.version, second.scopes), (2, aib_only));
+        assert_eq!((second.version, second.scopes), (2, group_a_only));
     }
 
     #[tokio::test]
     async fn of_two_concurrent_edits_from_one_version_one_lands() {
         let (a, b, _files) = two_workers();
-        let aib_only = fixture()[..1].to_vec();
+        let group_a_only = fixture()[..1].to_vec();
         let (scopes_a, scopes_b) = (a.employer_scopes(), b.employer_scopes());
         let (x, y) = tokio::join!(
             scopes_a.replace(0, fixture(), "admin-1"),
-            scopes_b.replace(0, aib_only, "admin-2"),
+            scopes_b.replace(0, group_a_only, "admin-2"),
         );
         let landed: Vec<_> = [x.unwrap(), y.unwrap()].into_iter().flatten().collect();
         assert_eq!(landed.len(), 1, "{landed:?}");

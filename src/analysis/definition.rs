@@ -52,7 +52,7 @@ pub enum Direction {
 }
 
 impl Direction {
-    fn sql(self) -> &'static str {
+    pub(crate) fn sql(self) -> &'static str {
         match self {
             Self::Asc => "ASC",
             Self::Desc => "DESC",
@@ -98,9 +98,9 @@ pub struct Definition {
     pub relation: String,
     /// The output columns in output order, then any others by name.
     pub columns: Vec<Column>,
-    /// The columns the caller's employer scope applies to.
-    pub employer: String,
-    pub employer_group: String,
+    /// Each scope key a mapping entry may name, such as `employer_group`,
+    /// and the text column it restricts.
+    pub scope: BTreeMap<String, String>,
     pub filters: Vec<Filter>,
     pub output: Vec<String>,
     pub default_sort: (String, Direction),
@@ -119,7 +119,7 @@ struct Raw {
     display_name: String,
     relation: String,
     columns: BTreeMap<String, RawColumn>,
-    scope: RawScope,
+    scope: BTreeMap<String, String>,
     #[serde(default)]
     filters: BTreeMap<String, FilterKind>,
     output: RawOutput,
@@ -132,13 +132,6 @@ struct RawColumn {
     header: String,
     #[serde(rename = "type")]
     kind: ColumnType,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawScope {
-    employer: String,
-    employer_group: String,
 }
 
 #[derive(Deserialize)]
@@ -173,12 +166,21 @@ struct RawSql {
 
 /// A name SQL can use unquoted: lowercase letters, digits and underscores,
 /// starting with a letter.
-fn is_sql_name(name: &str) -> bool {
+pub(crate) fn is_sql_name(name: &str) -> bool {
     (1..=63).contains(&name.len())
         && name.starts_with(|c: char| c.is_ascii_lowercase())
         && name
             .chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// The parameters filter `name` binds: a date range its two ends, a select
+/// its values.
+fn filter_params(name: &str, kind: FilterKind) -> Vec<String> {
+    match kind {
+        FilterKind::DateRange => vec![format!(":{name}_from"), format!(":{name}_to")],
+        FilterKind::MultiSelect | FilterKind::SearchSelect => vec![format!(":{name}")],
+    }
 }
 
 fn is_analysis_id(id: &str) -> bool {
@@ -242,23 +244,30 @@ impl Definition {
         }
         let kind_of = |name: &str| raw.columns.get(name).map(|c| c.kind);
 
-        for (role, name) in [
-            ("employer", &raw.scope.employer),
-            ("employer_group", &raw.scope.employer_group),
-        ] {
-            if kind_of(name) != Some(ColumnType::Text) {
-                return refuse(format!("scope.{role} must name a text column"));
-            }
+        if raw.scope.is_empty() {
+            return refuse("scope must name at least one column");
         }
-        if raw.scope.employer == raw.scope.employer_group {
-            return refuse("scope.employer and scope.employer_group must differ");
+        let mut scoped = BTreeSet::new();
+        for (key, column) in &raw.scope {
+            // A mapping entry's own fields can't double as scope keys.
+            if !is_sql_name(key) || key == "group_id" || key == "label" {
+                return refuse(format!(
+                    "scope key {key:?} must be a lowercase SQL name other than group_id and label"
+                ));
+            }
+            if kind_of(column) != Some(ColumnType::Text) {
+                return refuse(format!("scope.{key} must name a text column"));
+            }
+            if !scoped.insert(column.as_str()) {
+                return refuse(format!("two scope keys name the column {column}"));
+            }
         }
 
         for (name, kind) in &raw.filters {
             let Some(column) = kind_of(name) else {
                 return refuse(format!("filter {name} names no column"));
             };
-            if *name == raw.scope.employer || *name == raw.scope.employer_group {
+            if scoped.contains(name.as_str()) {
                 return refuse(format!("filter {name} is a scope column"));
             }
             let expected = match kind {
@@ -267,6 +276,15 @@ impl Definition {
             };
             if column != expected {
                 return refuse(format!("filter {name} doesn't fit its column's type"));
+            }
+        }
+        // Searches bind the other filters' values beside their own.
+        let mut params = BTreeSet::new();
+        for (name, kind) in &raw.filters {
+            for param in filter_params(name, *kind) {
+                if SEARCH_PARAMS.contains(&param.as_str()) || !params.insert(param.clone()) {
+                    return refuse(format!("filter {name}'s parameter {param} is taken"));
+                }
             }
         }
         let filter_names: BTreeSet<&String> = raw.filters.keys().collect();
@@ -318,8 +336,7 @@ impl Definition {
             display_name: display_name.to_string(),
             relation: raw.relation,
             columns,
-            employer: raw.scope.employer,
-            employer_group: raw.scope.employer_group,
+            scope: raw.scope,
             filters: raw
                 .filters
                 .into_iter()
@@ -382,12 +399,7 @@ impl Definition {
     fn row_params(&self) -> BTreeSet<String> {
         self.filters
             .iter()
-            .flat_map(|f| match f.kind {
-                FilterKind::DateRange => {
-                    vec![format!(":{}_from", f.name), format!(":{}_to", f.name)]
-                }
-                FilterKind::MultiSelect | FilterKind::SearchSelect => vec![format!(":{}", f.name)],
-            })
+            .flat_map(|f| filter_params(&f.name, f.kind))
             .collect()
     }
 
@@ -403,6 +415,49 @@ impl Definition {
             self.relation,
             columns.join(", ")
         )
+    }
+
+    /// The indexes a table gets once its rows are in. Every output and
+    /// filter column is indexed in the order pages sort it (text
+    /// case-insensitively), then `_record_id`, which also serves date
+    /// ranges. A select filter compares values exactly, so its column also
+    /// gets a binary index, which serves its lookups and a search's ordered
+    /// prefix scan. The names start with `_`, which no relation can.
+    pub(crate) fn create_index_sql(&self) -> String {
+        let mut statements = Vec::new();
+        let mut sorted = BTreeSet::new();
+        for name in self
+            .output
+            .iter()
+            .chain(self.filters.iter().map(|f| &f.name))
+        {
+            if !sorted.insert(name) {
+                continue;
+            }
+            let Some(column) = self.column(name) else {
+                continue;
+            };
+            let collate = match column.kind {
+                ColumnType::Text => " COLLATE NOCASE",
+                ColumnType::Date => "",
+            };
+            statements.push(format!(
+                "CREATE INDEX \"_by_{name}\" ON \"{}\" (\"{name}\"{collate}, {RECORD_ID});",
+                self.relation
+            ));
+        }
+        for filter in &self.filters {
+            if matches!(
+                filter.kind,
+                FilterKind::MultiSelect | FilterKind::SearchSelect
+            ) {
+                statements.push(format!(
+                    "CREATE INDEX \"_exact_{0}\" ON \"{1}\" (\"{0}\", {RECORD_ID});",
+                    filter.name, self.relation
+                ));
+            }
+        }
+        statements.join("\n")
     }
 
     /// One page of the `rows` query: sorted by `sort` (case-insensitively for
@@ -437,6 +492,8 @@ impl Definition {
             .map_err(|e| DefinitionError(format!("SQLite unavailable: {e}")))?;
         conn.execute_batch(&self.create_table_sql())
             .map_err(|e| DefinitionError(format!("the columns don't make a table: {e}")))?;
+        conn.execute_batch(&self.create_index_sql())
+            .map_err(|e| DefinitionError(format!("the columns don't index: {e}")))?;
 
         let row_params = self.row_params();
         let rows = check_statement(&conn, "sql.rows", &self.rows_sql, |p| {
@@ -458,6 +515,14 @@ impl Definition {
         for filter in &self.filters {
             let label = format!("sql.options.{}", filter.name);
             let sql = &self.options_sql[&filter.name];
+            let first_word: String = sql.chars().take_while(char::is_ascii_alphabetic).collect();
+            if first_word.eq_ignore_ascii_case("with") {
+                return refuse(format!(
+                    "{label} may not start with WITH: the worker runs it under its own, \
+                     which narrows {} to the rows the other filters match",
+                    self.relation
+                ));
+            }
             let (allowed, returns): (&[&str], &[&str]) = match filter.kind {
                 FilterKind::DateRange => (&[], &["min", "max"]),
                 FilterKind::MultiSelect => (&[], &["value", "count"]),
@@ -600,6 +665,73 @@ pub(crate) mod tests {
             "{}",
             refused(&toml)
         );
+    }
+
+    #[test]
+    fn scope_keys_name_distinct_text_columns() {
+        const GROUP: &str = "employer_group = \"employer_group\"";
+        let toml = AWARDS_REPORT.replace(GROUP, &format!("{GROUP}\nregion = \"surname\""));
+        let def = Definition::parse(toml.as_bytes()).unwrap();
+        assert_eq!(def.scope["region"], "surname");
+        assert_eq!(awards_report().scope.len(), 2);
+
+        for (line, says) in [
+            ("employer_group = \"date_of_birth\"", "text column"),
+            ("employer_group = \"employer\"", "two scope keys"),
+            ("employer_group = \"nope\"", "text column"),
+            ("label = \"employer_group\"", "group_id and label"),
+            ("Region = \"surname\"", "lowercase SQL name"),
+        ] {
+            let toml = AWARDS_REPORT.replace(GROUP, line);
+            assert!(refused(&toml).contains(says), "{line}: {}", refused(&toml));
+        }
+        let none = AWARDS_REPORT
+            .replace("employer       = \"employer\"\n", "")
+            .replace(&format!("{GROUP}\n"), "");
+        assert!(
+            refused(&none).contains("at least one"),
+            "{}",
+            refused(&none)
+        );
+    }
+
+    #[test]
+    fn filters_bind_parameters_of_their_own() {
+        const LAST_COLUMN: &str =
+            "exam_board_date   = { header = \"Exam Board Date\",   type = \"date\" }";
+        const LAST_FILTER: &str = "membership_number = \"search_select\"";
+        for (column, kind, says) in [
+            ("search", "search_select", ":search"),
+            (
+                "exam_board_date_from",
+                "multi_select",
+                ":exam_board_date_from",
+            ),
+        ] {
+            let toml = AWARDS_REPORT
+                .replace(
+                    LAST_COLUMN,
+                    &format!("{LAST_COLUMN}\n{column} = {{ header = \"X\", type = \"text\" }}"),
+                )
+                .replace(
+                    LAST_FILTER,
+                    &format!("{LAST_FILTER}\n{column} = \"{kind}\""),
+                );
+            assert!(
+                refused(&toml).contains(says),
+                "{column}: {}",
+                refused(&toml)
+            );
+        }
+    }
+
+    #[test]
+    fn option_queries_leave_with_to_the_worker() {
+        let toml = AWARDS_REPORT.replace(
+            "SELECT award AS value, count(*) AS count\nFROM awards",
+            "WITH a AS (SELECT * FROM awards) SELECT award AS value, count(*) AS count\nFROM a",
+        );
+        assert!(refused(&toml).contains("WITH"), "{}", refused(&toml));
     }
 
     #[test]

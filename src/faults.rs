@@ -60,7 +60,7 @@ fn awards_csv(staff: &str) -> String {
     format!(
         "Staff Number,Membership Number,Title,First Name,Surname,Date of Birth,Employer,\
          Employer Group,Award,Award Grade,Exam Board Date\n\
-         {staff},0100045,Mx,Sam,Example,01/01/1990,AIB,AIB,Certificate,Pass,01/06/2026\n"
+         {staff},0100045,Mx,Sam,Example,01/01/1990,Bank A,Group A,Certificate,Pass,01/06/2026\n"
     )
 }
 

@@ -189,8 +189,8 @@ pub(crate) mod tests {
         validate_csv_bytes(rows.join("\n").as_bytes(), &awards_schema())
     }
 
-    const ROW: &str = "000123,0100045,Ms,Aoife,Brennan,14/03/1988,AIB,AIB,\
-        Professional Certificate in Financial Services,Merit,01/01/2026";
+    const ROW: &str = "000123,0100045,Ms,Alex,Alpha,14/03/1988,Bank A,Group A,\
+        Professional Certificate in Subject A,Merit,01/01/2026";
 
     #[test]
     fn an_upload_with_the_schemas_headers_passes() {

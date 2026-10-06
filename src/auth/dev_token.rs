@@ -138,11 +138,11 @@ mod tests {
 
         let spec = spec_from_args(
             &config(),
-            &args(&["--roles", "Analyst", "--groups", "g-aib, g-ebs,"]),
+            &args(&["--roles", "Analyst", "--groups", "g-a, g-b,"]),
         )
         .unwrap();
         assert_eq!(spec.roles, ["Analyst"]);
-        assert_eq!(spec.groups, ["g-aib", "g-ebs"]);
+        assert_eq!(spec.groups, ["g-a", "g-b"]);
 
         let spec = spec_from_args(&config(), &args(&["--bad", "audience"])).unwrap();
         assert_eq!(spec.aud, "api://aa827d93-d487-40bf-8956-b6872ed55290");

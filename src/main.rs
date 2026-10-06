@@ -151,7 +151,9 @@ An analysis shows admins every row. An analyst sees only the rows `/v1/admin/emp
         // Analyses
         api::analyses::get_analysis,
         api::analyses::get_options,
+        api::analyses::filtered_options,
         api::analyses::search_values,
+        api::analyses::filtered_search,
         api::analyses::run_query,
     ),
     components(schemas(
@@ -237,7 +239,10 @@ An analysis shows admins every row. An analyst sees only the rows `/v1/admin/emp
         api::analyses::FilterSummary,
         api::analyses::PageSize,
         api::analyses::ScopeSummary,
+        api::analyses::ScopeCondition,
         api::analyses::OptionsResponse,
+        api::analyses::OptionsRequest,
+        api::analyses::SearchRequest,
         api::analyses::SearchResponse,
         analysis::query::QueryRequest,
         analysis::query::FilterRequest,
@@ -958,8 +963,8 @@ mod tests {
         assert_eq!(empty, json!({ "version": 0, "scopes": [] }));
 
         let scopes = json!([
-            { "group_id": "g-aib", "label": "UAT_EDQ_CP_AIB", "employer_group": "AIB" },
-            { "group_id": "g-ebs", "label": "UAT_EDQ_EBS_NETWORK", "employer": "EBS Network" },
+            { "group_id": "g-a", "label": "GROUP_A_ANALYSTS", "employer_group": "Group A" },
+            { "group_id": "g-network", "label": "NETWORK_ANALYSTS", "employer": "Bank A Network" },
         ]);
         let key = new_key();
         let (status, first) = put(key.clone(), json!({ "version": 0, "scopes": scopes })).await;
@@ -978,18 +983,20 @@ mod tests {
             (StatusCode::OK, first)
         );
 
-        // A stale edit, an entry with two targets and an unknown field are
-        // refused.
+        // A stale edit, an entry with no condition or one that names no
+        // scope key, and an unknown field are refused.
         let (status, body) = put(new_key(), json!({ "version": 0, "scopes": [] })).await;
         assert_eq!(
             (status, body["code"].as_str()),
             (StatusCode::CONFLICT, Some("version_conflict"))
         );
-        let both = json!([{
-            "group_id": "g", "label": "G", "employer_group": "AIB", "employer": "EBS Network"
-        }]);
-        let (status, _) = put(new_key(), json!({ "version": 1, "scopes": both })).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
+        for bad in [
+            json!([{ "group_id": "g", "label": "G" }]),
+            json!([{ "group_id": "g", "label": "G", "Employer Group": "Group A" }]),
+        ] {
+            let (status, _) = put(new_key(), json!({ "version": 1, "scopes": bad })).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+        }
         let (status, _) = put(
             new_key(),
             json!({ "version": 1, "scopes": [], "everyone": true }),
@@ -997,11 +1004,22 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
 
-        let (status, cleared) = put(new_key(), json!({ "version": 1, "scopes": [] })).await;
+        // An entry's conditions apply together.
+        let both = json!([{
+            "group_id": "g", "label": "G", "employer_group": "Group A", "employer": "Bank A Network"
+        }]);
+        let (status, together) = put(new_key(), json!({ "version": 1, "scopes": both })).await;
+        assert_eq!(status, StatusCode::OK, "{together}");
+        assert_eq!(
+            (&together["version"], &together["scopes"]),
+            (&json!(2), &both)
+        );
+
+        let (status, cleared) = put(new_key(), json!({ "version": 2, "scopes": [] })).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
             (&cleared["version"], &cleared["scopes"]),
-            (&json!(2), &json!([]))
+            (&json!(3), &json!([]))
         );
     }
 

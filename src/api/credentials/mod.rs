@@ -699,29 +699,29 @@ pub(crate) mod tests {
         assert_eq!(seen, ["P0", "P1", "P2", "P3", "P4"]);
     }
 
-    /// `rows` synthetic rows of the Awards Report's columns, at the lengths
-    /// IOB's export has.
+    /// `rows` synthetic rows of the Awards Report's columns, with made-up
+    /// values at the lengths a real export has.
     fn awards_scale_csv(rows: usize) -> String {
         const TITLES: [&str; 5] = ["Mr", "Ms", "Mrs", "Dr", "Mx"];
-        const FIRST: [&str; 6] = ["Aoife", "Cian", "Niamh", "Darragh", "Sinead", "Eoin"];
+        const FIRST: [&str; 6] = ["Alexis", "Sam", "Jordan", "Casey", "Riley", "Morgan"];
         const SURNAMES: [&str; 6] = [
-            "Brennan",
-            "Doyle",
-            "Fitzgerald",
-            "Gallagher",
-            "O'Sullivan",
-            "Walsh",
+            "Alphason",
+            "Bravo",
+            "Charleston",
+            "Deltawood",
+            "Echolands",
+            "Foxtrot",
         ];
         const EMPLOYERS: [(&str, &str); 4] = [
-            ("AIB", "AIB"),
-            ("EBS Network", "AIB"),
-            ("Bank of Ireland", "Bank of Ireland"),
-            ("PTSB", "PTSB"),
+            ("Bank A", "Group A"),
+            ("Bank A Network", "Group A"),
+            ("Bank B", "Group B"),
+            ("Bank C", "Group C"),
         ];
         const AWARDS: [&str; 3] = [
-            "Professional Certificate in Financial Services",
-            "Professional Diploma in Compliance",
-            "Certificate in Digital Banking",
+            "Professional Certificate in Subject Area A",
+            "Professional Diploma in Subject B",
+            "Certificate in Subject Area C",
         ];
         const GRADES: [&str; 4] = ["Pass", "Merit", "Distinction", "Pass with Distinction"];
         let mut csv = format!("{}\n", crate::data_validation::tests::AWARDS_HEADER);
@@ -849,7 +849,7 @@ pub(crate) mod tests {
         let path = format!("/v1/drt/pools/{pool_pda}/analyses/awards-report-v1/query");
         let filtered = json!({
             "filters": {
-                "award": { "mode": "selected", "values": ["Certificate in Digital Banking"] },
+                "award": { "mode": "selected", "values": ["Certificate in Subject Area C"] },
                 "exam_board_date": { "from": "01/03/2026", "to": "30/06/2026" },
             },
             "sort": { "field": "surname", "direction": "asc" },
@@ -879,6 +879,17 @@ pub(crate) mod tests {
             "analysis over {} rows: {}",
             2 * ROWS,
             query_timings.join(", ")
+        );
+        let table = crate::analysis::table::Table::build(
+            &crate::analysis::definition::tests::awards_report(),
+            &[csv.as_bytes(), csv.as_bytes()],
+            &crate::analysis::table::Scope::All,
+        )
+        .unwrap();
+        eprintln!(
+            "the admin's table: {:.1} MiB for {} rows, indexes included",
+            mib(table.bytes),
+            table.rows
         );
     }
 }

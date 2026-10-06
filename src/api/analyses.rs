@@ -6,7 +6,9 @@
 //!
 //! - `GET  …/analyses/{analysis_id}`                  — the analysis, and the caller's rows
 //! - `GET  …/analyses/{analysis_id}/options`          — filter options from the caller's rows
+//! - `POST …/analyses/{analysis_id}/options`          — the same, under the other filters
 //! - `GET  …/analyses/{analysis_id}/options/{filter}` — a search filter's values
+//! - `POST …/analyses/{analysis_id}/options/{filter}` — the same, under the other filters
 //! - `POST …/analyses/{analysis_id}/query`            — a page of matching rows
 //!
 //! under `/v1/drt/pools/{pool_pda}`. The SQL is the pool's definition, read
@@ -23,6 +25,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap};
 use axum::Json;
 use chrono::Utc;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tracing::{error, warn};
@@ -30,7 +33,8 @@ use utoipa::{IntoParams, ToSchema};
 
 use crate::analysis::definition::{ColumnType, Definition, FilterKind};
 use crate::analysis::query::{
-    self, FilterOptions, Page, QueryError, QueryRequest, SortRequest, DEFAULT_SEARCH_LIMIT,
+    self, FilterOptions, FilterRequest, Page, QueryError, QueryRequest, SortRequest,
+    DEFAULT_SEARCH_LIMIT,
 };
 use crate::analysis::runner::DEADLINE;
 use crate::analysis::table::Scope;
@@ -74,13 +78,21 @@ pub struct PageSize {
     pub max: u32,
 }
 
-/// The rows the caller sees: every row, or those of these employer groups
-/// and employers.
+/// The rows the caller sees: every row, or those matching any entry of
+/// `any_of`, each a list of conditions a row must meet together.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ScopeSummary {
     pub all: bool,
-    pub employer_groups: Vec<String>,
-    pub employers: Vec<String>,
+    pub any_of: Vec<Vec<ScopeCondition>>,
+}
+
+/// A row's column for scope key `key` holds `value` exactly.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ScopeCondition {
+    pub key: String,
+    /// The CSV header of the column the key restricts.
+    pub header: String,
+    pub value: String,
 }
 
 /// A pool's analysis, as the caller may run it.
@@ -109,6 +121,16 @@ pub struct OptionsResponse {
     pub options: BTreeMap<String, FilterOptions>,
 }
 
+/// Filter options under the filters a request sets.
+#[derive(Debug, Default, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OptionsRequest {
+    /// As a query names them. Each filter's options come from the rows the
+    /// other filters match, so its other values stay on offer.
+    #[serde(default)]
+    pub filters: BTreeMap<String, FilterRequest>,
+}
+
 /// Query for a search filter's values.
 #[derive(Debug, Deserialize, IntoParams)]
 #[serde(deny_unknown_fields)]
@@ -118,6 +140,20 @@ pub struct SearchQuery {
     pub search: String,
     /// How many values (default 20, max 100).
     pub limit: Option<u32>,
+}
+
+/// A search filter's values under the filters a request sets.
+#[derive(Debug, Default, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SearchRequest {
+    /// The values' prefix, matched literally; empty for the first values.
+    #[serde(default)]
+    pub search: String,
+    /// How many values (default 20, max 100).
+    pub limit: Option<u32>,
+    /// As a query names them. The search filter's own is left out.
+    #[serde(default)]
+    pub filters: BTreeMap<String, FilterRequest>,
 }
 
 /// A search filter's values that start with the search, in order.
@@ -146,13 +182,14 @@ async fn load(
 }
 
 /// The grant the caller runs the analysis through (none for an admin), and
-/// the rows they see. Fails closed: no active grant, or no employer scope,
-/// is 403.
+/// the rows they see, as `def` can apply them. Fails closed: no active
+/// grant, or no scope this analysis applies, is 403.
 async fn authorize(
     state: &AppState,
     caller: &Caller,
     doc: &PoolDoc,
     analysis: &AnalysisRef,
+    def: &Definition,
 ) -> Result<(Option<String>, Scope), ApiError> {
     if caller.is_admin() {
         return Ok((None, Scope::All));
@@ -163,7 +200,50 @@ async fn authorize(
             ApiError::forbidden("you have no active grant to this analysis").with_code("no_grant")
         })?;
     let mapping = state.storage.employer_scopes().get().await?;
-    Ok((Some(grant.grant_id.clone()), caller.row_scope(&mapping)?))
+    let scope = caller
+        .row_scope(&mapping)?
+        .for_definition(def)
+        .ok_or_else(|| {
+            ApiError::forbidden(
+                "none of your groups has a scope this analysis applies; ask an admin",
+            )
+            .with_code("no_employer_scope")
+        })?;
+    Ok((Some(grant.grant_id.clone()), scope))
+}
+
+/// 415 unless the request's body is JSON.
+fn require_json(headers: &HeaderMap) -> Result<(), ApiError> {
+    let is_json = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.starts_with("application/json"));
+    if is_json {
+        Ok(())
+    } else {
+        Err(ApiError::unsupported_media_type(
+            "the request is JSON: send Content-Type: application/json",
+        ))
+    }
+}
+
+/// The request in `body`, or `400 invalid_query`.
+fn parse<T: DeserializeOwned>(body: &[u8]) -> Result<T, ApiError> {
+    serde_json::from_slice(body).map_err(|e| {
+        ApiError::bad_request(format!("the request isn't valid: {e}")).with_code("invalid_query")
+    })
+}
+
+/// `filters`, checked as a query's are, with no sort or paging.
+fn filters_only(
+    def: &Definition,
+    filters: BTreeMap<String, FilterRequest>,
+) -> Result<query::Query, ApiError> {
+    let request = QueryRequest {
+        filters,
+        ..Default::default()
+    };
+    query::Query::check(def, &request).map_err(query_error)
 }
 
 fn query_error(e: QueryError) -> ApiError {
@@ -248,20 +328,31 @@ impl Logged {
     }
 }
 
-fn scope_summary(scope: &Scope) -> ScopeSummary {
+fn scope_summary(scope: &Scope, def: &Definition) -> ScopeSummary {
     match scope {
         Scope::All => ScopeSummary {
             all: true,
-            employer_groups: Vec::new(),
-            employers: Vec::new(),
+            any_of: Vec::new(),
         },
-        Scope::Only {
-            employer_groups,
-            employers,
-        } => ScopeSummary {
+        Scope::Only(entries) => ScopeSummary {
             all: false,
-            employer_groups: employer_groups.iter().cloned().collect(),
-            employers: employers.iter().cloned().collect(),
+            any_of: entries
+                .iter()
+                .map(|conditions| {
+                    conditions
+                        .iter()
+                        .map(|(key, value)| ScopeCondition {
+                            key: key.clone(),
+                            header: def
+                                .scope
+                                .get(key)
+                                .and_then(|column| def.column(column))
+                                .map_or_else(|| key.clone(), |c| c.header.clone()),
+                            value: value.clone(),
+                        })
+                        .collect()
+                })
+                .collect(),
         },
     }
 }
@@ -305,7 +396,7 @@ fn summary(
             default: def.page_default,
             max: def.page_max,
         },
-        scope: scope_summary(scope),
+        scope: scope_summary(scope, def),
     }
 }
 
@@ -340,11 +431,11 @@ pub async fn get_analysis(
 ) -> Result<Json<AnalysisSummary>, ApiError> {
     caller.require(Permission::AnalysesRun)?;
     let (doc, analysis) = load(&state, &pool_pda, &analysis_id).await?;
-    let (_, scope) = authorize(&state, &caller, &doc, &analysis).await?;
     let def = state
         .analyses
         .definition(&state.storage, &analysis.code_hash_hex)
         .await?;
+    let (_, scope) = authorize(&state, &caller, &doc, &analysis, &def).await?;
     Ok(Json(summary(&doc, &analysis, &def, &scope)))
 }
 
@@ -373,41 +464,106 @@ pub async fn get_options(
     State(state): State<AppState>,
     Path((pool_pda, analysis_id)): Path<(String, String)>,
 ) -> Result<Json<OptionsResponse>, ApiError> {
+    options_for(&caller, &state, &pool_pda, &analysis_id, None)
+        .await
+        .map(Json)
+}
+
+/// Each filter's options, from the caller's rows the other filters match.
+#[utoipa::path(
+    post,
+    path = "/v1/drt/pools/{pool_pda}/analyses/{analysis_id}/options",
+    tag = "Analyses",
+    summary = "Filter options under the other filters",
+    description = "As `GET`, but each filter's options come from the caller's rows that the request's other filters match, so they follow what a page shows: setting an award narrows the date range's bounds and the other filters' values, while the award filter's own values stay on offer. The filters are checked as a query's are. Read-only, so it needs no Idempotency-Key. Recorded in the analysis log. Needs `analyses:run`, and for an analyst an active grant.",
+    security(("bearer_auth" = [])),
+    params(
+        ("pool_pda" = String, Path, description = "Pool PDA address (base58)"),
+        ("analysis_id" = String, Path, description = "The pool's analysis"),
+    ),
+    request_body = OptionsRequest,
+    responses(
+        (status = 200, description = "The options", body = OptionsResponse),
+        (status = 400, description = "The filters don't fit the analysis (`invalid_query`)"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "No active grant, or no employer scope"),
+        (status = 404, description = "Pool or analysis not found"),
+        (status = 415, description = "The body isn't JSON"),
+        (status = 422, description = "The options ran out of time (`analysis_timeout`)"),
+        (status = 503, description = "The worker is busy (`analysis_busy`, with Retry-After), or the analysis log is unavailable"),
+    )
+)]
+pub async fn filtered_options(
+    caller: Caller,
+    State(state): State<AppState>,
+    Path((pool_pda, analysis_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<OptionsResponse>, ApiError> {
     caller.require(Permission::AnalysesRun)?;
-    let (doc, analysis) = load(&state, &pool_pda, &analysis_id).await?;
-    let mut logged = Logged::new(&caller, &doc, &analysis, "options", json!({}));
+    require_json(&headers)?;
+    options_for(&caller, &state, &pool_pda, &analysis_id, Some(&body))
+        .await
+        .map(Json)
+}
+
+/// The options routes' work: a `POST`'s `body` may set filters, and a `GET`
+/// sets none, so it gets the options the table was built with.
+async fn options_for(
+    caller: &Caller,
+    state: &AppState,
+    pool_pda: &str,
+    analysis_id: &str,
+    body: Option<&Bytes>,
+) -> Result<OptionsResponse, ApiError> {
+    caller.require(Permission::AnalysesRun)?;
+    let (doc, analysis) = load(state, pool_pda, analysis_id).await?;
+    let asked = body.map_or_else(
+        || json!({}),
+        |b| serde_json::from_slice(b).unwrap_or(Value::Null),
+    );
+    let mut logged = Logged::new(caller, &doc, &analysis, "options", asked);
     let result = async {
-        let (grant, scope) = authorize(&state, &caller, &doc, &analysis).await?;
-        logged.record.grant_id = grant;
         let def = state
             .analyses
             .definition(&state.storage, &analysis.code_hash_hex)
             .await?;
+        let (grant, scope) = authorize(state, caller, &doc, &analysis, &def).await?;
+        logged.record.grant_id = grant;
+        let request: OptionsRequest = match body {
+            Some(bytes) => parse(bytes)?,
+            None => OptionsRequest::default(),
+        };
+        let query = filters_only(&def, request.filters)?;
         let table = state
             .analyses
             .table(&state.storage, &doc, &def, &scope)
             .await?;
+        if query.is_unfiltered() {
+            return Ok(OptionsResponse {
+                options: table.options().clone(),
+            });
+        }
         let options = state
             .analyses
             .blocking(move || {
                 table
-                    .options(&def, Instant::now() + DEADLINE)
+                    .facets(&def, &query, Instant::now() + DEADLINE)
                     .map_err(query_error)
             })
             .await?;
         Ok(OptionsResponse { options })
     }
     .await;
-    let response = logged
-        .finish(&state, result, |r| {
+    logged
+        .finish(state, result, |r| {
             let values = r.options.values().map(|o| match o {
                 FilterOptions::Values(values) => values.len() as u64,
                 FilterOptions::DateRange { .. } => 0,
             });
             (values.sum(), None)
         })
-        .await?;
-    Ok(Json(response))
+        .await
 }
 
 /// A search filter's values that start with `search`.
@@ -439,38 +595,129 @@ pub async fn search_values(
     Path((pool_pda, analysis_id, filter)): Path<(String, String, String)>,
     Query(search): Query<SearchQuery>,
 ) -> Result<Json<SearchResponse>, ApiError> {
+    let body = SearchBody::Query(search);
+    search_for(&caller, &state, &pool_pda, &analysis_id, filter, body)
+        .await
+        .map(Json)
+}
+
+/// A search filter's values that start with `search`, from the caller's
+/// rows the other filters match.
+#[utoipa::path(
+    post,
+    path = "/v1/drt/pools/{pool_pda}/analyses/{analysis_id}/options/{filter}",
+    tag = "Analyses",
+    summary = "Search a filter's values under the other filters",
+    description = "As `GET`, but only from the caller's rows that the request's other filters match; the search filter's own selection is left out, so its other values stay on offer. The filters are checked as a query's are. Read-only, so it needs no Idempotency-Key. Recorded in the analysis log. Needs `analyses:run`, and for an analyst an active grant.",
+    security(("bearer_auth" = [])),
+    params(
+        ("pool_pda" = String, Path, description = "Pool PDA address (base58)"),
+        ("analysis_id" = String, Path, description = "The pool's analysis"),
+        ("filter" = String, Path, description = "A search filter of the analysis"),
+    ),
+    request_body = SearchRequest,
+    responses(
+        (status = 200, description = "The values", body = SearchResponse),
+        (status = 400, description = "Not a search filter, a search or limit out of range, or filters that don't fit the analysis (`invalid_query`)"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "No active grant, or no employer scope"),
+        (status = 404, description = "Pool or analysis not found"),
+        (status = 415, description = "The body isn't JSON"),
+        (status = 422, description = "The search ran out of time (`analysis_timeout`)"),
+        (status = 503, description = "The worker is busy (`analysis_busy`, with Retry-After), or the analysis log is unavailable"),
+    )
+)]
+pub async fn filtered_search(
+    caller: Caller,
+    State(state): State<AppState>,
+    Path((pool_pda, analysis_id, filter)): Path<(String, String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<SearchResponse>, ApiError> {
     caller.require(Permission::AnalysesRun)?;
-    let (doc, analysis) = load(&state, &pool_pda, &analysis_id).await?;
-    let limit = search.limit.unwrap_or(DEFAULT_SEARCH_LIMIT);
-    let asked = json!({ "filter": filter, "search": search.search, "limit": limit });
-    let mut logged = Logged::new(&caller, &doc, &analysis, "search", asked);
+    require_json(&headers)?;
+    let body = SearchBody::Json(&body);
+    search_for(&caller, &state, &pool_pda, &analysis_id, filter, body)
+        .await
+        .map(Json)
+}
+
+/// What a search was asked with: a `GET`'s query string, or a `POST`'s
+/// body, which may set filters.
+enum SearchBody<'a> {
+    Query(SearchQuery),
+    Json(&'a Bytes),
+}
+
+/// The search routes' work.
+async fn search_for(
+    caller: &Caller,
+    state: &AppState,
+    pool_pda: &str,
+    analysis_id: &str,
+    filter: String,
+    body: SearchBody<'_>,
+) -> Result<SearchResponse, ApiError> {
+    caller.require(Permission::AnalysesRun)?;
+    let (doc, analysis) = load(state, pool_pda, analysis_id).await?;
+    let asked = match &body {
+        SearchBody::Query(q) => json!({
+            "filter": filter,
+            "search": q.search,
+            "limit": q.limit.unwrap_or(DEFAULT_SEARCH_LIMIT),
+        }),
+        SearchBody::Json(bytes) => match serde_json::from_slice::<Value>(bytes) {
+            Ok(Value::Object(mut fields)) => {
+                fields.insert("filter".into(), json!(filter));
+                Value::Object(fields)
+            }
+            _ => json!({ "filter": filter }),
+        },
+    };
+    let mut logged = Logged::new(caller, &doc, &analysis, "search", asked);
     let result = async {
-        let (grant, scope) = authorize(&state, &caller, &doc, &analysis).await?;
-        logged.record.grant_id = grant;
         let def = state
             .analyses
             .definition(&state.storage, &analysis.code_hash_hex)
             .await?;
+        let (grant, scope) = authorize(state, caller, &doc, &analysis, &def).await?;
+        logged.record.grant_id = grant;
+        let request = match body {
+            SearchBody::Query(q) => SearchRequest {
+                search: q.search,
+                limit: q.limit,
+                filters: BTreeMap::new(),
+            },
+            SearchBody::Json(bytes) => parse(bytes)?,
+        };
+        let query = filters_only(&def, request.filters)?;
+        let limit = request.limit.unwrap_or(DEFAULT_SEARCH_LIMIT);
         let table = state
             .analyses
             .table(&state.storage, &doc, &def, &scope)
             .await?;
-        let prefix = search.search;
+        let prefix = request.search;
         let values = state
             .analyses
             .blocking(move || {
                 table
-                    .search(&def, &filter, &prefix, limit, Instant::now() + DEADLINE)
+                    .search(
+                        &def,
+                        &filter,
+                        &prefix,
+                        limit,
+                        &query,
+                        Instant::now() + DEADLINE,
+                    )
                     .map_err(query_error)
             })
             .await?;
         Ok(SearchResponse { values })
     }
     .await;
-    let response = logged
-        .finish(&state, result, |r| (r.values.len() as u64, None))
-        .await?;
-    Ok(Json(response))
+    logged
+        .finish(state, result, |r| (r.values.len() as u64, None))
+        .await
 }
 
 /// A page of the rows that match a query, from the caller's rows.
@@ -505,28 +752,18 @@ pub async fn run_query(
     body: Bytes,
 ) -> Result<Json<Page>, ApiError> {
     caller.require(Permission::AnalysesRun)?;
-    let is_json = headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|ct| ct.starts_with("application/json"));
-    if !is_json {
-        return Err(ApiError::unsupported_media_type(
-            "a query is JSON: send Content-Type: application/json",
-        ));
-    }
+    require_json(&headers)?;
     let (doc, analysis) = load(&state, &pool_pda, &analysis_id).await?;
     let asked = serde_json::from_slice(&body).unwrap_or(Value::Null);
     let mut logged = Logged::new(&caller, &doc, &analysis, "query", asked);
     let result = async {
-        let (grant, scope) = authorize(&state, &caller, &doc, &analysis).await?;
-        logged.record.grant_id = grant;
-        let request: QueryRequest = serde_json::from_slice(&body).map_err(|e| {
-            ApiError::bad_request(format!("the query isn't valid: {e}")).with_code("invalid_query")
-        })?;
         let def = state
             .analyses
             .definition(&state.storage, &analysis.code_hash_hex)
             .await?;
+        let (grant, scope) = authorize(&state, &caller, &doc, &analysis, &def).await?;
+        logged.record.grant_id = grant;
+        let request: QueryRequest = parse(&body)?;
         let query = query::Query::check(&def, &request).map_err(query_error)?;
         if let Some(asked) = logged.record.request.as_object_mut() {
             asked.insert(
@@ -575,23 +812,22 @@ mod tests {
     use crate::auth::entra::tests::{config, entra_key};
     use crate::data_validation::tests::{awards_schema, AWARDS_HEADER};
     use crate::storage::pools::{Grant, GrantRevocation, Upload, INITIAL};
-    use crate::storage::scopes::tests::{fixture, AIB_GROUP, EBS_GROUP};
-    use crate::storage::scopes::EmployerScope;
+    use crate::storage::scopes::tests::{entry, fixture, GROUP_A_ANALYSTS, NETWORK_ANALYSTS};
     use crate::storage::Change;
 
     /// Staff number, employer, employer group, award, exam board date.
     const ROWS: [(&str, &str, &str, &str, &str); 5] = [
-        ("000123", "AIB", "AIB", "Certificate", "01/01/2026"),
-        ("000124", "AIB", "AIB", "Diploma", "30/09/2026"),
-        ("020001", "EBS Network", "AIB", "Certificate", "15/06/2026"),
+        ("000123", "Bank A", "Group A", "Certificate", "01/01/2026"),
+        ("000124", "Bank A", "Group A", "Diploma", "30/09/2026"),
         (
-            "030001",
-            "Bank of Ireland",
-            "Bank of Ireland",
+            "020001",
+            "Bank A Network",
+            "Group A",
             "Certificate",
-            "01/01/2026",
+            "15/06/2026",
         ),
-        ("040001", "PTSB", "PTSB", "Advisor", "10/02/2026"),
+        ("030001", "Bank B", "Group B", "Certificate", "01/01/2026"),
+        ("040001", "Bank C", "Group C", "Advisor", "10/02/2026"),
     ];
 
     /// An Awards Report pool of `owner`'s whose first upload holds `ROWS`.
@@ -607,7 +843,7 @@ mod tests {
         let mut csv = format!("{AWARDS_HEADER}\n");
         for (i, (staff, employer, group, award, date)) in ROWS.iter().enumerate() {
             csv.push_str(&format!(
-                "{staff},M{i},Mx,Sam,Doyle,01/01/1990,{employer},{group},{award},Pass,{date}\n"
+                "{staff},M{i},Mx,Sam,Example,01/01/1990,{employer},{group},{award},Pass,{date}\n"
             ));
         }
         let pools = worker.storage.pools();
@@ -689,15 +925,15 @@ mod tests {
         let pool_pda = awards_pool(&worker, &owner).await;
         let scopes = worker.storage.employer_scopes();
         scopes.replace(0, fixture(), "admin").await.unwrap();
-        let (aib, aib_id) = analyst(&worker.app, "oid-aib", &[AIB_GROUP]).await;
-        let (ebs, ebs_id) = analyst(&worker.app, "oid-ebs", &[EBS_GROUP]).await;
-        grant(&worker, &pool_pda, &aib_id).await;
-        grant(&worker, &pool_pda, &ebs_id).await;
+        let (group_a, group_a_id) = analyst(&worker.app, "oid-group-a", &[GROUP_A_ANALYSTS]).await;
+        let (network, network_id) = analyst(&worker.app, "oid-network", &[NETWORK_ANALYSTS]).await;
+        grant(&worker, &pool_pda, &group_a_id).await;
+        grant(&worker, &pool_pda, &network_id).await;
         let base = format!("/v1/drt/pools/{pool_pda}/analyses/{ANALYSIS}");
         let query = format!("{base}/query");
 
-        // Group AIB includes its employer EBS Network; newest first by default.
-        let (status, _, page) = send(&worker.app, post(&query, &aib, &json!({}))).await;
+        // Group A includes its employer Bank A Network; newest first by default.
+        let (status, _, page) = send(&worker.app, post(&query, &group_a, &json!({}))).await;
         assert_eq!(status, StatusCode::OK, "{page}");
         assert_eq!(
             (&page["total_matched"], &page["limit"], &page["offset"]),
@@ -707,7 +943,9 @@ mod tests {
             column(&page, "staff_number"),
             ["000124", "020001", "000123"]
         );
-        assert!(column(&page, "employer_group").iter().all(|g| g == "AIB"));
+        assert!(column(&page, "employer_group")
+            .iter()
+            .all(|g| g == "Group A"));
         assert!(page["rows"][0].get("_record_id").is_none());
 
         let filtered = json!({
@@ -719,18 +957,19 @@ mod tests {
             "sort": { "field": "staff_number", "direction": "asc" },
             "pagination": { "limit": 1, "offset": 1 },
         });
-        let (status, _, page) = send(&worker.app, post(&query, &aib, &filtered)).await;
+        let (status, _, page) = send(&worker.app, post(&query, &group_a, &filtered)).await;
         assert_eq!(status, StatusCode::OK, "{page}");
         assert_eq!(page["total_matched"], 2);
         assert_eq!(column(&page, "staff_number"), ["020001"]);
 
-        let (_, _, page) = send(&worker.app, post(&query, &ebs, &json!({}))).await;
-        assert_eq!(column(&page, "employer"), ["EBS Network"]);
+        let (_, _, page) = send(&worker.app, post(&query, &network, &json!({}))).await;
+        assert_eq!(column(&page, "employer"), ["Bank A Network"]);
         let (_, _, page) = send(&worker.app, post(&query, &owner.token, &json!({}))).await;
         assert_eq!(page["total_matched"], 5);
 
         // Options and searches come from the caller's rows only.
-        let (status, _, options) = send(&worker.app, get(&format!("{base}/options"), &aib)).await;
+        let (status, _, options) =
+            send(&worker.app, get(&format!("{base}/options"), &group_a)).await;
         assert_eq!(status, StatusCode::OK, "{options}");
         assert_eq!(
             options["options"],
@@ -743,18 +982,20 @@ mod tests {
             })
         );
         let search = format!("{base}/options/staff_number?search=0&limit=5");
-        let (_, _, found) = send(&worker.app, get(&search, &aib)).await;
+        let (_, _, found) = send(&worker.app, get(&search, &group_a)).await;
         assert_eq!(found["values"], json!(["000123", "000124", "020001"]));
         let search = format!("{base}/options/staff_number?search=03");
-        let (_, _, found) = send(&worker.app, get(&search, &aib)).await;
+        let (_, _, found) = send(&worker.app, get(&search, &group_a)).await;
         assert_eq!(found["values"], json!([]));
 
         // The summary names the caller's rows.
-        let (status, _, summary) = send(&worker.app, get(&base, &aib)).await;
+        let (status, _, summary) = send(&worker.app, get(&base, &group_a)).await;
         assert_eq!(status, StatusCode::OK, "{summary}");
         assert_eq!(
             summary["scope"],
-            json!({ "all": false, "employer_groups": ["AIB"], "employers": [] })
+            json!({ "all": false, "any_of": [[
+                { "key": "employer_group", "header": "Employer Group", "value": "Group A" }
+            ]] })
         );
         assert_eq!(
             summary["columns"][0],
@@ -782,7 +1023,7 @@ mod tests {
             .iter()
             .find(|r| r.request.get("pagination").is_some())
             .unwrap();
-        assert_eq!(filtered_record.grant_id, Some(format!("g-{aib_id}")));
+        assert_eq!(filtered_record.grant_id, Some(format!("g-{group_a_id}")));
         assert_eq!(filtered_record.request["filters"], filtered["filters"]);
         assert_eq!(
             filtered_record.request["ran_with"]["sort"],
@@ -801,7 +1042,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{read}");
         assert_eq!(read["records"], serde_json::to_value(&log).unwrap());
         assert_eq!(
-            send(&worker.app, get(&path, &aib)).await.0,
+            send(&worker.app, get(&path, &group_a)).await.0,
             StatusCode::FORBIDDEN
         );
         let undated = format!("/v1/admin/analysis-log?pool_pda={pool_pda}&date=2026-10-5");
@@ -812,34 +1053,136 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn options_and_searches_follow_the_other_filters() {
+        let worker = worker();
+        let owner = worker.admin("oid-owner").await;
+        let pool_pda = awards_pool(&worker, &owner).await;
+        worker
+            .storage
+            .employer_scopes()
+            .replace(0, fixture(), "admin")
+            .await
+            .unwrap();
+        let (group_a, group_a_id) = analyst(&worker.app, "oid-group-a", &[GROUP_A_ANALYSTS]).await;
+        grant(&worker, &pool_pda, &group_a_id).await;
+        let base = format!("/v1/drt/pools/{pool_pda}/analyses/{ANALYSIS}");
+        let diploma = json!({ "award": { "mode": "selected", "values": ["Diploma"] } });
+
+        // Within Group A's rows, a Diploma narrows the dates and the staff
+        // numbers; the awards stay as they were.
+        let options = format!("{base}/options");
+        let (status, _, found) = send(
+            &worker.app,
+            post(&options, &group_a, &json!({ "filters": diploma })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{found}");
+        assert_eq!(
+            found["options"],
+            json!({
+                "award": [
+                    { "value": "Certificate", "count": 2 },
+                    { "value": "Diploma", "count": 1 },
+                ],
+                "exam_board_date": { "min": "30/09/2026", "max": "30/09/2026" },
+            })
+        );
+        let search = format!("{base}/options/staff_number");
+        let body = json!({ "search": "0", "filters": diploma });
+        let (status, _, found) = send(&worker.app, post(&search, &group_a, &body)).await;
+        assert_eq!(status, StatusCode::OK, "{found}");
+        assert_eq!(found["values"], json!(["000124"]));
+        let (_, _, unfiltered) = send(&worker.app, post(&options, &group_a, &json!({}))).await;
+        let (_, _, built) = send(&worker.app, get(&options, &group_a)).await;
+        assert_eq!(unfiltered, built);
+
+        // The filters are checked as a query's are, and must be JSON.
+        let scoped =
+            json!({ "filters": { "employer": { "mode": "selected", "values": ["Bank C"] } } });
+        for path in [&options, &search] {
+            let (status, _, err) = send(&worker.app, post(path, &group_a, &scoped)).await;
+            assert_eq!(
+                (status, err["code"].as_str()),
+                (StatusCode::BAD_REQUEST, Some("invalid_query")),
+                "{path}"
+            );
+            let text = Request::post(path)
+                .header(header::AUTHORIZATION, format!("Bearer {group_a}"))
+                .header(header::CONTENT_TYPE, "text/plain")
+                .body(Body::from("{}"))
+                .unwrap();
+            assert_eq!(
+                send(&worker.app, text).await.0,
+                StatusCode::UNSUPPORTED_MEDIA_TYPE
+            );
+        }
+
+        // The analysis log has each request as it was sent.
+        let today = Utc::now().format("%Y-%m-%d").to_string();
+        let log = worker
+            .storage
+            .analysis_log()
+            .on(&pool_pda.to_string(), &today)
+            .await
+            .unwrap();
+        let searched = log
+            .iter()
+            .find(|r| r.action == "search" && r.outcome == "success")
+            .unwrap();
+        assert_eq!(
+            searched.request,
+            json!({ "filter": "staff_number", "search": "0", "filters": diploma })
+        );
+        assert_eq!(searched.grant_id, Some(format!("g-{group_a_id}")));
+        assert!(log
+            .iter()
+            .any(|r| r.action == "options" && r.request["filters"] == diploma));
+        assert_eq!(
+            log.iter().filter(|r| r.outcome == "invalid_query").count(),
+            2
+        );
+    }
+
+    #[tokio::test]
     async fn queries_fail_closed_and_refuse_what_the_analysis_does_not_define() {
         let worker = worker();
         let owner = worker.admin("oid-owner").await;
         let pool_pda = awards_pool(&worker, &owner).await;
         let mut scopes = fixture();
-        scopes.push(EmployerScope {
-            group_id: "g-cu".into(),
-            label: "UAT_EDQ_CREDIT_UNION".into(),
-            employer_group: Some("Credit Union".into()),
-            employer: None,
-        });
+        scopes.push(entry(
+            "g-group-d",
+            "GROUP_D_ANALYSTS",
+            &[("employer_group", "Group D")],
+        ));
+        scopes.push(entry(
+            "g-region-e",
+            "REGION_E_ANALYSTS",
+            &[("region", "Region E")],
+        ));
         worker
             .storage
             .employer_scopes()
             .replace(0, scopes, "admin")
             .await
             .unwrap();
-        let (granted, granted_id) = analyst(&worker.app, "oid-aib", &[AIB_GROUP]).await;
-        let (ungranted, _) = analyst(&worker.app, "oid-nogrant", &[AIB_GROUP]).await;
+        let (granted, granted_id) = analyst(&worker.app, "oid-group-a", &[GROUP_A_ANALYSTS]).await;
+        let (ungranted, _) = analyst(&worker.app, "oid-nogrant", &[GROUP_A_ANALYSTS]).await;
         let (unmapped, unmapped_id) = analyst(&worker.app, "oid-unmapped", &["g-other"]).await;
-        let (empty, empty_id) = analyst(&worker.app, "oid-cu", &["g-cu"]).await;
+        let (empty, empty_id) = analyst(&worker.app, "oid-group-d", &["g-group-d"]).await;
+        let (elsewhere, elsewhere_id) = analyst(&worker.app, "oid-region-e", &["g-region-e"]).await;
         let mut spec = Spec::valid(&config());
         spec.roles = vec!["Analyst".into()];
         spec.groups_overage = true;
         let overage = spec.sign(entra_key()).unwrap();
         let overage_id = sign_in(&worker.app, &overage).await;
         let nobody = Spec::valid(&config()).sign(entra_key()).unwrap();
-        for analyst in [&granted_id, &unmapped_id, &empty_id, &overage_id] {
+        for analyst in [
+            &granted_id,
+            &unmapped_id,
+            &empty_id,
+            &elsewhere_id,
+            &overage_id,
+        ] {
             grant(&worker, &pool_pda, analyst).await;
         }
         let base = format!("/v1/drt/pools/{pool_pda}/analyses/{ANALYSIS}");
@@ -853,17 +1196,23 @@ mod tests {
                 StatusCode::FORBIDDEN,
                 "no_employer_scope",
             ),
+            (
+                &elsewhere,
+                json!({}),
+                StatusCode::FORBIDDEN,
+                "no_employer_scope",
+            ),
             (&overage, json!({}), StatusCode::FORBIDDEN, "groups_overage"),
             (&nobody, json!({}), StatusCode::FORBIDDEN, "forbidden"),
             (
                 &granted,
-                json!({ "scope": { "employer_group": "PTSB" } }),
+                json!({ "scope": { "employer_group": "Group C" } }),
                 StatusCode::BAD_REQUEST,
                 "invalid_query",
             ),
             (
                 &granted,
-                json!({ "filters": { "employer_group": { "mode": "selected", "values": ["PTSB"] } } }),
+                json!({ "filters": { "employer_group": { "mode": "selected", "values": ["Group C"] } } }),
                 StatusCode::BAD_REQUEST,
                 "invalid_query",
             ),

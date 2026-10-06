@@ -270,11 +270,11 @@ pub fn drt_router() -> Router<AppState> {
         )
         .route(
             "/v1/drt/pools/{pool_pda}/analyses/{analysis_id}/options",
-            get(analyses::get_options),
+            get(analyses::get_options).post(analyses::filtered_options),
         )
         .route(
             "/v1/drt/pools/{pool_pda}/analyses/{analysis_id}/options/{filter}",
-            get(analyses::search_values),
+            get(analyses::search_values).post(analyses::filtered_search),
         )
         .route(
             "/v1/drt/pools/{pool_pda}/analyses/{analysis_id}/query",
