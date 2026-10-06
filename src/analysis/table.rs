@@ -144,6 +144,10 @@ impl Table {
         );
 
         let mut conn = Connection::open_in_memory()?;
+        // Rows never reach a disk, and the image has no temporary directory:
+        // the files SQLite spills large index builds and sorts to stay in
+        // memory too.
+        conn.pragma_update(None, "temp_store", "MEMORY")?;
         conn.execute_batch(&def.create_table_sql())?;
         let (mut record_id, mut rows) = (0i64, 0usize);
         let tx = conn.transaction()?;
@@ -351,6 +355,19 @@ pub(crate) mod tests {
         );
         assert_eq!(kept_out, [&combination("Bank B", None, 1)]);
         assert!(counts.split(&Scope::All).1.is_empty());
+    }
+
+    #[test]
+    fn tables_keep_temporary_files_in_memory() {
+        let csv = format!(
+            "{AWARDS_HEADER}\n1,M1,Mx,Sam,Alpha,01/01/1990,Bank A,Group A,Certificate,Pass,01/01/2026\n"
+        );
+        let table = Table::build(&awards_report(), &[csv.as_bytes()], &Scope::All).unwrap();
+        let temp_store: i64 = table
+            .connection()
+            .pragma_query_value(None, "temp_store", |row| row.get(0))
+            .unwrap();
+        assert_eq!(temp_store, 2, "PRAGMA temp_store is MEMORY");
     }
 
     /// The scope of these entries, each a list of conditions.
