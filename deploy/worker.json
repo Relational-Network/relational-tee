@@ -1,0 +1,110 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "description": "The confidential container group profile workers run from: the worker and Microsoft's SKR sidecar. A deployment's CCE policy is generated from this template with that deployment's parameters (az confcom acipolicygen writes the policy into ccePolicy, and the result is deployed as it is), so the host data its manifest approves can be reproduced from this file, the image rebuilt from this repository, and the parameters the deployment publishes next to its manifest. Plain ARM JSON with literal sizes, because confcom evaluates parameters but not other template functions; resource sizes aren't part of the policy.",
+    "license": "AGPL-3.0-or-later"
+  },
+  "parameters": {
+    "name": { "type": "string", "metadata": { "description": "The profile's name; a new one per release, so NGroups rolls to it." } },
+    "location": { "type": "string" },
+    "tags": { "type": "object", "defaultValue": {} },
+    "workerImage": { "type": "string", "metadata": { "description": "The worker image, by digest: registry/repository@sha256:..." } },
+    "sidecarImage": { "type": "string", "metadata": { "description": "Microsoft's SKR sidecar image, by digest." } },
+    "registryServer": { "type": "string", "metadata": { "description": "The registry the worker image is pulled from." } },
+    "identityId": { "type": "string", "metadata": { "description": "Resource ID of the user-assigned identity that pulls images, releases keys and reaches storage." } },
+    "environment": { "type": "string", "metadata": { "description": "The environment's name, as its manifest names it." } },
+    "maaEndpoint": { "type": "string", "metadata": { "description": "The MAA authority, a host without a scheme." } },
+    "keyVaultUrl": { "type": "string" },
+    "storageBlobUrl": { "type": "string" },
+    "managedIdentityClientId": { "type": "string", "metadata": { "description": "Client ID of the identity above, which the storage client asks IMDS for." } },
+    "entraTenantId": { "type": "string" },
+    "entraApiClientId": { "type": "string" },
+    "entraAllowedClientIds": { "type": "string", "metadata": { "description": "Comma-separated client IDs whose tokens the worker accepts." } },
+    "apiHostname": { "type": "string" },
+    "dashboardOrigin": { "type": "string" },
+    "logAnalyticsWorkspaceId": { "type": "string" },
+    "logAnalyticsWorkspaceKey": { "type": "securestring" }
+  },
+  "resources": [
+    {
+      "type": "Microsoft.ContainerInstance/containerGroupProfiles",
+      "apiVersion": "2024-11-01-preview",
+      "name": "[parameters('name')]",
+      "location": "[parameters('location')]",
+      "tags": "[parameters('tags')]",
+      "properties": {
+        "sku": "Confidential",
+        "osType": "Linux",
+        "restartPolicy": "Always",
+        "confidentialComputeProperties": {
+          "ccePolicy": ""
+        },
+        "imageRegistryCredentials": [
+          {
+            "server": "[parameters('registryServer')]",
+            "identity": "[parameters('identityId')]"
+          }
+        ],
+        "ipAddress": {
+          "type": "Private",
+          "ports": [{ "protocol": "TCP", "port": 8443 }]
+        },
+        "diagnostics": {
+          "logAnalytics": {
+            "workspaceId": "[parameters('logAnalyticsWorkspaceId')]",
+            "workspaceKey": "[parameters('logAnalyticsWorkspaceKey')]"
+          }
+        },
+        "containers": [
+          {
+            "name": "worker",
+            "properties": {
+              "image": "[parameters('workerImage')]",
+              "ports": [{ "protocol": "TCP", "port": 8443 }],
+              "resources": {
+                "requests": { "cpu": 2, "memoryInGB": 3 }
+              },
+              "environmentVariables": [
+                { "name": "ENVIRONMENT", "value": "[parameters('environment')]" },
+                { "name": "KEY_PROVIDER", "value": "skr" },
+                { "name": "SKR_ENDPOINT", "value": "http://localhost:9000" },
+                { "name": "MAA_ENDPOINT", "value": "[parameters('maaEndpoint')]" },
+                { "name": "KEY_VAULT_URL", "value": "[parameters('keyVaultUrl')]" },
+                { "name": "KEY_NAMES", "value": "transport-key,storage-root,tls-key,commitment-key" },
+                { "name": "STORAGE_BACKEND", "value": "azure" },
+                { "name": "STORAGE_BLOB_URL", "value": "[parameters('storageBlobUrl')]" },
+                { "name": "MANAGED_IDENTITY_CLIENT_ID", "value": "[parameters('managedIdentityClientId')]" },
+                { "name": "ENTRA_TENANT_ID", "value": "[parameters('entraTenantId')]" },
+                { "name": "ENTRA_API_CLIENT_ID", "value": "[parameters('entraApiClientId')]" },
+                { "name": "ENTRA_ALLOWED_CLIENT_IDS", "value": "[parameters('entraAllowedClientIds')]" },
+                { "name": "API_HOSTNAME", "value": "[parameters('apiHostname')]" },
+                { "name": "DASHBOARD_ORIGIN", "value": "[parameters('dashboardOrigin')]" },
+                { "name": "LOG_FORMAT", "value": "json" }
+              ]
+            }
+          },
+          {
+            "name": "skr",
+            "properties": {
+              "image": "[parameters('sidecarImage')]",
+              "resources": {
+                "requests": { "cpu": 0.5, "memoryInGB": 1 }
+              },
+              "environmentVariables": [
+                { "name": "Port", "value": "9000" },
+                { "name": "LogLevel", "value": "info" }
+              ]
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "outputs": {
+    "id": {
+      "type": "string",
+      "value": "[resourceId('Microsoft.ContainerInstance/containerGroupProfiles', parameters('name'))]"
+    }
+  }
+}
