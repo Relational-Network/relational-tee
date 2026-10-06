@@ -370,6 +370,21 @@ pub(crate) mod tests {
         assert_eq!(temp_store, 2, "PRAGMA temp_store is MEMORY");
     }
 
+    #[test]
+    fn sqlite_keeps_no_memory_statistics() {
+        let csv = format!(
+            "{AWARDS_HEADER}\n1,M1,Mx,Sam,Alpha,01/01/1990,Bank A,Group A,Certificate,Pass,01/01/2026\n"
+        );
+        let table = Table::build(&awards_report(), &[csv.as_bytes()], &Scope::All).unwrap();
+        assert_eq!(table.rows, 1);
+        // SAFETY: reads a counter; SQLite is initialised by the build above.
+        let used = unsafe { rusqlite::ffi::sqlite3_memory_used() };
+        assert_eq!(
+            used, 0,
+            "SQLite was built without SQLITE_DEFAULT_MEMSTATUS=0"
+        );
+    }
+
     /// The scope of these entries, each a list of conditions.
     pub(crate) fn only(entries: &[&[(&str, &str)]]) -> Scope {
         Scope::Only(

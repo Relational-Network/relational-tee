@@ -5,6 +5,12 @@
 # holds no machine-specific settings. Put those (for example
 # `build.rustc-wrapper = "sccache"`) in ~/.cargo/config.toml or the dev shell.
 
+# Analysis tables are built and queried on several threads at once, and
+# SQLite's process-wide memory statistics would put all their allocations
+# behind one mutex.
+[env]
+LIBSQLITE3_FLAGS = "-DSQLITE_DEFAULT_MEMSTATUS=0"
+
 [alias]
 dev-check = "check --features dev"
 dev-build = "build --features dev"
