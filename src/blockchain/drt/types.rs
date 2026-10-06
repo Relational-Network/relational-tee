@@ -44,7 +44,9 @@ pub use super::idl_generated::{
 
 pub const MAX_POOL_NAME_LEN: usize = 64;
 pub const MAX_DRT_NAME_LEN: usize = 32;
-pub const MAX_CODE_REPO_URL_LEN: usize = 256;
+/// The longest `code_repo_url` the program stores: it allocates every
+/// `DrtConfig` account for a URL of this many bytes.
+pub const MAX_CODE_REPO_URL_LEN: usize = 200;
 pub const MAX_DRTS_PER_POOL: usize = 8;
 pub const MAX_SUPPLY: u64 = 1_000_000_000;
 

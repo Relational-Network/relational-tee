@@ -438,7 +438,7 @@ pub async fn get_pool(
     security(("bearer_auth" = [])),
     params(
         ("pool_pda" = String, Path, description = "Pool PDA address (base58)"),
-        ("drt_name" = String, Path, description = "DRT name (e.g. 'append', 'mean')"),
+        ("drt_name" = String, Path, description = "DRT name: 'append', or the pool's analysis (e.g. 'awards-report-v1')"),
     ),
     responses(
         (status = 200, description = "DRT config", body = DrtConfigResponse),

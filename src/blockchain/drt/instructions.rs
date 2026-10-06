@@ -245,6 +245,7 @@ mod tests {
     use solana_transaction::Transaction;
 
     use super::*;
+    use crate::blockchain::drt::accounts::fetch_drt_config;
     use crate::blockchain::rpc::JsonRpcClient;
     use crate::config::DEFAULT_SOLANA_RPC_URL;
 
@@ -354,7 +355,8 @@ mod tests {
     /// Grant PDA exists, while the same instruction under a fresh commitment
     /// passes, so the commitment alone decides; and `revoke_grant` from the
     /// pool's owner closes that Grant PDA. Simulated without signature
-    /// checks, so it needs no keys and spends nothing.
+    /// checks, so it needs no keys and spends nothing. The grant's
+    /// `DrtConfig`, zero padding and all, reads back as the worker reads it.
     #[tokio::test]
     #[ignore = "calls devnet: run with `just grant-guard`"]
     async fn devnet_refuses_a_second_grant_under_one_commitment() {
@@ -375,6 +377,8 @@ mod tests {
         );
         let (grant_pda, _) = derive_grant_pda(&landed.commitment);
         assert!(rpc.account_exists(&grant_pda, "finalized").await.unwrap());
+        let config = fetch_drt_config(&rpc, &drt_config).await.unwrap();
+        assert_eq!((config.pool, config.mint), (pool, mint));
 
         let (refused, logs) = simulate(&rpc, again, &holder).await;
         let Some(refusal) = refused else {
