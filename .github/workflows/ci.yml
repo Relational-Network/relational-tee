@@ -165,6 +165,8 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
           DEPLOY_REPO: ${{ secrets.DEPLOY_REPO }}
+        # The branch is named because the App may start workflows but not read
+        # the repository, so gh can't look up its default branch.
         run: >-
-          gh workflow run deploy-staging.yml -R "$GITHUB_REPOSITORY_OWNER/$DEPLOY_REPO"
+          gh workflow run deploy-staging.yml -R "$GITHUB_REPOSITORY_OWNER/$DEPLOY_REPO" --ref main
           -f commit="$GITHUB_SHA" -f digest="${{ steps.push.outputs.digest }}"
