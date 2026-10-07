@@ -176,7 +176,7 @@ fn pool_instructions(
     description = "Fetch the analysis definition from its allowlisted GitHub URL and check it against code_hash_hex; then, atomically, create_pool + register_drt for 'append' and for the analysis + seal_pool; once that transaction is finalized, store the pool's document, whose schema is the definition's columns. Idempotent: retries with the same Idempotency-Key create one pool.",
     security(("bearer_auth" = [])),
     params(
-        ("Idempotency-Key" = String, Header, description = "A UUID naming this user action; reuse it on every retry"),
+        ("Idempotency-Key" = String, Header, format = "uuid", description = "A UUID naming this user action; reuse it on every retry"),
     ),
     request_body = CreateMaltaPoolRequest,
     responses(

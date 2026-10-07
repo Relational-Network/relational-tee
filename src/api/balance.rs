@@ -45,7 +45,7 @@ pub struct BalanceResponse {
     description = "Returns native SOL balance (and SPL token balances in future) for a wallet.",
     security(("bearer_auth" = [])),
     params(
-        ("wallet_id" = String, Path, description = "Wallet UUID"),
+        ("wallet_id" = String, Path, format = "uuid", description = "Wallet UUID"),
     ),
     responses(
         (status = 200, description = "Balance info", body = BalanceResponse),

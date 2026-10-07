@@ -218,7 +218,7 @@ fn entry(state: &AppState, grant: &Grant, analyst: Option<&Identity>) -> GrantEn
     security(("bearer_auth" = [])),
     params(
         ("pool_pda" = String, Path, description = "Pool PDA address (base58)"),
-        ("Idempotency-Key" = String, Header, description = "A UUID naming this user action; reuse it on every retry"),
+        ("Idempotency-Key" = String, Header, format = "uuid", description = "A UUID naming this user action; reuse it on every retry"),
     ),
     request_body = GrantRequest,
     responses(
@@ -427,7 +427,7 @@ pub async fn grant_analysis(
     security(("bearer_auth" = [])),
     params(
         ("pool_pda" = String, Path, description = "Pool PDA address (base58)"),
-        ("Idempotency-Key" = String, Header, description = "A UUID naming this user action; reuse it on every retry"),
+        ("Idempotency-Key" = String, Header, format = "uuid", description = "A UUID naming this user action; reuse it on every retry"),
     ),
     request_body = GrantRequest,
     responses(

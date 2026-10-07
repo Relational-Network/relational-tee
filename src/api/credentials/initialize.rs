@@ -41,7 +41,7 @@ pub struct InitializePoolResponse {
     /// Record ID of the stored dataset.
     pub record_id: String,
     /// Pool lifecycle state after initialization.
-    pub state: String,
+    pub state: PoolState,
 }
 
 // ============================================================================
@@ -64,7 +64,7 @@ pub struct InitializePoolResponse {
     security(("bearer_auth" = [])),
     params(
         ("pool_pda" = String, Path, description = "Pool PDA address (base58)"),
-        ("Idempotency-Key" = String, Header, description = "A UUID naming this user action; reuse it on every retry"),
+        ("Idempotency-Key" = String, Header, format = "uuid", description = "A UUID naming this user action; reuse it on every retry"),
     ),
     request_body(content = SealedUploadForm, content_type = "multipart/form-data"),
     responses(
@@ -161,7 +161,7 @@ pub async fn initialize_pool(
         &InitializePoolResponse {
             rows: upload.rows,
             record_id: INITIAL.to_string(),
-            state: PoolState::Ready.as_str().to_string(),
+            state: PoolState::Ready,
         },
     )
     .await

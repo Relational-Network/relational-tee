@@ -56,7 +56,6 @@ pub struct ColumnSummary {
     pub header: String,
     /// `text`, or `date` (DD/MM/YYYY).
     #[serde(rename = "type")]
-    #[schema(value_type = String)]
     pub kind: ColumnType,
 }
 
@@ -66,7 +65,6 @@ pub struct FilterSummary {
     pub name: String,
     /// `date_range` (`from` and `to`), `multi_select` (values from the
     /// options) or `search_select` (values from a search).
-    #[schema(value_type = String)]
     pub kind: FilterKind,
 }
 

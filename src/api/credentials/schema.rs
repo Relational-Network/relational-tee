@@ -40,6 +40,7 @@ pub struct GetSchemaResponse {
     responses(
         (status = 200, description = "Schema returned", body = GetSchemaResponse),
         (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Needs pools:read"),
         (status = 404, description = "Pool or schema not found"),
     )
 )]

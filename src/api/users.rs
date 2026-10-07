@@ -11,7 +11,6 @@
 //! Graph.
 
 use axum::extract::{Query, State};
-use axum::response::{IntoResponse, Response};
 use axum::Json;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -62,13 +61,16 @@ pub async fn get_me(caller: Caller) -> Json<UserMeResponse> {
 
 /// Query for `GET /v1/users`.
 #[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct UsersQuery {
     /// Find the one user with this email (case-insensitive) instead of
     /// listing.
     pub email: Option<String>,
     /// `next_cursor` from the previous page.
     pub cursor: Option<String>,
-    /// Maximum number of users to return (default 50, max 200).
+    /// Maximum number of users to return (default 50). Values above 200
+    /// count as 200.
+    #[param(minimum = 1, maximum = 200)]
     pub limit: Option<usize>,
 }
 
@@ -114,6 +116,14 @@ pub struct UserLookupResponse {
     pub display_name: String,
 }
 
+/// A page of users, or with `email` the user found.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(untagged)]
+pub enum UsersBody {
+    Page(UsersResponse),
+    Lookup(UserLookupResponse),
+}
+
 /// List known users, or find one by email.
 #[utoipa::path(
     get,
@@ -124,7 +134,7 @@ pub struct UserLookupResponse {
     security(("bearer_auth" = [])),
     params(UsersQuery),
     responses(
-        (status = 200, description = "A page of users, or with `email` the user found", body = UsersResponse),
+        (status = 200, description = "A page of users, or with `email` the user found", body = UsersBody),
         (status = 400, description = "Invalid cursor"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Needs users:read"),
@@ -135,7 +145,7 @@ pub async fn list_users(
     caller: Caller,
     State(state): State<AppState>,
     Query(query): Query<UsersQuery>,
-) -> Result<Response, ApiError> {
+) -> Result<Json<UsersBody>, ApiError> {
     caller.require(Permission::UsersRead)?;
     let identities = state.storage.identities();
 
@@ -144,12 +154,11 @@ pub async fn list_users(
             .by_email(email)
             .await?
             .ok_or_else(|| ApiError::not_found("no user with that email has signed in"))?;
-        return Ok(Json(UserLookupResponse {
+        return Ok(Json(UsersBody::Lookup(UserLookupResponse {
             user_id: found.user_id,
             email: found.email,
             display_name: found.display_name,
-        })
-        .into_response());
+        })));
     }
 
     let mut all = identities.all().await?;
@@ -158,9 +167,8 @@ pub async fn list_users(
     });
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
     let (users, next_cursor) = page(all, |i| i.user_id.as_str(), query.cursor.as_deref(), limit)?;
-    Ok(Json(UsersResponse {
+    Ok(Json(UsersBody::Page(UsersResponse {
         users: users.into_iter().map(UserEntry::from).collect(),
         next_cursor,
-    })
-    .into_response())
+    })))
 }

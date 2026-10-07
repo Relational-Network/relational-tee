@@ -65,7 +65,7 @@ pub struct GetWalletResponse {
 /// Response after soft-deleting a wallet.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct DeleteWalletResponse {
-    pub status: String,
+    pub status: WalletStatus,
     pub wallet_id: String,
 }
 
@@ -85,13 +85,14 @@ pub struct DeleteWalletResponse {
     description = "Generate a new Solana keypair inside the worker, store it encrypted, and return its public address. A user has at most one wallet.",
     security(("bearer_auth" = [])),
     params(
-        ("Idempotency-Key" = String, Header, description = "A UUID naming this user action; reuse it on every retry"),
+        ("Idempotency-Key" = String, Header, format = "uuid", description = "A UUID naming this user action; reuse it on every retry"),
     ),
     request_body = CreateWalletRequest,
     responses(
         (status = 201, description = "Wallet created", body = CreateWalletResponse),
         (status = 400, description = "Invalid request, or no Idempotency-Key"),
         (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Needs the Admin role"),
         (status = 409, description = "The user already has a wallet"),
         (status = 422, description = "The Idempotency-Key was used for a different request"),
         (status = 503, description = "Storage unavailable"),
@@ -185,6 +186,7 @@ pub async fn create_wallet(
     responses(
         (status = 200, description = "Wallet list", body = ListWalletsResponse),
         (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Needs wallets:read"),
     )
 )]
 pub async fn list_wallets(
@@ -219,7 +221,7 @@ pub async fn list_wallets(
     description = "Returns wallet details. The caller must own the wallet.",
     security(("bearer_auth" = [])),
     params(
-        ("wallet_id" = String, Path, description = "Wallet UUID"),
+        ("wallet_id" = String, Path, format = "uuid", description = "Wallet UUID"),
     ),
     responses(
         (status = 200, description = "Wallet details", body = GetWalletResponse),
@@ -255,8 +257,8 @@ pub async fn get_wallet(
     description = "Soft-deletes a wallet. The keypair is preserved for potential recovery.",
     security(("bearer_auth" = [])),
     params(
-        ("wallet_id" = String, Path, description = "Wallet UUID"),
-        ("Idempotency-Key" = String, Header, description = "A UUID naming this user action; reuse it on every retry"),
+        ("wallet_id" = String, Path, format = "uuid", description = "Wallet UUID"),
+        ("Idempotency-Key" = String, Header, format = "uuid", description = "A UUID naming this user action; reuse it on every retry"),
     ),
     responses(
         (status = 200, description = "Wallet deleted", body = DeleteWalletResponse),
@@ -290,7 +292,7 @@ pub async fn delete_wallet(
     op.finish(
         StatusCode::OK,
         &DeleteWalletResponse {
-            status: "deleted".to_string(),
+            status: WalletStatus::Deleted,
             wallet_id,
         },
     )

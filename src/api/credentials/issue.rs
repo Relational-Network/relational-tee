@@ -81,13 +81,14 @@ pub struct IssueCredentialsResponse {
     security(("bearer_auth" = [])),
     params(
         ("pool_pda" = String, Path, description = "Pool PDA address (base58)"),
-        ("Idempotency-Key" = String, Header, description = "A UUID naming this user action; reuse it on every retry"),
+        ("Idempotency-Key" = String, Header, format = "uuid", description = "A UUID naming this user action; reuse it on every retry"),
     ),
     request_body(content = SealedUploadForm, content_type = "multipart/form-data"),
     responses(
         (status = 200, description = "Credentials issued", body = IssueCredentialsResponse),
         (status = 400, description = "Validation error, insufficient DRTs, no Idempotency-Key, the sealed payload doesn't open (`sealed_payload_invalid`), or Solana refused the burn (`transaction_rejected`)"),
         (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Needs pools:write, or the caller's wallet doesn't own the pool"),
         (status = 404, description = "Pool not found"),
         (status = 409, description = "The pool changed concurrently; retry"),
         (status = 422, description = "The Idempotency-Key was used for a different request"),

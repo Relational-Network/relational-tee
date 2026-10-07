@@ -160,6 +160,7 @@ An analysis shows admins every row. An analyst sees only the rows `/v1/admin/emp
         data_validation::ValidationError,
         // Wallet schemas
         api::users::UserMeResponse,
+        api::users::UsersBody,
         api::users::UsersResponse,
         api::users::UserEntry,
         api::users::UserLookupResponse,
@@ -200,6 +201,8 @@ An analysis shows admins every row. An analyst sees only the rows `/v1/admin/emp
         storage::analysis_log::AnalysisRecord,
         // Shared domain types
         storage::wallets::WalletResponse,
+        storage::wallets::WalletStatus,
+        storage::pools::PoolState,
         history::WalletTransaction,
         history::TokenType,
         history::TxStatus,
@@ -234,6 +237,9 @@ An analysis shows admins every row. An analyst sees only the rows `/v1/admin/emp
         api::grants::MyAnalysis,
         api::grants::MyAnalysesResponse,
         // Analysis schemas
+        analysis::definition::ColumnType,
+        analysis::definition::FilterKind,
+        analysis::definition::Direction,
         api::analyses::AnalysisSummary,
         api::analyses::ColumnSummary,
         api::analyses::FilterSummary,
@@ -253,7 +259,7 @@ An analysis shows admins every row. An analyst sees only the rows `/v1/admin/emp
         analysis::query::FilterOptions,
         analysis::query::OptionValue,
     )),
-    modifiers(&SecurityAddon),
+    modifiers(&SecurityAddon, &ErrorBodies),
     tags(
         (name = "Health", description = "Health check endpoints"),
         (name = "Attestation", description = "Attestation and reference values"),
@@ -283,6 +289,43 @@ impl Modify for SecurityAddon {
                     utoipa::openapi::security::HttpAuthScheme::Bearer,
                 )),
             );
+        }
+    }
+}
+
+/// Give every error response that names no body the one every error has:
+/// the worker's own errors and the axum rejections the request middleware
+/// rewrites.
+struct ErrorBodies;
+
+impl Modify for ErrorBodies {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        use utoipa::openapi::{Content, Ref, RefOr};
+
+        let body = Content::new(Some(Ref::from_schema_name("ErrorBody")));
+        for item in openapi.paths.paths.values_mut() {
+            let operations = [
+                &mut item.get,
+                &mut item.put,
+                &mut item.post,
+                &mut item.delete,
+                &mut item.options,
+                &mut item.head,
+                &mut item.patch,
+                &mut item.trace,
+            ];
+            for operation in operations.into_iter().flatten() {
+                for (status, response) in &mut operation.responses.responses {
+                    let is_error = status.parse::<u16>().is_ok_and(|s| s >= 400);
+                    if let RefOr::T(response) = response {
+                        if is_error && response.content.is_empty() {
+                            response
+                                .content
+                                .insert("application/json".into(), body.clone());
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -877,7 +920,8 @@ mod tests {
         assert_eq!(me["email"], "Ada@Example.com");
         assert_eq!(me["display_name"], "Ada");
 
-        // A caller with no role sees only themselves and the pool list.
+        // A caller with no role sees only themselves and the pool list:
+        // every other documented read refuses them.
         let (status, them) = get_as(&app, &nobody, "/v1/users/me").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(them["permissions"], serde_json::json!([]));
@@ -885,10 +929,14 @@ mod tests {
             get_as(&app, &nobody, "/v1/drt/pools/list").await.0,
             StatusCode::OK
         );
-        for path in ["/v1/users", "/v1/wallets", "/v1/admin/wallets"] {
-            let (status, body) = get_as(&app, &nobody, path).await;
-            assert_eq!(status, StatusCode::FORBIDDEN, "{path}");
-            assert_eq!(body["code"], "forbidden");
+        let reads = secured_reads();
+        for uri in ["/v1/users", "/v1/wallets", "/v1/admin/wallets"] {
+            assert!(reads.iter().any(|read| read == uri), "{uri}");
+        }
+        for uri in reads {
+            let (status, body) = get_as(&app, &nobody, &uri).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{uri}: {body}");
+            assert_eq!(body["code"], "forbidden", "{uri}");
         }
 
         // Admins list and look up users once they've signed in.
@@ -1078,19 +1126,119 @@ mod tests {
         let app = router(AppState::for_tests());
         for (path, operations) in paths {
             let concrete = path.replace(['{', '}'], "");
-            for method in operations.as_object().unwrap().keys() {
+            for (method, operation) in operations.as_object().unwrap() {
                 let request = Request::builder()
                     .method(method.to_uppercase().as_str())
                     .uri(&concrete)
                     .body(Body::empty())
                     .unwrap();
                 let status = app.clone().oneshot(request).await.unwrap().status();
-                assert!(
-                    status != StatusCode::NOT_FOUND && status != StatusCode::METHOD_NOT_ALLOWED,
-                    "{method} {path}: {status}"
-                );
+                if operation.get("security").is_some() {
+                    assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {path}");
+                } else {
+                    assert!(
+                        status != StatusCode::NOT_FOUND && status != StatusCode::METHOD_NOT_ALLOWED,
+                        "{method} {path}: {status}"
+                    );
+                }
             }
         }
+    }
+
+    /// The operations any caller with a valid token may call, a caller with
+    /// no app role included.
+    const FOR_ANY_CALLER: [(&str, &str); 2] =
+        [("get", "/v1/users/me"), ("get", "/v1/drt/pools/list")];
+
+    #[test]
+    fn the_openapi_document_declares_path_parameters_error_bodies_and_refusals() {
+        let doc: serde_json::Value = serde_json::from_str(&openapi_document()).unwrap();
+        for (path, operations) in doc["paths"].as_object().unwrap() {
+            let named: std::collections::BTreeSet<&str> = path
+                .split('{')
+                .skip(1)
+                .filter_map(|rest| rest.split_once('}'))
+                .map(|(name, _)| name)
+                .collect();
+            for (method, operation) in operations.as_object().unwrap() {
+                let at = format!("{method} {path}");
+                let declared: std::collections::BTreeSet<&str> = operation["parameters"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|p| p["in"] == "path")
+                    .map(|p| p["name"].as_str().unwrap())
+                    .collect();
+                assert_eq!(declared, named, "{at}: its path parameters");
+
+                let responses = operation["responses"].as_object().unwrap();
+                for (status, response) in responses {
+                    if status.parse::<u16>().unwrap() < 400 {
+                        continue;
+                    }
+                    let body = if (path.as_str(), status.as_str()) == ("/health/ready", "503") {
+                        "#/components/schemas/ReadinessResponse"
+                    } else {
+                        "#/components/schemas/ErrorBody"
+                    };
+                    assert_eq!(
+                        response["content"]["application/json"]["schema"]["$ref"], body,
+                        "{at}: its {status} body"
+                    );
+                }
+
+                if operation.get("security").is_some() {
+                    assert!(responses.contains_key("401"), "{at} documents 401");
+                    if !FOR_ANY_CALLER.contains(&(method.as_str(), path.as_str())) {
+                        assert!(responses.contains_key("403"), "{at} documents 403");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Every documented `GET` that needs more than a valid token, as a URI
+    /// with valid values for its path and required query parameters.
+    fn secured_reads() -> Vec<String> {
+        let doc: serde_json::Value = serde_json::from_str(&openapi_document()).unwrap();
+        let pool = solana_pubkey::Pubkey::new_unique().to_string();
+        let value = |name: &str| -> String {
+            match name {
+                "pool_pda" => pool.clone(),
+                "wallet_id" => uuid::Uuid::new_v4().to_string(),
+                "analysis_id" => "an-analysis".into(),
+                "signature" => "1".repeat(64),
+                "version" => "1".into(),
+                "date" => "2026-01-01".into(),
+                other => panic!("no test value for the parameter {other}"),
+            }
+        };
+        let mut reads = Vec::new();
+        for (path, operations) in doc["paths"].as_object().unwrap() {
+            let Some(read) = operations.get("get") else {
+                continue;
+            };
+            if read.get("security").is_none() || FOR_ANY_CALLER.contains(&("get", path.as_str())) {
+                continue;
+            }
+            let mut uri = path.clone();
+            let mut query = Vec::new();
+            for parameter in read["parameters"].as_array().into_iter().flatten() {
+                let name = parameter["name"].as_str().unwrap();
+                match parameter["in"].as_str() {
+                    Some("path") => uri = uri.replace(&format!("{{{name}}}"), &value(name)),
+                    Some("query") if parameter["required"] == true => {
+                        query.push(format!("{name}={}", value(name)));
+                    }
+                    _ => {}
+                }
+            }
+            if !query.is_empty() {
+                uri = format!("{uri}?{}", query.join("&"));
+            }
+            reads.push(uri);
+        }
+        reads
     }
 
     #[cfg(not(feature = "swagger-ui"))]

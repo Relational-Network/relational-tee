@@ -28,7 +28,7 @@ pub const RECORD_ID: &str = "_record_id";
 /// The parameters an option query of a `search_select` filter may use.
 const SEARCH_PARAMS: [&str; 2] = [":search", ":limit"];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ColumnType {
     Text,
@@ -36,7 +36,7 @@ pub enum ColumnType {
     Date,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum FilterKind {
     DateRange,
@@ -44,7 +44,7 @@ pub enum FilterKind {
     SearchSelect,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Direction {
     Asc,

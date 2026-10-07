@@ -67,16 +67,18 @@ pub struct AdminWalletEntry {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct WalletStatusChangeResponse {
     pub wallet_id: String,
-    pub new_status: String,
+    pub new_status: WalletStatus,
 }
 
 /// Which analysis requests to list.
 #[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 #[serde(deny_unknown_fields)]
 pub struct AnalysisLogQuery {
     /// The pool whose analysis requests to list.
     pub pool_pda: String,
     /// The UTC day, as `YYYY-MM-DD`.
+    #[param(format = Date)]
     pub date: String,
 }
 
@@ -210,8 +212,8 @@ pub async fn list_all_wallets(
     description = "Suspend a wallet, preventing the owner from transacting. Admin only.",
     security(("bearer_auth" = [])),
     params(
-        ("wallet_id" = String, Path, description = "Wallet UUID"),
-        ("Idempotency-Key" = String, Header, description = "A UUID naming this user action; reuse it on every retry"),
+        ("wallet_id" = String, Path, format = "uuid", description = "Wallet UUID"),
+        ("Idempotency-Key" = String, Header, format = "uuid", description = "A UUID naming this user action; reuse it on every retry"),
     ),
     responses(
         (status = 200, description = "Wallet suspended", body = WalletStatusChangeResponse),
@@ -249,7 +251,7 @@ pub async fn suspend_wallet(
         StatusCode::OK,
         &WalletStatusChangeResponse {
             wallet_id,
-            new_status: "suspended".to_string(),
+            new_status: WalletStatus::Suspended,
         },
     )
     .await
@@ -264,8 +266,8 @@ pub async fn suspend_wallet(
     description = "Reactivate a suspended wallet. Admin only.",
     security(("bearer_auth" = [])),
     params(
-        ("wallet_id" = String, Path, description = "Wallet UUID"),
-        ("Idempotency-Key" = String, Header, description = "A UUID naming this user action; reuse it on every retry"),
+        ("wallet_id" = String, Path, format = "uuid", description = "Wallet UUID"),
+        ("Idempotency-Key" = String, Header, format = "uuid", description = "A UUID naming this user action; reuse it on every retry"),
     ),
     responses(
         (status = 200, description = "Wallet activated", body = WalletStatusChangeResponse),
@@ -303,7 +305,7 @@ pub async fn activate_wallet(
         StatusCode::OK,
         &WalletStatusChangeResponse {
             wallet_id,
-            new_status: "active".to_string(),
+            new_status: WalletStatus::Active,
         },
     )
     .await

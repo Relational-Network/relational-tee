@@ -27,22 +27,12 @@ const ABANDONED_AFTER: chrono::Duration = chrono::Duration::minutes(10);
 const POINTER_ATTEMPTS: u32 = 4;
 
 /// Wallet lifecycle status.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum WalletStatus {
     Active,
     Suspended,
     Deleted,
-}
-
-impl WalletStatus {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            WalletStatus::Active => "active",
-            WalletStatus::Suspended => "suspended",
-            WalletStatus::Deleted => "deleted",
-        }
-    }
 }
 
 /// The wallet document.
@@ -63,7 +53,7 @@ pub struct WalletResponse {
     pub wallet_id: String,
     pub public_address: String,
     pub created_at: DateTime<Utc>,
-    pub status: String,
+    pub status: WalletStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
 }
@@ -74,7 +64,7 @@ impl From<WalletMetadata> for WalletResponse {
             wallet_id: m.wallet_id,
             public_address: m.public_address,
             created_at: m.created_at,
-            status: m.status.as_str().to_string(),
+            status: m.status,
             label: m.label,
         }
     }

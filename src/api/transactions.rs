@@ -63,7 +63,8 @@ pub struct EstimateFeeResponse {
 pub struct SendTransactionRequest {
     /// Recipient Solana address (base58).
     pub recipient: String,
-    /// Amount in lamports (for native SOL).
+    /// Amount in lamports for native SOL, or in the token's smallest units.
+    #[schema(minimum = 1)]
     pub amount: u64,
     /// Token type: `"native"` or `"spl:{mint_address}"`. Default: `"native"`.
     #[serde(default = "default_token")]
@@ -90,10 +91,12 @@ pub struct SendTransactionResponse {
 
 /// Query params for listing transactions.
 #[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct ListTransactionsQuery {
     /// `next_cursor` from the previous page: the last signature it showed.
     pub cursor: Option<String>,
-    /// Max items per page (default 20, max 100).
+    /// Max items per page (default 20). Values above 100 count as 100.
+    #[param(minimum = 1, maximum = 100)]
     pub limit: Option<usize>,
 }
 
@@ -125,7 +128,7 @@ pub struct TransactionStatusResponse {
     description = "Estimate the network fee for a SOL transfer.",
     security(("bearer_auth" = [])),
     params(
-        ("wallet_id" = String, Path, description = "Wallet UUID"),
+        ("wallet_id" = String, Path, format = "uuid", description = "Wallet UUID"),
     ),
     request_body = EstimateFeeRequest,
     responses(
@@ -177,17 +180,17 @@ pub async fn estimate_fee(
     description = "Sign a transfer with the wallet's private key (inside the worker) and broadcast to Solana. Idempotent: retries with the same Idempotency-Key send one transfer.",
     security(("bearer_auth" = [])),
     params(
-        ("wallet_id" = String, Path, description = "Wallet UUID"),
-        ("Idempotency-Key" = String, Header, description = "A UUID naming this user action; reuse it on every retry"),
+        ("wallet_id" = String, Path, format = "uuid", description = "Wallet UUID"),
+        ("Idempotency-Key" = String, Header, format = "uuid", description = "A UUID naming this user action; reuse it on every retry"),
     ),
     request_body = SendTransactionRequest,
     responses(
         (status = 200, description = "Transaction sent", body = SendTransactionResponse),
-        (status = 400, description = "Invalid request, no Idempotency-Key, or Solana refused the transaction (`transaction_rejected`)"),
+        (status = 400, description = "An amount of zero, an invalid token, no Idempotency-Key, or Solana refused the transaction (`transaction_rejected`)"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden"),
         (status = 404, description = "Wallet not found"),
-        (status = 422, description = "Invalid address or amount, or the Idempotency-Key was used for a different request"),
+        (status = 422, description = "An invalid recipient address, or the Idempotency-Key was used for a different request"),
         (status = 503, description = "RPC unavailable"),
     )
 )]
@@ -273,7 +276,7 @@ pub async fn send_transaction(
     description = "The wallet's history, read from Solana, newest first. The cursor is the last signature of the previous page.",
     security(("bearer_auth" = [])),
     params(
-        ("wallet_id" = String, Path, description = "Wallet UUID"),
+        ("wallet_id" = String, Path, format = "uuid", description = "Wallet UUID"),
         ListTransactionsQuery,
     ),
     responses(
@@ -325,7 +328,7 @@ pub async fn list_transactions(
     description = "One transaction that touches the wallet, read from Solana by its signature.",
     security(("bearer_auth" = [])),
     params(
-        ("wallet_id" = String, Path, description = "Wallet UUID"),
+        ("wallet_id" = String, Path, format = "uuid", description = "Wallet UUID"),
         ("signature" = String, Path, description = "Transaction signature (base58)"),
     ),
     responses(

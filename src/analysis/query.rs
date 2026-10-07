@@ -72,7 +72,6 @@ pub enum Mode {
 #[serde(deny_unknown_fields)]
 pub struct SortRequest {
     pub field: String,
-    #[schema(value_type = String, example = "desc")]
     pub direction: Direction,
 }
 

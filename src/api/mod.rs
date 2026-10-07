@@ -53,11 +53,14 @@ fn default_page_limit() -> usize {
 /// `cursor` to get the next page. A cursor is the key of the last item
 /// shown, so any worker continues it.
 #[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct CursorQuery {
     /// `next_cursor` from the previous page; omit for the first page.
     pub cursor: Option<String>,
-    /// Maximum number of items to return (default 50, max 200).
+    /// Maximum number of items to return (default 50). Values above 200
+    /// count as 200.
     #[serde(default = "default_page_limit")]
+    #[param(minimum = 1, maximum = 200)]
     pub limit: usize,
 }
 

@@ -43,8 +43,9 @@ impl PoolKind {
     }
 }
 
-/// Pool lifecycle state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Pool lifecycle state: `needs_init` until the initial upload, then `ready`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
 pub enum PoolState {
     NeedsInit,
     Ready,

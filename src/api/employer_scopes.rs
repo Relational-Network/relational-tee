@@ -513,7 +513,7 @@ pub async fn get_employer_scopes(
     description = "Replace the whole mapping, and keep it as a new version. `version` is the version the edit started from; if another replacement came first, this one is refused with 409, so read the mapping again. Names are matched exactly as the data holds them. A mapping that already holds these entries is returned unchanged. Admin only.",
     security(("bearer_auth" = [])),
     params(
-        ("Idempotency-Key" = String, Header, description = "A UUID naming this user action; reuse it on every retry"),
+        ("Idempotency-Key" = String, Header, format = "uuid", description = "A UUID naming this user action; reuse it on every retry"),
     ),
     request_body = ReplaceEmployerScopesRequest,
     responses(
@@ -696,7 +696,7 @@ pub async fn list_scope_versions(
     description = "The mapping as a replacement made it. Admin only.",
     security(("bearer_auth" = [])),
     params(
-        ("version" = u64, Path, description = "The version, from 1"),
+        ("version" = u64, Path, minimum = 1, description = "The version, from 1"),
     ),
     responses(
         (status = 200, description = "The version", body = EmployerScopes),

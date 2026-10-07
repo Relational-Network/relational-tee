@@ -25,7 +25,7 @@ use crate::auth::{Caller, Permission};
 use crate::blockchain::drt::accounts::fetch_pool;
 use crate::error::ApiError;
 use crate::state::AppState;
-use crate::storage::pools::Upload;
+use crate::storage::pools::{PoolState, Upload};
 
 use super::parse_pda;
 
@@ -68,7 +68,7 @@ pub struct PoolSummaryResponse {
     /// before analyses.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub analysis: Option<crate::storage::pools::AnalysisRef>,
-    pub state: String,
+    pub state: PoolState,
     /// Total CSV rows that have been uploaded into this pool across all
     /// initialize + issue calls.
     pub total_rows: u64,
@@ -116,7 +116,7 @@ pub struct MarketplacePoolEntry {
     pub kind: String,
     pub owner: String,
     pub schema_id: String,
-    pub state: String,
+    pub state: PoolState,
     pub total_rows: u64,
     pub revoked_count: u64,
     pub created_at: String,
@@ -136,6 +136,7 @@ pub struct AllPoolsResponse {
 
 /// Query parameters for the list-all-pools endpoint.
 #[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct ListAllPoolsQuery {
     /// Filter by pool state: `ready` or `needs_init`.
     #[serde(default)]
@@ -146,8 +147,9 @@ pub struct ListAllPoolsQuery {
     /// Sort order: `created_desc` (default), `created_asc`, `name_asc`, `credentials_desc`.
     #[serde(default = "default_sort")]
     pub sort: String,
-    /// Page size (default 50, max 100).
+    /// Page size (default 50). Values above 100 count as 100.
     #[serde(default = "default_limit")]
+    #[param(minimum = 1, maximum = 100)]
     pub limit: usize,
     /// `next_cursor` from the previous page.
     #[serde(default)]
@@ -190,7 +192,7 @@ pub struct IssuanceLogResponse {
     path = "/v1/drt/pools/{pool_pda}/revocations",
     tag = "Credentials",
     summary = "List revocations",
-    description = "List a pool's revocations in credential ID order, one cursor page at a time. Admin only.",
+    description = "List a pool's revocations in credential ID order, one cursor page at a time. Needs `pools:read`.",
     security(("bearer_auth" = [])),
     params(
         ("pool_pda" = String, Path, description = "Pool PDA address (base58)"),
@@ -200,6 +202,7 @@ pub struct IssuanceLogResponse {
         (status = 200, description = "Revocation list", body = RevocationsResponse),
         (status = 400, description = "Invalid cursor"),
         (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Needs pools:read"),
         (status = 404, description = "Pool not found"),
     )
 )]
@@ -248,8 +251,11 @@ pub async fn list_revocations(
     ),
     responses(
         (status = 200, description = "Pool summary", body = PoolSummaryResponse),
+        (status = 400, description = "Invalid pool PDA address"),
         (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Needs pools:read"),
         (status = 404, description = "Pool not found"),
+        (status = 503, description = "Solana RPC unavailable (`rpc_unavailable`)"),
     )
 )]
 pub async fn pool_summary(
@@ -283,7 +289,7 @@ pub async fn pool_summary(
 
     let totals = doc.totals();
     Ok(Json(PoolSummaryResponse {
-        state: doc.state().as_str().to_string(),
+        state: doc.state(),
         initialized_at: doc.initial.as_ref().map(|u| u.uploaded_at.to_rfc3339()),
         pool_pda: pool_pda_str,
         pool_name: doc.pool_name,
@@ -326,8 +332,8 @@ pub async fn list_all_pools(
     let search = query.search.as_deref().map(str::to_lowercase);
     let mut entries: Vec<MarketplacePoolEntry> = Vec::new();
     for doc in state.storage.pools().all().await? {
-        let state_str = doc.state().as_str();
-        if query.state.as_deref().is_some_and(|s| s != state_str) {
+        let state = doc.state();
+        if query.state.as_deref().is_some_and(|s| s != state.as_str()) {
             continue;
         }
         if search
@@ -352,7 +358,7 @@ pub async fn list_all_pools(
         entries.push(MarketplacePoolEntry {
             kind: doc.kind.as_str().to_string(),
             owner: doc.owner_pubkey.clone(),
-            state: state_str.to_string(),
+            state,
             total_rows: totals.rows,
             revoked_count: totals.revoked,
             created_at: doc.created_at.to_rfc3339(),
@@ -399,7 +405,7 @@ pub async fn list_all_pools(
     path = "/v1/drt/pools/{pool_pda}/issuance-log",
     tag = "Credentials",
     summary = "Pool issuance log",
-    description = "A pool's uploads (initialisation and issuances, with each burn's signature), newest first, one cursor page at a time. Admin only.",
+    description = "A pool's uploads (initialisation and issuances, with each burn's signature), newest first, one cursor page at a time. Needs `pools:read`.",
     security(("bearer_auth" = [])),
     params(
         ("pool_pda" = String, Path, description = "Pool PDA address (base58)"),
@@ -409,6 +415,7 @@ pub async fn list_all_pools(
         (status = 200, description = "Issuance log", body = IssuanceLogResponse),
         (status = 400, description = "Invalid cursor"),
         (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Needs pools:read"),
         (status = 404, description = "Pool not found"),
     )
 )]
