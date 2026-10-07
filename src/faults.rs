@@ -322,9 +322,8 @@ impl Suite {
         )
     }
 
-    /// The pool's unburned append DRTs, read from Solana: the summary's
-    /// `remaining_supply` falls back to the original supply when its RPC
-    /// call fails.
+    /// The pool's unburned append DRTs, read from Solana by the suite itself
+    /// rather than through the workers it checks.
     async fn remaining(&self, pool: &str) -> Result<u64, String> {
         self.remaining_of(pool, "append").await
     }

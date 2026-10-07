@@ -92,20 +92,18 @@ pub struct DrtConfigResponseCompact {
     pub drt_type: String,
     /// Total tokens minted at registration (the original supply).
     pub supply: u64,
-    /// Tokens still in circulation (i.e. not yet burned/redeemed).
-    /// Best-effort: if the SPL RPC call fails this falls back to `supply`.
+    /// Tokens not yet burned: the mint's supply on Solana.
     pub remaining_supply: u64,
     pub mint: String,
 }
 
-/// DRT entry for marketplace listing (compact, no mint/hash details).
+/// DRT entry for marketplace listing (compact, no mint/hash details). The
+/// pool's summary has each DRT's remaining supply.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct MarketplaceDrtEntry {
     pub drt_type: String,
     /// Total tokens minted at registration.
     pub supply: u64,
-    /// Tokens still in circulation. Best-effort RPC lookup.
-    pub remaining_supply: u64,
 }
 
 /// Pool entry for the marketplace "browse all" listing.
@@ -134,19 +132,36 @@ pub struct AllPoolsResponse {
     pub next_cursor: Option<String>,
 }
 
+/// The pool list's order.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PoolSort {
+    /// Newest first.
+    #[default]
+    CreatedDesc,
+    /// Oldest first.
+    CreatedAsc,
+    /// By name, case-insensitively.
+    NameAsc,
+    /// Most uploaded rows first.
+    CredentialsDesc,
+}
+
 /// Query parameters for the list-all-pools endpoint.
 #[derive(Debug, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct ListAllPoolsQuery {
-    /// Filter by pool state: `ready` or `needs_init`.
+    /// Only the pools in this state.
     #[serde(default)]
-    pub state: Option<String>,
+    #[param(inline)]
+    pub state: Option<PoolState>,
     /// Case-insensitive search on pool name.
     #[serde(default)]
     pub search: Option<String>,
-    /// Sort order: `created_desc` (default), `created_asc`, `name_asc`, `credentials_desc`.
-    #[serde(default = "default_sort")]
-    pub sort: String,
+    /// The order: newest first by default.
+    #[serde(default)]
+    #[param(inline)]
+    pub sort: PoolSort,
     /// Page size (default 50). Values above 100 count as 100.
     #[serde(default = "default_limit")]
     #[param(minimum = 1, maximum = 100)]
@@ -154,10 +169,6 @@ pub struct ListAllPoolsQuery {
     /// `next_cursor` from the previous page.
     #[serde(default)]
     pub cursor: Option<String>,
-}
-
-fn default_sort() -> String {
-    "created_desc".to_string()
 }
 
 /// Single upload in the issuance log: the initialisation or an issuance.
@@ -244,7 +255,7 @@ pub async fn list_revocations(
     path = "/v1/drt/pools/{pool_pda}/summary",
     tag = "Credentials",
     summary = "Pool summary",
-    description = "Combined view of the pool's document (who created it, with the creation signature; totals) and its on-chain DRT state.",
+    description = "Combined view of the pool's document (who created it, with the creation signature; totals) and its on-chain state: the owner, and each DRT's remaining supply, read from its mint. When Solana can't be read, the summary is `503 rpc_unavailable`, which a client retries. Needs `pools:read`.",
     security(("bearer_auth" = [])),
     params(
         ("pool_pda" = String, Path, description = "Pool PDA address (base58)"),
@@ -268,17 +279,24 @@ pub async fn pool_summary(
     let doc = load_pool(&state, &pool_pda_str).await?;
     let pool = fetch_pool(state.solana_client.rpc(), &pool_pda).await?;
 
-    // `remaining_supply` is a best-effort RPC lookup that falls back to the
-    // recorded supply.
     let mut drts: Vec<DrtConfigResponseCompact> = Vec::with_capacity(doc.drts.len());
     for (name, d) in doc.drts.iter() {
-        let remaining_supply = match Pubkey::from_str(&d.mint) {
-            Ok(mint_pk) => match state.solana_client.rpc().get_token_supply(&mint_pk).await {
-                Ok(amt) => amt.amount.parse::<u64>().unwrap_or(d.supply),
-                Err(_) => d.supply,
-            },
-            Err(_) => d.supply,
-        };
+        let mint = Pubkey::from_str(&d.mint).map_err(|_| {
+            ApiError::internal(format!("the pool's {name} mint isn't an address"))
+                .with_code("integrity_error")
+        })?;
+        let supply = state
+            .solana_client
+            .rpc()
+            .get_token_supply(&mint)
+            .await
+            .map_err(|e| ApiError::rpc_unavailable(format!("reading the {name} supply: {e}")))?;
+        let remaining_supply = supply.amount.parse::<u64>().map_err(|_| {
+            ApiError::internal(format!(
+                "Solana gave the {name} mint a supply that isn't a number: {}",
+                supply.amount
+            ))
+        })?;
         drts.push(DrtConfigResponseCompact {
             drt_type: name.clone(),
             supply: d.supply,
@@ -320,7 +338,7 @@ pub async fn pool_summary(
     params(ListAllPoolsQuery),
     responses(
         (status = 200, description = "Pool list", body = AllPoolsResponse),
-        (status = 400, description = "Invalid cursor"),
+        (status = 400, description = "Invalid cursor, state or sort"),
         (status = 401, description = "Unauthorized"),
     )
 )]
@@ -333,7 +351,7 @@ pub async fn list_all_pools(
     let mut entries: Vec<MarketplacePoolEntry> = Vec::new();
     for doc in state.storage.pools().all().await? {
         let state = doc.state();
-        if query.state.as_deref().is_some_and(|s| s != state.as_str()) {
+        if query.state.is_some_and(|s| s != state) {
             continue;
         }
         if search
@@ -344,15 +362,12 @@ pub async fn list_all_pools(
         }
 
         let totals = doc.totals();
-        // `remaining_supply == supply` keeps this listing off the RPC; the
-        // per-pool summary looks up the live remaining supply.
         let pool_drts: Vec<MarketplaceDrtEntry> = doc
             .drts
             .iter()
             .map(|(name, d)| MarketplaceDrtEntry {
                 drt_type: name.clone(),
                 supply: d.supply,
-                remaining_supply: d.supply,
             })
             .collect();
         entries.push(MarketplacePoolEntry {
@@ -371,19 +386,19 @@ pub async fn list_all_pools(
     }
 
     // Sort, with the PDA as a tiebreaker so pages are stable.
-    match query.sort.as_str() {
-        "created_asc" => entries.sort_by(|a, b| {
+    match query.sort {
+        PoolSort::CreatedAsc => entries.sort_by(|a, b| {
             (a.created_at.as_str(), a.pool_pda.as_str()).cmp(&(&b.created_at, &b.pool_pda))
         }),
-        "name_asc" => entries.sort_by(|a, b| {
+        PoolSort::NameAsc => entries.sort_by(|a, b| {
             (a.pool_name.to_lowercase(), &a.pool_pda)
                 .cmp(&(b.pool_name.to_lowercase(), &b.pool_pda))
         }),
-        "credentials_desc" => entries.sort_by(|a, b| {
+        PoolSort::CredentialsDesc => entries.sort_by(|a, b| {
             (std::cmp::Reverse(a.total_rows), &a.pool_pda)
                 .cmp(&(std::cmp::Reverse(b.total_rows), &b.pool_pda))
         }),
-        _ => entries.sort_by(|a, b| {
+        PoolSort::CreatedDesc => entries.sort_by(|a, b| {
             (b.created_at.as_str(), b.pool_pda.as_str()).cmp(&(&a.created_at, &a.pool_pda))
         }),
     }

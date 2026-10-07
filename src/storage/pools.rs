@@ -51,15 +51,6 @@ pub enum PoolState {
     Ready,
 }
 
-impl PoolState {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            PoolState::NeedsInit => "needs_init",
-            PoolState::Ready => "ready",
-        }
-    }
-}
-
 /// Per-DRT bookkeeping, mirroring what `register_drt` put on-chain, so pool
 /// pages render without calling the chain.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

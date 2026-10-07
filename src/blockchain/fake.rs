@@ -28,6 +28,9 @@ pub struct FakeChain {
     pub accounts: Mutex<Vec<Pubkey>>,
     /// Accounts with data, which `getAccountInfo` returns.
     pub data: Mutex<Vec<(Pubkey, Vec<u8>)>>,
+    /// Mints' supplies, which `getTokenSupply` returns; for any other mint
+    /// it answers with an error.
+    pub supplies: Mutex<Vec<(Pubkey, u64)>>,
     /// Finalized transactions, and whether each succeeded.
     pub landed: Mutex<Vec<(String, bool)>>,
     /// `getSignaturesForAddress`'s answer, newest first.
@@ -95,6 +98,27 @@ impl FakeChain {
                             "confirmationStatus": "finalized" })
                     });
                 context(json!([status]))
+            }
+            "getTokenSupply" => {
+                let mint = params[0].as_str().unwrap();
+                let supply = self
+                    .supplies
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|(m, _)| m.to_string() == mint)
+                    .map(|(_, supply)| *supply);
+                let Some(supply) = supply else {
+                    return Err(json!({
+                        "code": -32602,
+                        "message": "Invalid param: could not find account",
+                    }));
+                };
+                context(json!({
+                    "amount": supply.to_string(),
+                    "decimals": 0,
+                    "uiAmountString": supply.to_string(),
+                }))
             }
             "getSignaturesForAddress" => Value::Array(self.history.lock().unwrap().clone()),
             "getBlockHeight" => json!(self.block_height.load(Ordering::SeqCst)),

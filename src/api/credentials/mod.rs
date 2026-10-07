@@ -666,6 +666,113 @@ pub(crate) mod tests {
         assert_eq!(seen, ["P0", "P1", "P2", "P3", "P4"]);
     }
 
+    #[tokio::test]
+    async fn the_list_filters_by_state_sorts_and_refuses_values_it_does_not_know() {
+        let worker = worker();
+        let owner = worker.admin("oid-admin").await;
+        let ready = worker
+            .pool(&owner, Some(initial_upload(&owner.user_id)))
+            .await;
+        let fresh = worker.pool(&owner, None).await;
+        let list = |query: &str| {
+            let request = Request::get(format!("/v1/drt/pools/list?{query}"))
+                .header(header::AUTHORIZATION, format!("Bearer {}", owner.token))
+                .body(Body::empty())
+                .unwrap();
+            let app = worker.app.clone();
+            async move { send(&app, request).await }
+        };
+        let pools = |body: &Value| -> Vec<String> {
+            body["pools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p["pool_pda"].as_str().unwrap().to_string())
+                .collect()
+        };
+
+        let (status, _, body) = list("state=ready").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(pools(&body), [ready.to_string()]);
+        assert_eq!(body["pools"][0]["state"], "ready");
+        assert_eq!(
+            body["pools"][0]["drts"][0],
+            json!({ "drt_type": APPEND_DRT_NAME, "supply": 5 })
+        );
+        let (_, _, body) = list("state=needs_init").await;
+        assert_eq!(pools(&body), [fresh.to_string()]);
+        let (_, _, body) = list("sort=credentials_desc").await;
+        assert_eq!(pools(&body), [ready.to_string(), fresh.to_string()]);
+
+        for query in ["state=open", "sort=newest"] {
+            let (status, _, body) = list(query).await;
+            assert_eq!(
+                (status, body["code"].as_str()),
+                (StatusCode::BAD_REQUEST, Some("bad_request")),
+                "{query}: {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_summary_reads_each_drts_remaining_supply_from_solana() {
+        let worker = worker();
+        let owner = worker.admin("oid-admin").await;
+        let pool_pda = worker.pool(&owner, None).await;
+        let summary = || {
+            let request = Request::get(format!("/v1/drt/pools/{pool_pda}/summary"))
+                .header(header::AUTHORIZATION, format!("Bearer {}", owner.token))
+                .body(Body::empty())
+                .unwrap();
+            let app = worker.app.clone();
+            async move { send(&app, request).await }
+        };
+
+        // While Solana can't give the mint's supply, the summary is
+        // unavailable rather than showing the minted supply as remaining.
+        let (status, _, body) = summary().await;
+        assert_eq!(
+            (status, body["code"].as_str()),
+            (StatusCode::SERVICE_UNAVAILABLE, Some("rpc_unavailable")),
+            "{body}"
+        );
+
+        // Two of the five append DRTs have been burned.
+        worker
+            .chain
+            .supplies
+            .lock()
+            .unwrap()
+            .push((append_mint(&pool_pda), 3));
+        let (status, _, body) = summary().await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            (
+                &body["drts"][0]["supply"],
+                &body["drts"][0]["remaining_supply"]
+            ),
+            (&json!(5), &json!(3))
+        );
+
+        // A mint in the pool's document that isn't an address is an
+        // integrity failure.
+        worker
+            .storage
+            .pools()
+            .update::<ApiError>(&pool_pda.to_string(), |doc| {
+                doc.drts.get_mut(APPEND_DRT_NAME).unwrap().mint = "not-a-mint".into();
+                Ok(Change::Changed)
+            })
+            .await
+            .unwrap();
+        let (status, _, body) = summary().await;
+        assert_eq!(
+            (status, body["code"].as_str()),
+            (StatusCode::INTERNAL_SERVER_ERROR, Some("integrity_error")),
+            "{body}"
+        );
+    }
+
     /// `rows` synthetic rows of the Awards Report's columns, with made-up
     /// values at the lengths a real export has.
     fn awards_scale_csv(rows: usize) -> String {
