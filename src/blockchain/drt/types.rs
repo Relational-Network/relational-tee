@@ -36,8 +36,8 @@ pub const APPEND_DRT_NAME: &str = "append";
 // ── Discriminators re-exported from idl_generated ───────────────
 
 pub use super::idl_generated::{
-    DISC_CREATE_POOL, DISC_DRT_CONFIG_ACCOUNT, DISC_GRANT_RIGHT, DISC_POOL_ACCOUNT,
-    DISC_REGISTER_DRT, DISC_REVOKE_GRANT, DISC_SEAL_POOL,
+    DISC_CREATE_POOL, DISC_GRANT_RIGHT, DISC_POOL_ACCOUNT, DISC_REGISTER_DRT, DISC_REVOKE_GRANT,
+    DISC_SEAL_POOL,
 };
 
 // ── Limits ──────────────────────────────────────────────────────
@@ -64,7 +64,9 @@ pub struct Pool {
     pub bump: u8,
 }
 
-/// On-chain `DrtConfig` account.
+/// On-chain `DrtConfig` account, which only tests and `just grant-guard`
+/// read.
+#[cfg(test)]
 #[derive(Debug, Clone, BorshDeserialize, BorshSerialize)]
 pub struct DrtConfig {
     pub pool: Pubkey,
@@ -135,27 +137,4 @@ pub struct CreatePoolResponse {
     pub right_ids: BTreeMap<String, String>,
     /// Solana Explorer URL for the final signature.
     pub explorer_url: String,
-}
-
-/// API view of a DrtConfig.
-#[derive(Debug, Serialize, ToSchema)]
-pub struct DrtConfigResponse {
-    pub name: String,
-    pub right_id: String,
-    pub mint: String,
-    pub supply: u64,
-    pub code_repo_url: String,
-    pub code_hash: String,
-}
-
-/// API view of a Pool.
-#[derive(Debug, Serialize, ToSchema)]
-pub struct PoolInfoResponse {
-    pub pool_pda: String,
-    pub pool_uuid: String,
-    pub name: String,
-    pub kind: String,
-    pub owner: String,
-    pub sealed: bool,
-    pub drts: Vec<DrtConfigResponse>,
 }

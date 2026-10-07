@@ -232,13 +232,6 @@ pub fn drt_router() -> Router<AppState> {
     Router::new()
         // ── Atomic create (new contract) ─────────────────────────
         .route("/v1/drt/pools/malta", post(pools::create_malta_pool))
-        // ── Pool info ────────────────────────────────────────────
-        .route("/v1/drt/pools/{pool_pda}", get(pools::get_pool))
-        // ── On-chain DRT inspection ──────────────────────────────
-        .route(
-            "/v1/drt/pools/{pool_pda}/drt/{drt_name}",
-            get(pools::get_drt),
-        )
         // ── Schema, from the pool's analysis ─────────────────────
         .route(
             "/v1/drt/pools/{pool_pda}/schema",
@@ -261,10 +254,6 @@ pub fn drt_router() -> Router<AppState> {
             "/v1/drt/pools/{pool_pda}/issuance-log",
             get(credentials::reads::get_issuance_log),
         )
-        .route(
-            "/v1/drt/pools/by-wallet/{wallet_id}",
-            get(credentials::reads::list_pools_by_wallet),
-        )
         // ── Analyst grants ───────────────────────────────────────
         .route(
             "/v1/drt/pools/{pool_pda}/grant",
@@ -283,11 +272,11 @@ pub fn drt_router() -> Router<AppState> {
         )
         .route(
             "/v1/drt/pools/{pool_pda}/analyses/{analysis_id}/options",
-            get(analyses::get_options).post(analyses::filtered_options),
+            post(analyses::filtered_options),
         )
         .route(
             "/v1/drt/pools/{pool_pda}/analyses/{analysis_id}/options/{filter}",
-            get(analyses::search_values).post(analyses::filtered_search),
+            post(analyses::filtered_search),
         )
         .route(
             "/v1/drt/pools/{pool_pda}/analyses/{analysis_id}/query",

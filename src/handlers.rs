@@ -1,68 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Relational Network
 
-//! HTTP request handlers for the enclave API.
-//!
-//! This module contains handlers for:
-//! - Admin endpoints (require admin role)
-//! - Opening and validating the sealed CSV uploads of the pool endpoints
+//! Opening and validating the sealed CSV uploads of the pool endpoints.
 
-use axum::{extract::Multipart, Json};
-use serde::Serialize;
-use tracing::info;
-use utoipa::ToSchema;
+use axum::extract::Multipart;
 
 use crate::auth::Caller;
 use crate::data_validation::{validate_csv_bytes, FieldSchema, ValidationSummary};
 use crate::error::ApiError;
 use crate::idempotency::Idempotent;
 use crate::seal::{self, SealedUpload, TransportKeys};
-
-// ============================================================================
-// Admin Endpoints
-// ============================================================================
-
-/// Response for admin status endpoint.
-#[derive(Debug, Serialize, ToSchema)]
-pub struct AdminStatusResponse {
-    pub status: String,
-    pub admin_user: String,
-    pub uptime_seconds: u64,
-}
-
-/// Admin-only status endpoint.
-///
-/// Returns enclave operational status. Requires admin role.
-#[utoipa::path(
-    get,
-    path = "/v1/admin/status",
-    tag = "Admin",
-    summary = "Admin status",
-    description = "Returns enclave status. Requires admin role.",
-    security(("bearer_auth" = [])),
-    responses(
-        (status = 200, description = "Status returned", body = AdminStatusResponse),
-        (status = 401, description = "Unauthorized - missing or invalid token"),
-        (status = 403, description = "Forbidden - admin role required")
-    )
-)]
-pub async fn admin_status(caller: Caller) -> Result<Json<AdminStatusResponse>, ApiError> {
-    caller.require_admin()?;
-    info!(admin_user = %caller.user_id, "Admin status requested");
-    let uptime_seconds = crate::STARTED_AT
-        .get()
-        .map(|t| t.elapsed().as_secs())
-        .unwrap_or(0);
-    Ok(Json(AdminStatusResponse {
-        status: "operational".to_string(),
-        admin_user: caller.user_id,
-        uptime_seconds,
-    }))
-}
-
-// ============================================================================
-// Sealed uploads
-// ============================================================================
 
 /// Read and open the sealed CSV of `caller`'s upload `request`.
 pub(crate) async fn open_sealed_csv(

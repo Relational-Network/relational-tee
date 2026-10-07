@@ -5,10 +5,8 @@
 //! active grant over the rows their employer scope allows.
 //!
 //! - `GET  …/analyses/{analysis_id}`                  — the analysis, and the caller's rows
-//! - `GET  …/analyses/{analysis_id}/options`          — filter options from the caller's rows
-//! - `POST …/analyses/{analysis_id}/options`          — the same, under the other filters
-//! - `GET  …/analyses/{analysis_id}/options/{filter}` — a search filter's values
-//! - `POST …/analyses/{analysis_id}/options/{filter}` — the same, under the other filters
+//! - `POST …/analyses/{analysis_id}/options`          — filter options, under the other filters
+//! - `POST …/analyses/{analysis_id}/options/{filter}` — a search filter's values, likewise
 //! - `POST …/analyses/{analysis_id}/query`            — a page of matching rows
 //!
 //! under `/v1/drt/pools/{pool_pda}`. The SQL is the pool's definition, read
@@ -21,7 +19,7 @@ use std::collections::BTreeMap;
 use std::time::Instant;
 
 use axum::body::Bytes;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap};
 use axum::Json;
 use chrono::Utc;
@@ -29,7 +27,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tracing::{error, warn};
-use utoipa::{IntoParams, ToSchema};
+use utoipa::ToSchema;
 
 use crate::analysis::definition::{ColumnType, Definition, FilterKind};
 use crate::analysis::query::{
@@ -129,17 +127,6 @@ pub struct OptionsRequest {
     /// other filters match, so its other values stay on offer.
     #[serde(default)]
     pub filters: BTreeMap<String, FilterRequest>,
-}
-
-/// Query for a search filter's values.
-#[derive(Debug, Deserialize, IntoParams)]
-#[serde(deny_unknown_fields)]
-pub struct SearchQuery {
-    /// The values' prefix, matched literally; empty for the first values.
-    #[serde(default)]
-    pub search: String,
-    /// How many values (default 20, max 100).
-    pub limit: Option<u32>,
 }
 
 /// A search filter's values under the filters a request sets.
@@ -439,43 +426,13 @@ pub async fn get_analysis(
     Ok(Json(summary(&doc, &analysis, &def, &scope)))
 }
 
-/// Each filter's options, from the caller's rows.
-#[utoipa::path(
-    get,
-    path = "/v1/drt/pools/{pool_pda}/analyses/{analysis_id}/options",
-    tag = "Analyses",
-    summary = "Filter options",
-    description = "The options of each filter but the searches, computed from the rows the caller sees only: the earliest and latest date of a date range, and each value of a multi-select with its row count. Recorded in the analysis log. Needs `analyses:run`, and for an analyst an active grant.",
-    security(("bearer_auth" = [])),
-    params(
-        ("pool_pda" = String, Path, description = "Pool PDA address (base58)"),
-        ("analysis_id" = String, Path, description = "The pool's analysis"),
-    ),
-    responses(
-        (status = 200, description = "The options", body = OptionsResponse),
-        (status = 401, description = "Unauthorized"),
-        (status = 403, description = "No active grant, or no employer scope"),
-        (status = 404, description = "Pool or analysis not found"),
-        (status = 503, description = "The worker is busy (`analysis_busy`, with Retry-After), or the analysis log is unavailable"),
-    )
-)]
-pub async fn get_options(
-    caller: Caller,
-    State(state): State<AppState>,
-    Path((pool_pda, analysis_id)): Path<(String, String)>,
-) -> Result<Json<OptionsResponse>, ApiError> {
-    options_for(&caller, &state, &pool_pda, &analysis_id, None)
-        .await
-        .map(Json)
-}
-
 /// Each filter's options, from the caller's rows the other filters match.
 #[utoipa::path(
     post,
     path = "/v1/drt/pools/{pool_pda}/analyses/{analysis_id}/options",
     tag = "Analyses",
-    summary = "Filter options under the other filters",
-    description = "As `GET`, but each filter's options come from the caller's rows that the request's other filters match, so they follow what a page shows: setting an award narrows the date range's bounds and the other filters' values, while the award filter's own values stay on offer. The filters are checked as a query's are. Read-only, so it needs no Idempotency-Key. Recorded in the analysis log. Needs `analyses:run`, and for an analyst an active grant.",
+    summary = "Filter options",
+    description = "The options of each filter but the searches, from the rows the caller sees only: the earliest and latest date of a date range, and each value of a multi-select with its row count. Each filter's options come from the rows that the request's other filters match, so they follow what a page shows: setting an award narrows the date range's bounds and the other filters' values, while the award filter's own values stay on offer. With no filters, they're the options of all the caller's rows. The filters are checked as a query's are. Read-only, so it needs no Idempotency-Key. Recorded in the analysis log. Needs `analyses:run`, and for an analyst an active grant.",
     security(("bearer_auth" = [])),
     params(
         ("pool_pda" = String, Path, description = "Pool PDA address (base58)"),
@@ -502,26 +459,22 @@ pub async fn filtered_options(
 ) -> Result<Json<OptionsResponse>, ApiError> {
     caller.require(Permission::AnalysesRun)?;
     require_json(&headers)?;
-    options_for(&caller, &state, &pool_pda, &analysis_id, Some(&body))
+    options_for(&caller, &state, &pool_pda, &analysis_id, &body)
         .await
         .map(Json)
 }
 
-/// The options routes' work: a `POST`'s `body` may set filters, and a `GET`
-/// sets none, so it gets the options the table was built with.
+/// The options route's work. A request that sets no filter gets the
+/// options the table was built with.
 async fn options_for(
     caller: &Caller,
     state: &AppState,
     pool_pda: &str,
     analysis_id: &str,
-    body: Option<&Bytes>,
+    body: &Bytes,
 ) -> Result<OptionsResponse, ApiError> {
-    caller.require(Permission::AnalysesRun)?;
     let (doc, analysis) = load(state, pool_pda, analysis_id).await?;
-    let asked = body.map_or_else(
-        || json!({}),
-        |b| serde_json::from_slice(b).unwrap_or(Value::Null),
-    );
+    let asked = serde_json::from_slice(body).unwrap_or(Value::Null);
     let mut logged = Logged::new(caller, &doc, &analysis, "options", asked);
     let result = async {
         let def = state
@@ -530,10 +483,7 @@ async fn options_for(
             .await?;
         let (grant, scope) = authorize(state, caller, &doc, &analysis, &def).await?;
         logged.record.grant_id = grant;
-        let request: OptionsRequest = match body {
-            Some(bytes) => parse(bytes)?,
-            None => OptionsRequest::default(),
-        };
+        let request: OptionsRequest = parse(body)?;
         let query = filters_only(&def, request.filters)?;
         let table = state
             .analyses
@@ -566,49 +516,14 @@ async fn options_for(
         .await
 }
 
-/// A search filter's values that start with `search`.
-#[utoipa::path(
-    get,
-    path = "/v1/drt/pools/{pool_pda}/analyses/{analysis_id}/options/{filter}",
-    tag = "Analyses",
-    summary = "Search a filter's values",
-    description = "The values of a search filter, such as a staff number, that start with `search`, in order, from the rows the caller sees only. Recorded in the analysis log. Needs `analyses:run`, and for an analyst an active grant.",
-    security(("bearer_auth" = [])),
-    params(
-        ("pool_pda" = String, Path, description = "Pool PDA address (base58)"),
-        ("analysis_id" = String, Path, description = "The pool's analysis"),
-        ("filter" = String, Path, description = "A search filter of the analysis"),
-        SearchQuery,
-    ),
-    responses(
-        (status = 200, description = "The values", body = SearchResponse),
-        (status = 400, description = "Not a search filter, or a search or limit out of range (`invalid_query`)"),
-        (status = 401, description = "Unauthorized"),
-        (status = 403, description = "No active grant, or no employer scope"),
-        (status = 404, description = "Pool or analysis not found"),
-        (status = 503, description = "The worker is busy (`analysis_busy`, with Retry-After), or the analysis log is unavailable"),
-    )
-)]
-pub async fn search_values(
-    caller: Caller,
-    State(state): State<AppState>,
-    Path((pool_pda, analysis_id, filter)): Path<(String, String, String)>,
-    Query(search): Query<SearchQuery>,
-) -> Result<Json<SearchResponse>, ApiError> {
-    let body = SearchBody::Query(search);
-    search_for(&caller, &state, &pool_pda, &analysis_id, filter, body)
-        .await
-        .map(Json)
-}
-
 /// A search filter's values that start with `search`, from the caller's
 /// rows the other filters match.
 #[utoipa::path(
     post,
     path = "/v1/drt/pools/{pool_pda}/analyses/{analysis_id}/options/{filter}",
     tag = "Analyses",
-    summary = "Search a filter's values under the other filters",
-    description = "As `GET`, but only from the caller's rows that the request's other filters match; the search filter's own selection is left out, so its other values stay on offer. The filters are checked as a query's are. Read-only, so it needs no Idempotency-Key. Recorded in the analysis log. Needs `analyses:run`, and for an analyst an active grant.",
+    summary = "Search a filter's values",
+    description = "The values of a search filter, such as a staff number, that start with `search`, in order, from the rows the caller sees that the request's other filters match; the search filter's own selection is left out, so its other values stay on offer. The filters are checked as a query's are. Read-only, so it needs no Idempotency-Key. Recorded in the analysis log. Needs `analyses:run`, and for an analyst an active grant.",
     security(("bearer_auth" = [])),
     params(
         ("pool_pda" = String, Path, description = "Pool PDA address (base58)"),
@@ -636,43 +551,27 @@ pub async fn filtered_search(
 ) -> Result<Json<SearchResponse>, ApiError> {
     caller.require(Permission::AnalysesRun)?;
     require_json(&headers)?;
-    let body = SearchBody::Json(&body);
-    search_for(&caller, &state, &pool_pda, &analysis_id, filter, body)
+    search_for(&caller, &state, &pool_pda, &analysis_id, filter, &body)
         .await
         .map(Json)
 }
 
-/// What a search was asked with: a `GET`'s query string, or a `POST`'s
-/// body, which may set filters.
-enum SearchBody<'a> {
-    Query(SearchQuery),
-    Json(&'a Bytes),
-}
-
-/// The search routes' work.
+/// The search route's work.
 async fn search_for(
     caller: &Caller,
     state: &AppState,
     pool_pda: &str,
     analysis_id: &str,
     filter: String,
-    body: SearchBody<'_>,
+    body: &Bytes,
 ) -> Result<SearchResponse, ApiError> {
-    caller.require(Permission::AnalysesRun)?;
     let (doc, analysis) = load(state, pool_pda, analysis_id).await?;
-    let asked = match &body {
-        SearchBody::Query(q) => json!({
-            "filter": filter,
-            "search": q.search,
-            "limit": q.limit.unwrap_or(DEFAULT_SEARCH_LIMIT),
-        }),
-        SearchBody::Json(bytes) => match serde_json::from_slice::<Value>(bytes) {
-            Ok(Value::Object(mut fields)) => {
-                fields.insert("filter".into(), json!(filter));
-                Value::Object(fields)
-            }
-            _ => json!({ "filter": filter }),
-        },
+    let asked = match serde_json::from_slice::<Value>(body) {
+        Ok(Value::Object(mut fields)) => {
+            fields.insert("filter".into(), json!(filter));
+            Value::Object(fields)
+        }
+        _ => json!({ "filter": filter }),
     };
     let mut logged = Logged::new(caller, &doc, &analysis, "search", asked);
     let result = async {
@@ -682,14 +581,7 @@ async fn search_for(
             .await?;
         let (grant, scope) = authorize(state, caller, &doc, &analysis, &def).await?;
         logged.record.grant_id = grant;
-        let request = match body {
-            SearchBody::Query(q) => SearchRequest {
-                search: q.search,
-                limit: q.limit,
-                filters: BTreeMap::new(),
-            },
-            SearchBody::Json(bytes) => parse(bytes)?,
-        };
+        let request: SearchRequest = parse(body)?;
         let query = filters_only(&def, request.filters)?;
         let limit = request.limit.unwrap_or(DEFAULT_SEARCH_LIMIT);
         let table = state
@@ -968,8 +860,11 @@ pub(crate) mod tests {
         assert_eq!(page["total_matched"], 5);
 
         // Options and searches come from the caller's rows only.
-        let (status, _, options) =
-            send(&worker.app, get(&format!("{base}/options"), &group_a)).await;
+        let (status, _, options) = send(
+            &worker.app,
+            post(&format!("{base}/options"), &group_a, &json!({})),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK, "{options}");
         assert_eq!(
             options["options"],
@@ -981,11 +876,12 @@ pub(crate) mod tests {
                 "exam_board_date": { "min": "01/01/2026", "max": "30/09/2026" },
             })
         );
-        let search = format!("{base}/options/staff_number?search=0&limit=5");
-        let (_, _, found) = send(&worker.app, get(&search, &group_a)).await;
+        let search = format!("{base}/options/staff_number");
+        let body = json!({ "search": "0", "limit": 5 });
+        let (_, _, found) = send(&worker.app, post(&search, &group_a, &body)).await;
         assert_eq!(found["values"], json!(["000123", "000124", "020001"]));
-        let search = format!("{base}/options/staff_number?search=03");
-        let (_, _, found) = send(&worker.app, get(&search, &group_a)).await;
+        let body = json!({ "search": "03" });
+        let (_, _, found) = send(&worker.app, post(&search, &group_a, &body)).await;
         assert_eq!(found["values"], json!([]));
 
         // The summary names the caller's rows.
@@ -1092,9 +988,6 @@ pub(crate) mod tests {
         let (status, _, found) = send(&worker.app, post(&search, &group_a, &body)).await;
         assert_eq!(status, StatusCode::OK, "{found}");
         assert_eq!(found["values"], json!(["000124"]));
-        let (_, _, unfiltered) = send(&worker.app, post(&options, &group_a, &json!({}))).await;
-        let (_, _, built) = send(&worker.app, get(&options, &group_a)).await;
-        assert_eq!(unfiltered, built);
 
         // The filters are checked as a query's are, and must be JSON.
         let scoped =
@@ -1271,21 +1164,18 @@ pub(crate) mod tests {
                 "{path}"
             );
         }
-        let (status, _, err) = send(
-            &worker.app,
-            get(&format!("{base}/options/award?search=C"), &granted),
-        )
-        .await;
-        assert_eq!(
-            (status, err["code"].as_str()),
-            (StatusCode::BAD_REQUEST, Some("invalid_query"))
-        );
-        let (status, _, _) = send(
-            &worker.app,
-            get(&format!("{base}/options/staff_number?scope=all"), &granted),
-        )
-        .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
+        for (filter, body) in [
+            ("award", json!({ "search": "C" })),
+            ("staff_number", json!({ "search": "0", "scope": "all" })),
+        ] {
+            let path = format!("{base}/options/{filter}");
+            let (status, _, err) = send(&worker.app, post(&path, &granted, &body)).await;
+            assert_eq!(
+                (status, err["code"].as_str()),
+                (StatusCode::BAD_REQUEST, Some("invalid_query")),
+                "{body}"
+            );
+        }
         let text = Request::post(&query)
             .header(header::AUTHORIZATION, format!("Bearer {granted}"))
             .header(header::CONTENT_TYPE, "text/plain")
@@ -1336,7 +1226,7 @@ pub(crate) mod tests {
         });
         assert_eq!(outcomes["no_grant"], 2);
         assert_eq!(outcomes["groups_overage"], 1);
-        assert_eq!(outcomes["invalid_query"], 6);
+        assert_eq!(outcomes["invalid_query"], 7);
         let override_attempt = log
             .iter()
             .find(|r| r.request.get("scope").is_some())

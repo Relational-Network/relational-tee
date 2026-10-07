@@ -34,10 +34,10 @@ fn event_for(method: &Method, route: &str) -> Option<&'static str> {
         ("POST", "/v1/drt/pools/{pool_pda}/grant") => "grant_created",
         ("POST", "/v1/drt/pools/{pool_pda}/revoke-grant") => "grant_revoked",
         ("POST", "/v1/drt/pools/{pool_pda}/analyses/{analysis_id}/query") => "analysis_queried",
-        ("GET" | "POST", "/v1/drt/pools/{pool_pda}/analyses/{analysis_id}/options") => {
+        ("POST", "/v1/drt/pools/{pool_pda}/analyses/{analysis_id}/options") => {
             "analysis_options_read"
         }
-        ("GET" | "POST", "/v1/drt/pools/{pool_pda}/analyses/{analysis_id}/options/{filter}") => {
+        ("POST", "/v1/drt/pools/{pool_pda}/analyses/{analysis_id}/options/{filter}") => {
             "analysis_values_searched"
         }
         ("POST", "/v1/wallets") => "wallet_created",
@@ -53,7 +53,6 @@ fn event_for(method: &Method, route: &str) -> Option<&'static str> {
             "admin_employer_scope_version_read"
         }
         ("GET", "/v1/admin/analysis-log") => "admin_analysis_log_read",
-        ("GET", "/v1/admin/status") => "admin_status_read",
         ("GET", "/v1/admin/wallet-stats") => "admin_wallet_stats_read",
         ("GET", "/v1/admin/wallets") => "admin_wallets_listed",
         ("GET", "/v1/users") => "admin_users_listed",

@@ -51,7 +51,6 @@ use axum::{
     Router,
 };
 use std::sync::Arc;
-use std::time::Instant;
 use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::{DefaultOnRequest, TraceLayer};
 use tracing::{info, warn, Level};
@@ -61,7 +60,6 @@ use utoipa_swagger_ui::SwaggerUi;
 
 use config::{KeyProviderConfig, ServerConfig, StorageConfig, Transport};
 
-use handlers::{admin_status, AdminStatusResponse};
 use health::{
     health, liveness, readiness, CanaryDetails, Certificate, CertificateDetails, HealthDetails,
     HealthResponse, ReadinessResponse, RpcDetails,
@@ -71,9 +69,6 @@ use tee::{AttestationProvider, KeyName, KeyProvider, WorkerKeys};
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
-
-/// Start time captured once for uptime reporting.
-static STARTED_AT: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 
 // ============================================================================
 // OpenAPI Documentation
@@ -109,7 +104,6 @@ An analysis shows admins every row. An analyst sees only the rows `/v1/admin/emp
         health::readiness,
         attestation::get_attestation,
         reference_values::get_reference_values,
-        handlers::admin_status,
         // Wallet API
         api::users::get_me,
         api::users::list_users,
@@ -134,8 +128,6 @@ An analysis shows admins every row. An analyst sees only the rows `/v1/admin/emp
         api::employer_scopes::get_scope_version,
         // DRT Pool API (new contract)
         api::pools::create_malta_pool,
-        api::pools::get_pool,
-        api::pools::get_drt,
         // Credential / Pool discovery API
         api::credentials::schema::get_schema,
         api::credentials::initialize::initialize_pool,
@@ -144,7 +136,6 @@ An analysis shows admins every row. An analyst sees only the rows `/v1/admin/emp
         api::credentials::reads::list_revocations,
         api::credentials::reads::pool_summary,
         api::credentials::reads::get_issuance_log,
-        api::credentials::reads::list_pools_by_wallet,
         api::credentials::reads::list_all_pools,
         // Analyst grants
         api::grants::grant_analysis,
@@ -153,9 +144,7 @@ An analysis shows admins every row. An analyst sees only the rows `/v1/admin/emp
         api::grants::my_analyses,
         // Analyses
         api::analyses::get_analysis,
-        api::analyses::get_options,
         api::analyses::filtered_options,
-        api::analyses::search_values,
         api::analyses::filtered_search,
         api::analyses::run_query,
     ),
@@ -166,7 +155,6 @@ An analysis shows admins every row. An analyst sees only the rows `/v1/admin/emp
         CertificateDetails,
         CanaryDetails,
         RpcDetails,
-        AdminStatusResponse,
         error::ErrorBody,
         attestation::AttestationResponse,
         data_validation::ValidationError,
@@ -220,8 +208,6 @@ An analysis shows admins every row. An analyst sees only the rows `/v1/admin/emp
         blockchain::drt::types::AnalysisRequest,
         blockchain::drt::types::CreateMaltaPoolRequest,
         blockchain::drt::types::CreatePoolResponse,
-        blockchain::drt::types::DrtConfigResponse,
-        blockchain::drt::types::PoolInfoResponse,
         // Credential schemas
         api::credentials::schema::GetSchemaResponse,
         storage::pools::AnalysisRef,
@@ -236,8 +222,6 @@ An analysis shows admins every row. An analyst sees only the rows `/v1/admin/emp
         api::credentials::reads::RevocationsResponse,
         api::credentials::reads::PoolSummaryResponse,
         api::credentials::reads::DrtConfigResponseCompact,
-        api::credentials::reads::PoolListEntry,
-        api::credentials::reads::PoolsByWalletResponse,
         api::credentials::reads::MarketplaceDrtEntry,
         api::credentials::reads::MarketplacePoolEntry,
         api::credentials::reads::AllPoolsResponse,
@@ -485,9 +469,6 @@ async fn main() {
         std::process::exit(code);
     }
 
-    // Capture process start for uptime reporting.
-    let _ = STARTED_AT.set(Instant::now());
-
     let server_config = ServerConfig::from_env().unwrap_or_else(|e| {
         tracing::error!("Invalid configuration: {e}");
         std::process::exit(2);
@@ -689,7 +670,6 @@ fn router(state: AppState) -> Router {
             "/v1/reference-values",
             get(reference_values::get_reference_values),
         )
-        .route("/v1/admin/status", get(admin_status))
         // Wallet service routes.
         .merge(api::wallet_router())
         // DRT pool routes.
@@ -1055,7 +1035,6 @@ mod tests {
             "/health/ready",
             "/v1/attestation",
             "/v1/reference-values",
-            "/v1/admin/status",
             "/v1/admin/analysis-log",
             "/v1/admin/employer-scopes",
             "/v1/admin/employer-scopes/check",
@@ -1075,15 +1054,12 @@ mod tests {
             "/v1/wallets/{wallet_id}/transactions",
             "/v1/wallets/{wallet_id}/transactions/{signature}",
             "/v1/drt/me/analyses",
-            "/v1/drt/pools/by-wallet/{wallet_id}",
             "/v1/drt/pools/list",
             "/v1/drt/pools/malta",
-            "/v1/drt/pools/{pool_pda}",
             "/v1/drt/pools/{pool_pda}/analyses/{analysis_id}",
             "/v1/drt/pools/{pool_pda}/analyses/{analysis_id}/options",
             "/v1/drt/pools/{pool_pda}/analyses/{analysis_id}/options/{filter}",
             "/v1/drt/pools/{pool_pda}/analyses/{analysis_id}/query",
-            "/v1/drt/pools/{pool_pda}/drt/{drt_name}",
             "/v1/drt/pools/{pool_pda}/grant",
             "/v1/drt/pools/{pool_pda}/grants",
             "/v1/drt/pools/{pool_pda}/initialize",

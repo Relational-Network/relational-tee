@@ -3,15 +3,9 @@
 
 //! DRT pool API handlers (new `digital_rights_tokens` contract).
 //!
-//! - `POST /v1/drt/pools/malta`        — atomic create (pool + its analysis)
-//! - `GET  /v1/drt/pools/{pool_pda}`   — pool info (chain + enclave metadata)
+//! - `POST /v1/drt/pools/malta` — atomic create (pool + its analysis)
 
-use axum::{
-    extract::{Path, State},
-    http::StatusCode,
-    response::Response,
-    Json,
-};
+use axum::{extract::State, http::StatusCode, response::Response};
 use solana_instruction::Instruction;
 use solana_keypair::Keypair;
 use solana_message::Message;
@@ -29,11 +23,10 @@ use sha2::{Digest, Sha256};
 use crate::analysis::definition::Definition;
 use crate::analysis::fetch::{check_url, FetchError};
 use crate::blockchain::drt::{
-    accounts::{fetch_drt_config, fetch_pool},
     instructions::{
         build_compute_budget_ix, build_create_pool, build_register_drt, build_seal_pool,
     },
-    pda::{derive_drt_config_pda, derive_mint_pda, derive_pool_pda},
+    pda::{derive_mint_pda, derive_pool_pda},
     types::*,
     validation::{parse_code_hash, validate_drt_requests, validate_pool_name, ResolvedDrt},
 };
@@ -355,122 +348,4 @@ pub async fn create_malta_pool(
         explorer_url: explorer_url(&state, &doc.creation_signature),
     };
     op.finish(StatusCode::CREATED, &response).await
-}
-
-// ============================================================================
-// GET /v1/drt/pools/{pool_pda}
-// ============================================================================
-
-/// Fetch pool info by PDA. Merges on-chain state with enclave metadata.
-#[utoipa::path(
-    get,
-    path = "/v1/drt/pools/{pool_pda}",
-    tag = "DRT Pools",
-    summary = "Get DRT pool",
-    description = "Returns pool state from chain + enclave metadata (name, kind, DRT list with supply/url/hash).",
-    security(("bearer_auth" = [])),
-    params(
-        ("pool_pda" = String, Path, description = "Pool PDA address (base58)"),
-    ),
-    responses(
-        (status = 200, description = "Pool info", body = PoolInfoResponse),
-        (status = 401, description = "Unauthorized"),
-        (status = 404, description = "Pool not found"),
-        (status = 503, description = "RPC unavailable"),
-    )
-)]
-pub async fn get_pool(
-    caller: Caller,
-    State(state): State<AppState>,
-    Path(pool_pda_str): Path<String>,
-) -> Result<Json<PoolInfoResponse>, ApiError> {
-    caller.require(Permission::PoolsRead)?;
-    let pool_pda = Pubkey::from_str(&pool_pda_str)
-        .map_err(|_| ApiError::bad_request("invalid pool PDA address"))?;
-
-    let pool = fetch_pool(state.solana_client.rpc(), &pool_pda).await?;
-    let meta = state.storage.pools().get(&pool_pda_str).await?;
-
-    let (name, kind, drts) = match &meta {
-        Some(m) => {
-            let drts: Vec<DrtConfigResponse> = m
-                .drts
-                .iter()
-                .map(|(name, d)| DrtConfigResponse {
-                    name: name.clone(),
-                    right_id: d.right_id_hex.clone(),
-                    mint: d.mint.clone(),
-                    supply: d.supply,
-                    code_repo_url: d.code_repo_url.clone(),
-                    code_hash: d.code_hash_hex.clone(),
-                })
-                .collect();
-            (m.pool_name.clone(), m.kind.as_str().to_string(), drts)
-        }
-        None => (String::new(), "unknown".to_string(), Vec::new()),
-    };
-
-    Ok(Json(PoolInfoResponse {
-        pool_pda: pool_pda_str,
-        pool_uuid: hex::encode(pool.uuid),
-        name,
-        kind,
-        owner: pool.owner.to_string(),
-        sealed: pool.sealed,
-        drts,
-    }))
-}
-
-// ============================================================================
-// GET /v1/drt/pools/{pool_pda}/drt/{drt_name}
-// ============================================================================
-
-/// Fetch live on-chain `DrtConfig` for a registered DRT.
-///
-/// Useful as a sanity check that the pool document's `drts[name]` matches
-/// what's actually on chain.
-#[utoipa::path(
-    get,
-    path = "/v1/drt/pools/{pool_pda}/drt/{drt_name}",
-    tag = "DRT Pools",
-    summary = "Fetch on-chain DRT config",
-    description = "Returns the live DrtConfig from chain for the given DRT name in the pool.",
-    security(("bearer_auth" = [])),
-    params(
-        ("pool_pda" = String, Path, description = "Pool PDA address (base58)"),
-        ("drt_name" = String, Path, description = "DRT name: 'append', or the pool's analysis (e.g. 'awards-report-v1')"),
-    ),
-    responses(
-        (status = 200, description = "DRT config", body = DrtConfigResponse),
-        (status = 401, description = "Unauthorized"),
-        (status = 404, description = "Pool or DRT not found"),
-        (status = 503, description = "RPC unavailable"),
-    )
-)]
-pub async fn get_drt(
-    caller: Caller,
-    State(state): State<AppState>,
-    Path((pool_pda_str, drt_name)): Path<(String, String)>,
-) -> Result<Json<DrtConfigResponse>, ApiError> {
-    caller.require(Permission::PoolsRead)?;
-    let pool_pda = Pubkey::from_str(&pool_pda_str)
-        .map_err(|_| ApiError::bad_request("invalid pool PDA address"))?;
-    let meta = load_pool(&state, &pool_pda_str).await?;
-    let drt_meta = meta
-        .drts
-        .get(&drt_name)
-        .ok_or_else(|| ApiError::not_found(format!("DRT '{drt_name}' not found in pool")))?;
-
-    let right_id = crate::api::credentials::decode_right_id(&drt_meta.right_id_hex)?;
-    let (drt_config_pda, _) = derive_drt_config_pda(&pool_pda, &right_id);
-    let cfg = fetch_drt_config(state.solana_client.rpc(), &drt_config_pda).await?;
-
-    Ok(Json(DrtConfigResponse {
-        name: drt_name,
-        right_id: hex::encode(cfg.right_id),
-        mint: cfg.mint.to_string(),
-        supply: cfg.supply,
-        code_repo_url: cfg.code_repo_url,
-        code_hash: hex::encode(cfg.code_hash),
-    }))
 }

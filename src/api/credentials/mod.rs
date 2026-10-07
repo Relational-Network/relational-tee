@@ -78,11 +78,8 @@ pub(crate) mod tests {
     use super::*;
     use crate::auth::entra::mint::Spec;
     use crate::auth::entra::tests::{config, entra_key};
-    use crate::blockchain::drt::accounts::tests::drt_config_account;
-    use crate::blockchain::drt::pda::{
-        derive_drt_config_pda, derive_grant_pda, derive_user_ata, Commitments,
-    };
-    use crate::blockchain::drt::types::{DrtConfig, Pool, APPEND_DRT_NAME, DISC_POOL_ACCOUNT};
+    use crate::blockchain::drt::pda::{derive_grant_pda, derive_user_ata, Commitments};
+    use crate::blockchain::drt::types::{Pool, APPEND_DRT_NAME, DISC_POOL_ACCOUNT};
     use crate::blockchain::fake::{self, FakeChain};
     use crate::config::MAX_BODY_SIZE;
     use crate::data_validation::{FieldSchema, FieldType};
@@ -576,36 +573,6 @@ pub(crate) mod tests {
             json!({ "name": "Staff Number", "field_type": "text", "nullable": true })
         );
         assert_eq!(schema["fields"][5]["field_type"], "date");
-
-        let pool = Pubkey::from_str(pool_pda).unwrap();
-        let right_id: [u8; 16] = hex::decode(&execute.right_id_hex)
-            .unwrap()
-            .try_into()
-            .unwrap();
-        let on_chain = DrtConfig {
-            pool,
-            right_id,
-            mint: Pubkey::from_str(&execute.mint).unwrap(),
-            supply: execute.supply,
-            code_hash: hex::decode(&hash).unwrap().try_into().unwrap(),
-            code_repo_url: AWARDS_REPORT_URL.into(),
-            created_at: 0,
-            bump: 255,
-        };
-        worker.chain.data.lock().unwrap().push((
-            derive_drt_config_pda(&pool, &right_id).0,
-            drt_config_account(&on_chain),
-        ));
-        let drt = Request::get(format!("/v1/drt/pools/{pool_pda}/drt/awards-report-v1"))
-            .header(header::AUTHORIZATION, format!("Bearer {}", admin.token))
-            .body(Body::empty())
-            .unwrap();
-        let (status, _, drt) = send(&worker.app, drt).await;
-        assert_eq!(status, StatusCode::OK, "{drt}");
-        assert_eq!(
-            (&drt["supply"], &drt["code_repo_url"], &drt["code_hash"]),
-            (&json!(200), &json!(AWARDS_REPORT_URL), &json!(hash))
-        );
     }
 
     #[tokio::test]

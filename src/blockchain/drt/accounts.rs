@@ -6,12 +6,13 @@
 use borsh::BorshDeserialize;
 use solana_pubkey::Pubkey;
 
-use super::types::{DrtConfig, Pool, DISC_DRT_CONFIG_ACCOUNT, DISC_POOL_ACCOUNT};
+use super::types::{Pool, DISC_POOL_ACCOUNT};
 use crate::blockchain::rpc::JsonRpcClient;
 use crate::error::ApiError;
 
 /// Account size caps to prevent unbounded Borsh allocations from untrusted RPC.
 const MAX_POOL_DATA: usize = 1024;
+#[cfg(test)]
 const MAX_DRT_CONFIG_DATA: usize = 4 * 1024;
 
 fn strip_discriminator<'a>(
@@ -63,11 +64,13 @@ pub async fn fetch_pool(rpc: &JsonRpcClient, pool_pda: &Pubkey) -> Result<Pool, 
     decode(&data, &DISC_POOL_ACCOUNT, MAX_POOL_DATA, "pool")
 }
 
-/// Fetch and deserialise a DrtConfig account.
+/// Fetch and deserialise a DrtConfig account, for the tests and `just
+/// grant-guard` that hold the decoding to the deployed program.
+#[cfg(test)]
 pub async fn fetch_drt_config(
     rpc: &JsonRpcClient,
     drt_config_pda: &Pubkey,
-) -> Result<DrtConfig, ApiError> {
+) -> Result<super::types::DrtConfig, ApiError> {
     let data = rpc
         .get_account_data(drt_config_pda)
         .await
@@ -77,7 +80,7 @@ pub async fn fetch_drt_config(
         .ok_or_else(|| ApiError::not_found(format!("drt_config {drt_config_pda} not found")))?;
     decode(
         &data,
-        &DISC_DRT_CONFIG_ACCOUNT,
+        &super::idl_generated::DISC_DRT_CONFIG_ACCOUNT,
         MAX_DRT_CONFIG_DATA,
         "drt_config",
     )
@@ -86,7 +89,8 @@ pub async fn fetch_drt_config(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::blockchain::drt::types::MAX_CODE_REPO_URL_LEN;
+    use crate::blockchain::drt::idl_generated::DISC_DRT_CONFIG_ACCOUNT;
+    use crate::blockchain::drt::types::{DrtConfig, MAX_CODE_REPO_URL_LEN};
     use crate::blockchain::fake::{self, FakeChain};
     use std::sync::Arc;
 

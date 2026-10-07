@@ -5,7 +5,6 @@
 //!
 //! - `GET /v1/drt/pools/{pool_pda}/revocations` — list revocations
 //! - `GET /v1/drt/pools/{pool_pda}/summary` — pool metadata + on-chain state
-//! - `GET /v1/drt/pools/by-wallet/{wallet_id}` — list pools owned by wallet
 //! - `GET /v1/drt/pools/list` — list all pools (marketplace discovery)
 //! - `GET /v1/drt/pools/{pool_pda}/issuance-log` — list per-issuance records
 //!
@@ -26,7 +25,7 @@ use crate::auth::{Caller, Permission};
 use crate::blockchain::drt::accounts::fetch_pool;
 use crate::error::ApiError;
 use crate::state::AppState;
-use crate::storage::pools::{PoolDoc, Upload};
+use crate::storage::pools::Upload;
 
 use super::parse_pda;
 
@@ -97,28 +96,6 @@ pub struct DrtConfigResponseCompact {
     /// Best-effort: if the SPL RPC call fails this falls back to `supply`.
     pub remaining_supply: u64,
     pub mint: String,
-}
-
-/// Single pool entry in the list response.
-#[derive(Debug, Serialize, ToSchema)]
-pub struct PoolListEntry {
-    pub pool_pda: String,
-    pub pool_name: String,
-    pub total_rows: u64,
-    pub revoked_count: u64,
-    pub schema_id: String,
-    pub state: String,
-    pub created_at: String,
-}
-
-/// One page of the pools a wallet owns.
-#[derive(Debug, Serialize, ToSchema)]
-pub struct PoolsByWalletResponse {
-    pub wallet_id: String,
-    pub pools: Vec<PoolListEntry>,
-    /// Present when there's another page; pass it as `cursor`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub next_cursor: Option<String>,
 }
 
 /// DRT entry for marketplace listing (compact, no mint/hash details).
@@ -320,71 +297,6 @@ pub async fn pool_summary(
         creation_signature: doc.creation_signature,
         last_issue_at: totals.last_issue_at.map(|d| d.to_rfc3339()),
         drts,
-    }))
-}
-
-fn list_entry(doc: &PoolDoc) -> PoolListEntry {
-    let totals = doc.totals();
-    PoolListEntry {
-        pool_pda: doc.pool_pda.clone(),
-        pool_name: doc.pool_name.clone(),
-        total_rows: totals.rows,
-        revoked_count: totals.revoked,
-        schema_id: doc.schema_id.clone(),
-        state: doc.state().as_str().to_string(),
-        created_at: doc.created_at.to_rfc3339(),
-    }
-}
-
-/// List pools owned by a specific wallet.
-#[utoipa::path(
-    get,
-    path = "/v1/drt/pools/by-wallet/{wallet_id}",
-    tag = "Credentials",
-    summary = "List pools by wallet",
-    description = "List the pools a wallet owns, in pool PDA order, one cursor page at a time. The caller must own the wallet.",
-    security(("bearer_auth" = [])),
-    params(
-        ("wallet_id" = String, Path, description = "Wallet UUID"),
-        CursorQuery,
-    ),
-    responses(
-        (status = 200, description = "Pool list", body = PoolsByWalletResponse),
-        (status = 400, description = "Invalid cursor"),
-        (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Not wallet owner"),
-    )
-)]
-pub async fn list_pools_by_wallet(
-    caller: Caller,
-    State(state): State<AppState>,
-    Path(wallet_id): Path<String>,
-    Query(query): Query<CursorQuery>,
-) -> Result<Json<PoolsByWalletResponse>, ApiError> {
-    caller.require(Permission::PoolsRead)?;
-    // Verify wallet ownership.
-    let wallet = crate::api::load_wallet(&state, &wallet_id).await?;
-    crate::api::enforce_owner(&wallet, &caller.user_id)?;
-
-    let owned: Vec<PoolDoc> = state
-        .storage
-        .pools()
-        .all()
-        .await?
-        .into_iter()
-        .filter(|p| p.owner_wallet_id == wallet_id)
-        .collect();
-    let (items, next_cursor) = page(
-        owned,
-        |p| &p.pool_pda,
-        query.cursor.as_deref(),
-        query.clamped_limit(),
-    )?;
-
-    Ok(Json(PoolsByWalletResponse {
-        wallet_id,
-        pools: items.iter().map(list_entry).collect(),
-        next_cursor,
     }))
 }
 
