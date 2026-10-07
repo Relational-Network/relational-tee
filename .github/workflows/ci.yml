@@ -50,12 +50,12 @@ jobs:
       - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
       - run: nix flake check --print-build-logs
 
-  # Two runners build the image independently. CI has no binary cache, so
-  # each compiles the crate and its dependencies from source.
+  # Two runners build the image independently, alongside the gates; only
+  # publishing waits for both. CI has no binary cache, so each compiles the
+  # crate and its dependencies from source.
   image:
     name: Build the x86_64-linux image (${{ matrix.build }})
     runs-on: ubuntu-24.04
-    needs: [gates, flake-check]
     strategy:
       matrix:
         build: [1, 2]
@@ -88,7 +88,10 @@ jobs:
     runs-on: ubuntu-24.04
     needs: [image]
     steps:
+      # The action's own dependencies call the deprecated Buffer().
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        env:
+          NODE_OPTIONS: --no-deprecation
         with:
           pattern: image-*
       - name: Compare the builds
@@ -122,7 +125,7 @@ jobs:
   publish:
     name: Publish the image and start staging
     runs-on: ubuntu-24.04
-    needs: [reproducible]
+    needs: [gates, flake-check, reproducible]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     permissions:
       contents: read
@@ -133,6 +136,8 @@ jobs:
       DISPATCH: ${{ secrets.DEPLOY_APP_CLIENT_ID != '' && secrets.DEPLOY_REPO != '' }}
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        env:
+          NODE_OPTIONS: --no-deprecation
         with:
           name: image-1
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0

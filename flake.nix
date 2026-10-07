@@ -118,7 +118,9 @@
         craneLib.buildPackage (
           args
           // {
-            cargoArtifacts = craneLib.buildDepsOnly args;
+            # The gates check and test the crate, so the image's dependencies
+            # are only built, without crane's `cargo check` pass.
+            cargoArtifacts = craneLib.buildDepsOnly (args // { cargoCheckCommand = "true"; });
             SOURCE_DATE_EPOCH = sourceDateEpoch;
           }
         );
