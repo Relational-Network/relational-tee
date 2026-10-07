@@ -24,10 +24,10 @@ env:
 jobs:
   gates:
     name: Gates (fmt, clippy, tests, banned crates, audit)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v6.0.2
-      - uses: cachix/install-nix-action@v31
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
       # cargo audit needs the advisory database, so it runs outside the Nix
       # sandbox, in the dev shell. deny-crates fails if rsa or openssl-sys
       # appears in the dependency graph.
@@ -36,7 +36,7 @@ jobs:
       # Release builds don't serve the OpenAPI document, so CI publishes it.
       - name: The OpenAPI document
         run: nix develop --command just openapi > openapi.json
-      - uses: actions/upload-artifact@v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: openapi
           path: openapi.json
@@ -44,24 +44,24 @@ jobs:
 
   flake-check:
     name: nix flake check
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v6.0.2
-      - uses: cachix/install-nix-action@v31
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
       - run: nix flake check --print-build-logs
 
   # Two runners build the image independently. CI has no binary cache, so
   # each compiles the crate and its dependencies from source.
   image:
     name: Build the x86_64-linux image (${{ matrix.build }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [gates, flake-check]
     strategy:
       matrix:
         build: [1, 2]
     steps:
-      - uses: actions/checkout@v6.0.2
-      - uses: cachix/install-nix-action@v31
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
       - name: nix build
         run: nix build --print-build-logs .#packages.x86_64-linux.image
       - name: Record the image hash
@@ -74,7 +74,7 @@ jobs:
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
       - run: cp -L result image.tar.gz
-      - uses: actions/upload-artifact@v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: image-${{ matrix.build }}
           path: image.tar.gz
@@ -85,10 +85,10 @@ jobs:
   # When they aren't, diffoscope shows where they differ.
   reproducible:
     name: Check that the two image builds are identical
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [image]
     steps:
-      - uses: actions/download-artifact@v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: image-*
       - name: Compare the builds
@@ -97,18 +97,18 @@ jobs:
           sha256sum image-1/image.tar.gz image-2/image.tar.gz
           cmp image-1/image.tar.gz image-2/image.tar.gz
       # Checked out beside the images, because a checkout empties its directory.
-      - uses: actions/checkout@v6.0.2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         if: failure() && steps.compare.outcome == 'failure'
         with:
           path: src
-      - uses: cachix/install-nix-action@v31
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
         if: failure() && steps.compare.outcome == 'failure'
       - name: diffoscope
         if: failure() && steps.compare.outcome == 'failure'
         run: >-
           nix run --inputs-from ./src nixpkgs#diffoscopeMinimal --
           --text diffoscope.txt image-1/image.tar.gz image-2/image.tar.gz
-      - uses: actions/upload-artifact@v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: failure() && steps.compare.outcome == 'failure'
         with:
           name: diffoscope
@@ -121,7 +121,7 @@ jobs:
   # image is still published.
   publish:
     name: Publish the image and start staging
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [reproducible]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     permissions:
@@ -130,33 +130,40 @@ jobs:
       attestations: write
       id-token: write
     env:
-      DISPATCH: ${{ secrets.DEPLOY_APP_ID != '' && secrets.DEPLOY_REPO != '' }}
+      DISPATCH: ${{ secrets.DEPLOY_APP_CLIENT_ID != '' && secrets.DEPLOY_REPO != '' }}
     steps:
-      - uses: actions/download-artifact@v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: image-1
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
       - name: Push to GHCR
         id: push
         run: |
           image="ghcr.io/${GITHUB_REPOSITORY,,}"
           docker load < image.tar.gz
           docker tag relational-tee:latest "$image:$GITHUB_SHA"
-          echo "${{ github.token }}" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
           docker push "$image:$GITHUB_SHA"
           digest=$(docker inspect --format '{{index .RepoDigests 0}}' "$image:$GITHUB_SHA" | cut -d@ -f2)
           echo "image=$image" >> "$GITHUB_OUTPUT"
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
           echo "Published \`$image@$digest\`" >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/attest-build-provenance@v2
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-name: ${{ steps.push.outputs.image }}
           subject-digest: ${{ steps.push.outputs.digest }}
           push-to-registry: true
-      - uses: actions/create-github-app-token@v2
+          # A storage record needs the artifact-metadata permission, and
+          # nothing here reads storage records.
+          create-storage-record: false
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         id: app
         if: env.DISPATCH == 'true'
         with:
-          app-id: ${{ secrets.DEPLOY_APP_ID }}
+          client-id: ${{ secrets.DEPLOY_APP_CLIENT_ID }}
           private-key: ${{ secrets.DEPLOY_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: ${{ secrets.DEPLOY_REPO }}
