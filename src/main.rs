@@ -795,7 +795,8 @@ mod tests {
         assert_eq!(body["storage_canary"], false);
 
         // The Solana RPC here is unreachable; readiness doesn't care.
-        health.record_canary(storage.canary().await.map_err(|e| e.to_string()));
+        health.record_canary(storage.canary().await.is_ok());
+        health.record_rpc(false);
         let (status, body) = get(&app, "/health/ready").await;
         assert_eq!(status, StatusCode::OK, "{body}");
 
@@ -804,6 +805,16 @@ mod tests {
         assert_eq!(details["status"], "ready");
         assert_eq!(details["keys_held"].as_array().unwrap().len(), 4);
         assert_eq!(details["worker_id"], "worker-a");
+
+        // A public endpoint: a failed check shows only as failed.
+        assert_eq!(details["solana_rpc"]["status"], "error");
+        let mut canary: Vec<&String> = details["storage_canary"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .collect();
+        canary.sort();
+        assert_eq!(canary, ["age_seconds", "ok"]);
 
         health.start_draining();
         assert_eq!(

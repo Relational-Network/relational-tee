@@ -10,7 +10,8 @@
 //!   reads cached state only, so probes are cheap. It never depends on
 //!   Solana RPC or the token-signing key cache, so their outages can't pull
 //!   every worker out of rotation.
-//! - `GET /health`: details for operators, without secrets.
+//! - `GET /health`: details for operators, without secrets. It is public, so
+//!   a failed check shows only as failed; why is in the worker's log.
 //!
 //! On SIGTERM the worker drains: readiness fails at once, the worker keeps
 //! serving for two probe intervals so the load balancer notices, then stops
@@ -58,11 +59,10 @@ pub enum Certificate {
 #[derive(Default)]
 struct Canary {
     last_ok: Option<Instant>,
-    last_error: Option<String>,
 }
 
 struct Rpc {
-    status: String,
+    ok: bool,
     checked_at: Instant,
 }
 
@@ -118,15 +118,21 @@ impl Health {
         self.canary_age().is_some_and(|age| age <= CANARY_MAX_AGE)
     }
 
-    pub(crate) fn record_canary(&self, result: Result<(), String>) {
+    pub(crate) fn record_canary(&self, succeeded: bool) {
+        if !succeeded {
+            return;
+        }
         if let Ok(mut canary) = self.canary.lock() {
-            match result {
-                Ok(()) => {
-                    canary.last_ok = Some(Instant::now());
-                    canary.last_error = None;
-                }
-                Err(e) => canary.last_error = Some(e),
-            }
+            canary.last_ok = Some(Instant::now());
+        }
+    }
+
+    pub(crate) fn record_rpc(&self, ok: bool) {
+        if let Ok(mut rpc) = self.rpc.lock() {
+            *rpc = Some(Rpc {
+                ok,
+                checked_at: Instant::now(),
+            });
         }
     }
 
@@ -152,11 +158,11 @@ impl Health {
         let health = Arc::clone(self);
         tokio::spawn(async move {
             loop {
-                let result = storage.canary().await.map_err(|e| e.to_string());
+                let result = storage.canary().await;
                 if let Err(e) = &result {
                     warn!(error = %e, "Storage canary failed");
                 }
-                health.record_canary(result);
+                health.record_canary(result.is_ok());
                 tokio::time::sleep(CANARY_INTERVAL).await;
             }
         });
@@ -167,16 +173,14 @@ impl Health {
         let health = Arc::clone(self);
         tokio::spawn(async move {
             loop {
-                let status = match solana.rpc().get_health().await {
-                    Ok(()) => "ok".to_string(),
-                    Err(e) => format!("error: {e}"),
+                let ok = match solana.rpc().get_health().await {
+                    Ok(()) => true,
+                    Err(e) => {
+                        warn!(error = %e, "Solana RPC check failed");
+                        false
+                    }
                 };
-                if let Ok(mut rpc) = health.rpc.lock() {
-                    *rpc = Some(Rpc {
-                        status,
-                        checked_at: Instant::now(),
-                    });
-                }
+                health.record_rpc(ok);
                 tokio::time::sleep(RPC_CHECK_INTERVAL).await;
             }
         });
@@ -220,21 +224,20 @@ pub struct CertificateDetails {
 }
 
 /// The storage canary: a read and a conditional write of this worker's blob.
+/// Why a run failed is in the worker's log.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct CanaryDetails {
     pub ok: bool,
     /// Seconds since the last success.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub age_seconds: Option<u64>,
-    /// The last failure, if the last run failed.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
 }
 
 /// Solana RPC, as last checked.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct RpcDetails {
-    /// `ok`, `error: …`, or `unknown` before the first check.
+    /// `ok`, `error` (why is in the worker's log), or `unknown` before the
+    /// first check.
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub checked_age_seconds: Option<u64>,
@@ -284,23 +287,18 @@ pub async fn health(State(state): State<AppState>) -> Json<HealthDetails> {
     } else {
         &readiness.status
     };
-    let (canary_age, canary_error) = h
+    let canary_age = h
         .canary
         .lock()
-        .map(|c| {
-            (
-                c.last_ok.map(|at| at.elapsed().as_secs()),
-                c.last_error.clone(),
-            )
-        })
-        .unwrap_or_default();
+        .ok()
+        .and_then(|c| c.last_ok.map(|at| at.elapsed().as_secs()));
     let rpc = h
         .rpc
         .lock()
         .ok()
         .and_then(|rpc| {
             rpc.as_ref().map(|r| RpcDetails {
-                status: r.status.clone(),
+                status: if r.ok { "ok" } else { "error" }.into(),
                 checked_age_seconds: Some(r.checked_at.elapsed().as_secs()),
             })
         })
@@ -340,7 +338,6 @@ pub async fn health(State(state): State<AppState>) -> Json<HealthDetails> {
         storage_canary: CanaryDetails {
             ok: readiness.storage_canary,
             age_seconds: canary_age,
-            error: canary_error,
         },
         jwks_cache_age_seconds,
         solana_rpc: rpc,
@@ -461,18 +458,18 @@ mod tests {
         let h = health(Certificate::TlsKey(crate::tls::tests::serving()));
         assert_eq!(h.readiness().status, "not_ready", "no canary yet");
 
-        h.record_canary(Ok(()));
+        h.record_canary(true);
         let r = h.readiness();
         assert!(r.keys && r.certificate && r.storage_canary && !r.draining);
         assert_eq!(r.status, "ready");
 
         // A failure doesn't undo a recent success, but age does.
-        h.record_canary(Err("timeout".into()));
+        h.record_canary(false);
         assert_eq!(h.readiness().status, "ready");
         tokio::time::advance(CANARY_MAX_AGE + Duration::from_secs(1)).await;
         assert_eq!(h.readiness().status, "not_ready");
 
-        h.record_canary(Ok(()));
+        h.record_canary(true);
         h.start_draining();
         let r = h.readiness();
         assert!(r.draining);
@@ -488,7 +485,7 @@ mod tests {
         )
         .unwrap();
         let h = health(Certificate::TlsKey(Arc::new(certificates)));
-        h.record_canary(Ok(()));
+        h.record_canary(true);
         assert!(!h.readiness().certificate);
         assert_eq!(h.readiness().status, "not_ready");
     }
