@@ -3,7 +3,7 @@
 
 //! Balance query endpoints.
 //!
-//! - `GET /v1/wallets/{id}/balance` — full balance (native + SPL)
+//! - `GET /v1/wallets/{id}/balance` — the wallet's native SOL balance
 
 use axum::{
     extract::{Path, State},
@@ -23,7 +23,7 @@ use super::{enforce_owner_active, load_wallet};
 // Response types
 // ============================================================================
 
-/// Full balance response (native SOL + known SPL tokens).
+/// A wallet's balance: one entry, its native SOL.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct BalanceResponse {
     pub wallet_id: String,
@@ -36,13 +36,13 @@ pub struct BalanceResponse {
 // Handlers
 // ============================================================================
 
-/// Get full balance for a wallet (native SOL; SPL expansion in future).
+/// Get a wallet's native SOL balance.
 #[utoipa::path(
     get,
     path = "/v1/wallets/{wallet_id}/balance",
     tag = "Balance",
     summary = "Get wallet balance",
-    description = "Returns native SOL balance (and SPL token balances in future) for a wallet.",
+    description = "Returns the wallet's native SOL balance. SPL tokens the wallet holds, such as its pools' DRTs, aren't listed.",
     security(("bearer_auth" = [])),
     params(
         ("wallet_id" = String, Path, format = "uuid", description = "Wallet UUID"),
@@ -69,8 +69,6 @@ pub async fn get_balance(
         .solana_client
         .get_native_balance(&wallet.public_address)
         .await?;
-
-    // TODO: extend with SPL token queries (configured mint list).
 
     Ok(Json(BalanceResponse {
         wallet_id,

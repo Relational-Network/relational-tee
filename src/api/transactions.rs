@@ -26,6 +26,7 @@ use utoipa::{IntoParams, ToSchema};
 use crate::audit;
 use crate::auth::{Caller, Permission};
 use crate::blockchain::signing::keypair_from_bytes_verified;
+use crate::blockchain::spl_token::spl_transfer;
 use crate::blockchain::transactions::native_transfer;
 use crate::chain::{self, Effect};
 use crate::error::ApiError;
@@ -227,10 +228,7 @@ pub async fn send_transaction(
         let decimals = payload
             .decimals
             .ok_or_else(|| ApiError::bad_request("decimals required for SPL transfers"))?;
-        state
-            .solana_client
-            .spl_transfer(&owner, &recipient, mint, payload.amount, decimals)
-            .await?
+        spl_transfer(&owner, &recipient, mint, payload.amount, decimals)?
     } else {
         return Err(ApiError::bad_request(
             "invalid token type — use \"native\" or \"spl:{mint}\"",

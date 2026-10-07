@@ -36,8 +36,9 @@ use super::{enforce_owner, load_wallet};
 /// Request body for creating a wallet.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateWalletRequest {
-    /// Optional human-readable label (max 64 chars).
+    /// Optional human-readable label, at most 64 characters.
     #[serde(default)]
+    #[schema(max_length = 64)]
     pub label: Option<String>,
 }
 
@@ -110,9 +111,8 @@ pub async fn create_wallet(
     caller.require_admin()?;
     let mut op = open_or_replay!(state, &caller.user_id, request, &bytes);
 
-    // Validate label length.
     if let Some(ref label) = payload.label {
-        if label.len() > 64 {
+        if label.chars().count() > 64 {
             return Err(ApiError::bad_request("label must be at most 64 characters"));
         }
     }
@@ -297,4 +297,38 @@ pub async fn delete_wallet(
         },
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::body::Body;
+    use axum::http::{header, Request, StatusCode};
+    use serde_json::json;
+
+    use crate::api::credentials::tests::{send, worker};
+    use crate::auth::entra::mint::Spec;
+    use crate::auth::entra::tests::{config, entra_key};
+    use crate::idempotency::KEY_HEADER;
+
+    #[tokio::test]
+    async fn a_label_holds_64_characters_however_many_bytes_they_take() {
+        let worker = worker();
+        let mut spec = Spec::valid(&config());
+        spec.roles = vec!["Admin".into()];
+        let token = spec.sign(entra_key()).unwrap();
+        let create = |label: String| {
+            Request::post("/v1/wallets")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .header(&KEY_HEADER, uuid::Uuid::new_v4().to_string())
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({ "label": label }).to_string()))
+                .unwrap()
+        };
+
+        let (status, _, body) = send(&worker.app, create("é".repeat(65))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        let (status, _, body) = send(&worker.app, create("é".repeat(64))).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(body["wallet"]["label"], "é".repeat(64));
+    }
 }
