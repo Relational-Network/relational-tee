@@ -28,6 +28,8 @@ pub struct RpcError {
     /// The JSON-RPC error's code and data, when the node answered with one.
     pub code: Option<i64>,
     pub data: Option<Value>,
+    /// The HTTP status, when the node answered with one other than 200.
+    pub http_status: Option<u16>,
 }
 
 /// The JSON-RPC error a node answers `sendTransaction` with when the
@@ -51,6 +53,7 @@ impl RpcError {
             message: msg.into(),
             code: None,
             data: None,
+            http_status: None,
         }
     }
 
@@ -89,9 +92,43 @@ struct RpcErrorObject {
 
 #[derive(Deserialize)]
 struct RpcContext<T> {
-    #[allow(dead_code)]
     context: Option<Value>,
     value: T,
+}
+
+/// The most accounts one `getMultipleAccounts` call takes.
+pub const MAX_MULTIPLE_ACCOUNTS: usize = 100;
+
+/// An account as `getAccountInfo` returns it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Account {
+    /// The program that owns it.
+    pub owner: Pubkey,
+    pub lamports: u64,
+    pub data: Vec<u8>,
+}
+
+impl Account {
+    fn from_json(value: &Value) -> Result<Self, RpcError> {
+        let owner = value["owner"]
+            .as_str()
+            .and_then(|o| o.parse().ok())
+            .ok_or_else(|| RpcError::new("account without a valid owner"))?;
+        let lamports = value["lamports"]
+            .as_u64()
+            .ok_or_else(|| RpcError::new("account without lamports"))?;
+        let data = value["data"][0]
+            .as_str()
+            .ok_or_else(|| RpcError::new("account data isn't base64"))?;
+        let data = BASE64
+            .decode(data)
+            .map_err(|e| RpcError::new(format!("base64 decode: {e}")))?;
+        Ok(Self {
+            owner,
+            lamports,
+            data,
+        })
+    }
 }
 
 // ============================================================================
@@ -144,7 +181,9 @@ impl JsonRpcClient {
             .map_err(|e| RpcError::new(format!("response read error: {e}")))?;
 
         if !status.is_success() {
-            return Err(RpcError::new(format!("HTTP {status}: {text}")));
+            let mut e = RpcError::new(format!("HTTP {status}: {text}"));
+            e.http_status = Some(status.as_u16());
+            return Err(e);
         }
 
         let rpc_resp: RpcResponse<Value> =
@@ -155,6 +194,7 @@ impl JsonRpcClient {
                 message: err.message,
                 code: Some(err.code),
                 data: err.data,
+                http_status: None,
             });
         }
 
@@ -245,22 +285,53 @@ impl JsonRpcClient {
         Ok(ctx.value.into_iter().next().flatten())
     }
 
-    /// Whether an account exists at `commitment`.
-    pub async fn account_exists(
+    /// `getAccountInfo` at `commitment`: the account, or `None` if there is
+    /// none.
+    pub async fn get_account(
         &self,
         pubkey: &Pubkey,
         commitment: &str,
-    ) -> Result<bool, RpcError> {
-        let ctx: RpcContext<Value> = self
+    ) -> Result<Option<Account>, RpcError> {
+        let (_, mut accounts) = self.get_multiple_accounts(&[*pubkey], commitment).await?;
+        Ok(accounts.pop().flatten())
+    }
+
+    /// `getMultipleAccounts` at `commitment`: the slot it answered at, and
+    /// each account in the order asked, `None` where there is none. At most
+    /// [`MAX_MULTIPLE_ACCOUNTS`] at once.
+    pub async fn get_multiple_accounts(
+        &self,
+        pubkeys: &[Pubkey],
+        commitment: &str,
+    ) -> Result<(u64, Vec<Option<Account>>), RpcError> {
+        if pubkeys.len() > MAX_MULTIPLE_ACCOUNTS {
+            return Err(RpcError::new(format!(
+                "getMultipleAccounts takes at most {MAX_MULTIPLE_ACCOUNTS} accounts"
+            )));
+        }
+        let keys: Vec<String> = pubkeys.iter().map(|k| k.to_string()).collect();
+        let ctx: RpcContext<Vec<Value>> = self
             .call_typed(
-                "getAccountInfo",
-                json!([
-                    pubkey.to_string(),
-                    {"encoding": "base64", "commitment": commitment, "dataSlice": {"offset": 0, "length": 0}}
-                ]),
+                "getMultipleAccounts",
+                json!([keys, {"encoding": "base64", "commitment": commitment}]),
             )
             .await?;
-        Ok(!ctx.value.is_null())
+        if ctx.value.len() != pubkeys.len() {
+            return Err(RpcError::new(
+                "getMultipleAccounts answered for other accounts",
+            ));
+        }
+        let slot = ctx
+            .context
+            .as_ref()
+            .and_then(|c| c["slot"].as_u64())
+            .ok_or_else(|| RpcError::new("missing context slot"))?;
+        let accounts = ctx
+            .value
+            .iter()
+            .map(|v| (!v.is_null()).then(|| Account::from_json(v)).transpose())
+            .collect::<Result<_, _>>()?;
+        Ok((slot, accounts))
     }
 
     /// `getBalance` → lamports.

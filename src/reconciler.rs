@@ -22,12 +22,14 @@ use chrono::{TimeDelta, Utc};
 use solana_pubkey::Pubkey;
 use tracing::{info, warn};
 
-use crate::blockchain::drt::pda::derive_grant_pda;
+use crate::api::credentials::decode_right_id;
+use crate::blockchain::drt::pda::{derive_drt_config_pda, derive_grant_pda};
+use crate::blockchain::drt::types::APPEND_DRT_NAME;
 use crate::blockchain::SolanaClient;
-use crate::chain::creating_signature;
+use crate::chain::{creating_signature, Effect};
 use crate::error::ApiError;
 use crate::idempotency::stored_signature;
-use crate::storage::pools::Recording;
+use crate::storage::pools::{PoolDoc, Recording};
 use crate::storage::staged::{Saga, Staged};
 use crate::storage::{Change, Storage};
 use crate::store::Created;
@@ -109,7 +111,9 @@ async fn finish(
             }
             let pda = Pubkey::from_str(&pool.pool_pda)
                 .map_err(|_| ApiError::internal("a staged pool has an invalid PDA"))?;
-            let Some(signature) = effect_signature(storage, solana, &staged.record, &pda).await?
+            let effect = Effect::Pool(pda);
+            let Some(signature) =
+                effect_signature(storage, solana, &staged.record, &effect).await?
             else {
                 return Ok(false);
             };
@@ -130,9 +134,9 @@ async fn finish(
             let commitment = upload
                 .commitment_bytes()
                 .ok_or_else(|| ApiError::internal("a staged issuance has no commitment"))?;
-            let (grant_pda, _) = derive_grant_pda(&commitment);
+            let effect = burn(&doc, APPEND_DRT_NAME, &commitment)?;
             let Some(signature) =
-                effect_signature(storage, solana, &staged.record, &grant_pda).await?
+                effect_signature(storage, solana, &staged.record, &effect).await?
             else {
                 return Ok(false);
             };
@@ -162,9 +166,9 @@ async fn finish(
             let commitment = grant
                 .commitment_bytes()
                 .ok_or_else(|| ApiError::internal("a staged grant has no commitment"))?;
-            let (grant_pda, _) = derive_grant_pda(&commitment);
+            let effect = burn(&doc, &grant.drt_name, &commitment)?;
             let Some(signature) =
-                effect_signature(storage, solana, &staged.record, &grant_pda).await?
+                effect_signature(storage, solana, &staged.record, &effect).await?
             else {
                 return Ok(false);
             };
@@ -187,19 +191,33 @@ async fn finish(
     }
 }
 
-/// The signature that created `account`, if it exists at `finalized`.
+/// The burn of one of `doc`'s `drt_name` DRTs under `commitment`.
+fn burn(doc: &PoolDoc, drt_name: &str, commitment: &[u8; 32]) -> Result<Effect, ApiError> {
+    let pool = Pubkey::from_str(&doc.pool_pda)
+        .map_err(|_| ApiError::internal("a pool document has an invalid PDA"))?;
+    let drt = doc
+        .drts
+        .get(drt_name)
+        .ok_or_else(|| ApiError::internal(format!("the pool has no {drt_name} DRT")))?;
+    let right_id = decode_right_id(&drt.right_id_hex)?;
+    Ok(Effect::Grant {
+        pda: derive_grant_pda(commitment).0,
+        drt_config: derive_drt_config_pda(&pool, &right_id).0,
+    })
+}
+
+/// The signature that made `effect`, an account the program created, if it
+/// has happened at `finalized`.
 async fn effect_signature(
     storage: &Storage,
     solana: &SolanaClient,
     record: &str,
-    account: &Pubkey,
+    effect: &Effect,
 ) -> Result<Option<String>, ApiError> {
-    let exists = solana
-        .rpc()
-        .account_exists(account, "finalized")
-        .await
-        .map_err(|e| ApiError::rpc_unavailable(format!("account lookup failed: {e}")))?;
-    if !exists {
+    let (Effect::Pool(account) | Effect::Grant { pda: account, .. }) = effect else {
+        return Err(ApiError::internal("the reconciler finishes only creations"));
+    };
+    if !effect.happened(solana, "finalized").await? {
         return Ok(None);
     }
     let stored = stored_signature(storage, record).await?;
@@ -222,10 +240,41 @@ mod tests {
         Utc::now() - TimeDelta::minutes(11)
     }
 
+    /// The pool the burn tests use, on chain at a real address.
+    const P1: Pubkey = Pubkey::new_from_array([11; 32]);
+
+    /// Each DRT's right ID in [`drt_pool`].
+    fn right_id(name: &str) -> [u8; 16] {
+        [name.len() as u8; 16]
+    }
+
+    /// The DRT config of [`drt_pool`]'s `name` DRT.
+    fn drt_config(name: &str) -> Pubkey {
+        derive_drt_config_pda(&P1, &right_id(name)).0
+    }
+
+    /// A pool document at [`P1`] with an append DRT and the analysis's.
+    fn drt_pool() -> PoolDoc {
+        let mut doc = pool(&P1.to_string(), "w1");
+        for name in [APPEND_DRT_NAME, "awards-report-v1"] {
+            doc.drts.insert(
+                name.into(),
+                crate::storage::pools::DrtMetadata {
+                    right_id_hex: hex::encode(right_id(name)),
+                    mint: Pubkey::new_unique().to_string(),
+                    supply: 5,
+                    code_repo_url: String::new(),
+                    code_hash_hex: hex::encode([0; 32]),
+                },
+            );
+        }
+        doc
+    }
+
     #[tokio::test]
     async fn an_abandoned_issuance_gets_its_entry_once_its_burn_exists() {
         let storage = files_storage();
-        storage.pools().create(&pool("P1", "w1")).await.unwrap();
+        storage.pools().create(&drt_pool()).await.unwrap();
 
         // A request stored its burn, then died before recording the upload.
         let request = Idempotent::post(
@@ -253,7 +302,7 @@ mod tests {
             let mut entry = upload(record_id, 2);
             entry.commitment = Some(hex::encode(commitment));
             let saga = Saga::Issue {
-                pool_pda: "P1".into(),
+                pool_pda: P1.to_string(),
                 upload: entry,
             };
             let staged = Staged {
@@ -268,7 +317,9 @@ mod tests {
                 .unwrap();
         }
         let chain = Arc::new(FakeChain::default());
-        *chain.accounts.lock().unwrap() = grants;
+        for pda in grants {
+            chain.grant(pda, drt_config(APPEND_DRT_NAME));
+        }
         chain.land("sig-burn", true);
         let solana = fake::start(chain);
 
@@ -278,7 +329,7 @@ mod tests {
                 .unwrap(),
             1
         );
-        let doc = storage.pools().get("P1").await.unwrap().unwrap();
+        let doc = storage.pools().get(&P1.to_string()).await.unwrap().unwrap();
         let entries: Vec<_> = doc
             .issuances
             .iter()
@@ -302,7 +353,7 @@ mod tests {
     #[tokio::test]
     async fn an_abandoned_grant_is_recorded_unless_a_revocation_came_after() {
         let storage = files_storage();
-        storage.pools().create(&pool("P1", "w1")).await.unwrap();
+        storage.pools().create(&drt_pool()).await.unwrap();
         let request = Idempotent::post(
             "0f8fad5b-d9cb-469f-a165-70867728950e",
             "/v1/drt/pools/{pool_pda}/grant",
@@ -332,7 +383,7 @@ mod tests {
                 record: op.record_path().into(),
                 staged_at: old(),
                 saga: Saga::Grant {
-                    pool_pda: "P1".into(),
+                    pool_pda: P1.to_string(),
                     grant: entry,
                 },
             };
@@ -344,7 +395,7 @@ mod tests {
         }
         storage
             .pools()
-            .update::<ApiError>("P1", |doc| {
+            .update::<ApiError>(&P1.to_string(), |doc| {
                 let mut earlier = grant("g-bo-earlier", "bo", 20);
                 earlier.revoked = Some(GrantRevocation {
                     revocation_id: "r-bo".into(),
@@ -358,7 +409,9 @@ mod tests {
             .await
             .unwrap();
         let chain = Arc::new(FakeChain::default());
-        *chain.accounts.lock().unwrap() = grant_pdas;
+        for pda in grant_pdas {
+            chain.grant(pda, drt_config("awards-report-v1"));
+        }
         chain.land("sig-grant", true);
         let solana = fake::start(chain);
 
@@ -368,7 +421,7 @@ mod tests {
                 .unwrap(),
             1
         );
-        let doc = storage.pools().get("P1").await.unwrap().unwrap();
+        let doc = storage.pools().get(&P1.to_string()).await.unwrap().unwrap();
         let ana = doc.active_grant("ana", "awards-report-v1").unwrap();
         assert_eq!(
             (ana.grant_id.as_str(), ana.signature.as_deref()),
@@ -408,7 +461,7 @@ mod tests {
         // account's history: the oldest that succeeded.
         let failed = json!({ "InstructionError": [0, "Custom"] });
         let chain = Arc::new(FakeChain::default());
-        *chain.accounts.lock().unwrap() = vec![on_chain];
+        chain.pool(on_chain, Pubkey::new_unique());
         *chain.history.lock().unwrap() = vec![
             json!({ "signature": "sig-later", "err": null }),
             json!({ "signature": "sig-create", "err": null }),

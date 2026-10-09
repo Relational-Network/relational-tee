@@ -306,7 +306,7 @@ pub async fn create_malta_pool(
     let signature = chain::run(
         &state.solana_client,
         &mut op,
-        &Effect::Account(pool_pda),
+        &Effect::Pool(pool_pda),
         "finalized",
         signed(&keypair, &ixs),
     )

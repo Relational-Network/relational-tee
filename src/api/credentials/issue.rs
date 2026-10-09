@@ -25,7 +25,7 @@ use crate::api::pools::{load_pool, signed, verify_pool_ownership};
 use crate::audit;
 use crate::auth::{Caller, Permission};
 use crate::blockchain::drt::{
-    accounts::fetch_pool,
+    accounts::{fetch_grant_state, fetch_pool, GrantState},
     instructions::build_grant_right,
     pda::{derive_drt_config_pda, derive_grant_pda, derive_user_ata},
     types::APPEND_DRT_NAME,
@@ -168,12 +168,15 @@ pub async fn issue_credentials(
         .commitments
         .commitment(&record_id, &pool_uuid, &append_right_id);
     let (grant_pda, _) = derive_grant_pda(&commitment);
-    let burned = state
-        .solana_client
-        .rpc()
-        .account_exists(&grant_pda, "confirmed")
-        .await
-        .map_err(|e| ApiError::rpc_unavailable(format!("Solana RPC error: {e}")))?;
+    let burned = fetch_grant_state(
+        state.solana_client.rpc(),
+        &grant_pda,
+        &drt_config_pda,
+        "confirmed",
+    )
+    .await
+    .map_err(|e| ApiError::rpc_unavailable(format!("Solana RPC error: {e}")))?
+        == GrantState::Live;
 
     // Check the admin holds ≥1 append DRT, unless this upload's burn
     // already happened: then a retry completes after the last DRT is gone.
@@ -263,7 +266,10 @@ pub async fn issue_credentials(
     let sig_str = chain::run(
         &state.solana_client,
         &mut op,
-        &Effect::Account(grant_pda),
+        &Effect::Grant {
+            pda: grant_pda,
+            drt_config: drt_config_pda,
+        },
         "finalized",
         signed(&keypair, std::slice::from_ref(&ix)),
     )

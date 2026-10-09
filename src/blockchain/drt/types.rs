@@ -64,6 +64,16 @@ pub struct Pool {
     pub bump: u8,
 }
 
+/// On-chain `Grant` account: the receipt of one burned DRT, at
+/// `["grant", commitment]` (8-byte discriminator stripped externally).
+#[derive(Debug, Clone, PartialEq, Eq, BorshDeserialize, BorshSerialize)]
+pub struct GrantAccount {
+    /// The DRT whose token was burned.
+    pub drt_config: Pubkey,
+    pub granted_at: i64,
+    pub bump: u8,
+}
+
 /// On-chain `DrtConfig` account, which only tests and `just grant-guard`
 /// read.
 #[cfg(test)]

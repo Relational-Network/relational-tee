@@ -6,12 +6,15 @@
 use borsh::BorshDeserialize;
 use solana_pubkey::Pubkey;
 
-use super::types::{Pool, DISC_POOL_ACCOUNT};
-use crate::blockchain::rpc::JsonRpcClient;
+use super::idl_generated::DISC_GRANT_ACCOUNT;
+use super::types::{GrantAccount, Pool, DISC_POOL_ACCOUNT};
+use crate::blockchain::rpc::{Account, JsonRpcClient, RpcError};
+use crate::config::drt_program_id;
 use crate::error::ApiError;
 
 /// Account size caps to prevent unbounded Borsh allocations from untrusted RPC.
 const MAX_POOL_DATA: usize = 1024;
+const MAX_GRANT_DATA: usize = 64;
 #[cfg(test)]
 const MAX_DRT_CONFIG_DATA: usize = 4 * 1024;
 
@@ -62,6 +65,50 @@ pub async fn fetch_pool(rpc: &JsonRpcClient, pool_pda: &Pubkey) -> Result<Pool, 
         .map_err(|e| ApiError::rpc_unavailable(format!("reading pool account {pool_pda}: {e}")))?
         .ok_or_else(|| ApiError::not_found(format!("pool account {pool_pda} not found")))?;
     decode(&data, &DISC_POOL_ACCOUNT, MAX_POOL_DATA, "pool")
+}
+
+/// Whether `account` is the program's `Pool`. Anyone can send lamports to
+/// an address, which makes an account there that the program didn't make.
+pub fn is_pool(account: Option<&Account>) -> bool {
+    account.is_some_and(|a| a.owner == drt_program_id() && a.data.starts_with(&DISC_POOL_ACCOUNT))
+}
+
+/// What the chain holds at a Grant PDA, for the DRT config a burn names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrantState {
+    /// The program's Grant for that DRT config: the burn happened, and the
+    /// grant hasn't been closed.
+    Live,
+    /// No Grant: nothing, or an account the program didn't make, such as
+    /// lamports someone sent to the address.
+    Absent,
+    /// The program's Grant for another DRT config. `create_pool` is open to
+    /// anyone, so whoever learns a commitment, from a closed grant's
+    /// events, can take its address with a DRT of their own. It grants
+    /// nothing here, and no burn of ours can land there.
+    Foreign,
+}
+
+/// Classify the account at a Grant PDA for a burn of `drt_config`'s DRT.
+pub fn grant_state(account: Option<&Account>, drt_config: &Pubkey) -> GrantState {
+    let Some(account) = account.filter(|a| a.owner == drt_program_id()) else {
+        return GrantState::Absent;
+    };
+    match decode::<GrantAccount>(&account.data, &DISC_GRANT_ACCOUNT, MAX_GRANT_DATA, "grant") {
+        Ok(grant) if grant.drt_config == *drt_config => GrantState::Live,
+        _ => GrantState::Foreign,
+    }
+}
+
+/// [`grant_state`] of the account at `grant_pda`, read at `commitment`.
+pub async fn fetch_grant_state(
+    rpc: &JsonRpcClient,
+    grant_pda: &Pubkey,
+    drt_config: &Pubkey,
+    commitment: &str,
+) -> Result<GrantState, RpcError> {
+    let account = rpc.get_account(grant_pda, commitment).await?;
+    Ok(grant_state(account.as_ref(), drt_config))
 }
 
 /// Fetch and deserialise a DrtConfig account, for the tests and `just

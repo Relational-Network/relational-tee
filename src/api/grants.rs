@@ -39,7 +39,7 @@ use crate::api::pools::{explorer_url, load_pool, signed, verify_pool_ownership};
 use crate::audit;
 use crate::auth::{Caller, Permission};
 use crate::blockchain::drt::{
-    accounts::fetch_pool,
+    accounts::{fetch_grant_state, fetch_pool, GrantState},
     instructions::{build_grant_right, build_revoke_grant},
     pda::{derive_drt_config_pda, derive_grant_pda, derive_user_ata},
 };
@@ -170,6 +170,13 @@ fn revocation_pending() -> ApiError {
     .with_code("revocation_pending")
 }
 
+fn address_taken() -> ApiError {
+    ApiError::conflict(
+        "this analyst's Grant PDA is taken by a DRT of another pool, so no burn can land there",
+    )
+    .with_code("grant_pda_taken")
+}
+
 fn superseded() -> ApiError {
     ApiError::conflict("the analyst's grant was revoked after this request began; grant again")
         .with_code("grant_superseded")
@@ -284,14 +291,17 @@ pub async fn grant_analysis(
         .commitments
         .commitment(&analyst.user_id, &pool_uuid, &right_id);
     let (grant_pda, _) = derive_grant_pda(&commitment);
+    let (drt_config_pda, _) = derive_drt_config_pda(&pool_pda, &right_id);
     let rpc = state.solana_client.rpc();
 
     // Unless the burn already happened, the owner needs an Execute DRT.
-    if !rpc
-        .account_exists(&grant_pda, "finalized")
+    let on_chain = fetch_grant_state(rpc, &grant_pda, &drt_config_pda, "finalized")
         .await
-        .map_err(rpc_error)?
-    {
+        .map_err(rpc_error)?;
+    if on_chain == GrantState::Foreign {
+        return Err(address_taken());
+    }
+    if on_chain == GrantState::Absent {
         let ata = derive_user_ata(&keypair.pubkey(), &mint);
         let held = match rpc.get_account_data(&ata).await.map_err(rpc_error)? {
             Some(account) => token_account_amount(&account)
@@ -355,7 +365,6 @@ pub async fn grant_analysis(
     crate::fault::point("staged");
 
     // ── BURN (irreversible, at most once) ─────────────────────────
-    let (drt_config_pda, _) = derive_drt_config_pda(&pool_pda, &right_id);
     let ix = build_grant_right(
         &pool_pda,
         &drt_config_pda,
@@ -366,7 +375,10 @@ pub async fn grant_analysis(
     let signature = chain::run(
         &state.solana_client,
         &mut op,
-        &Effect::Account(grant_pda),
+        &Effect::Grant {
+            pda: grant_pda,
+            drt_config: drt_config_pda,
+        },
         "finalized",
         signed(&keypair, std::slice::from_ref(&ix)),
     )
@@ -469,6 +481,7 @@ pub async fn revoke_grant(
     let commitment = state
         .commitments
         .commitment(analyst_id, &pool_uuid, &right_id);
+    let (drt_config_pda, _) = derive_drt_config_pda(&pool_pda, &right_id);
     let is_mine = |g: &Grant| {
         g.revoked
             .as_ref()
@@ -488,10 +501,14 @@ pub async fn revoke_grant(
     } else {
         let (grant_pda, _) = derive_grant_pda(&commitment);
         let rpc = state.solana_client.rpc();
-        let exists = |level| rpc.account_exists(&grant_pda, level);
-        if exists("finalized").await.map_err(rpc_error)? {
+        let live = |level| async move {
+            fetch_grant_state(rpc, &grant_pda, &drt_config_pda, level)
+                .await
+                .map(|s| s == GrantState::Live)
+        };
+        if live("finalized").await.map_err(rpc_error)? {
             true
-        } else if exists("confirmed").await.map_err(rpc_error)? {
+        } else if live("confirmed").await.map_err(rpc_error)? {
             return Err(ApiError::conflict(
                 "a grant to this analyst is still settling on-chain; retry in a few seconds",
             )
@@ -578,12 +595,14 @@ pub async fn revoke_grant(
         .commitment_bytes()
         .ok_or_else(|| ApiError::internal("a grant has no commitment"))?;
     let (grant_pda, _) = derive_grant_pda(&commitment);
-    let (drt_config_pda, _) = derive_drt_config_pda(&pool_pda, &right_id);
     let ix = build_revoke_grant(&keypair.pubkey(), &pool_pda, &drt_config_pda, &commitment);
     let signature = chain::run(
         &state.solana_client,
         &mut op,
-        &Effect::Closed(grant_pda),
+        &Effect::Closed {
+            pda: grant_pda,
+            drt_config: drt_config_pda,
+        },
         "finalized",
         signed(&keypair, std::slice::from_ref(&ix)),
     )
@@ -832,6 +851,11 @@ pub(crate) mod tests {
         uuid::Uuid::new_v4().to_string()
     }
 
+    /// The analysis pool's Execute DRT config.
+    pub(crate) fn execute_drt_config(pool_pda: &Pubkey) -> Pubkey {
+        derive_drt_config_pda(pool_pda, &EXECUTE_RIGHT_ID).0
+    }
+
     fn grant_pda(worker: &Worker, analyst: &str) -> Pubkey {
         let commitment = worker
             .commitments
@@ -932,7 +956,7 @@ pub(crate) mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{granted}");
         let pda = grant_pda(&worker, &analyst_id);
-        worker.chain.accounts.lock().unwrap().push(pda);
+        worker.chain.grant(pda, execute_drt_config(&pool_pda));
 
         // The close fails, but access has already ended.
         let refused = json!({ "InstructionError": [0, "Custom"] });
@@ -981,7 +1005,7 @@ pub(crate) mod tests {
         assert!(revoked["revoke_signature"].is_string());
         let sent = worker.chain.sent();
         assert_eq!(sent_call(&worker, sent.len() - 1).0, DISC_REVOKE_GRANT);
-        worker.chain.accounts.lock().unwrap().retain(|a| *a != pda);
+        worker.chain.close(&pda);
 
         // The first revocation's retry finds its grant closed.
         let (status, _, retried) = send(
@@ -1052,12 +1076,10 @@ pub(crate) mod tests {
             .stage("grant-g-lost", staged)
             .await
             .unwrap();
-        worker
-            .chain
-            .accounts
-            .lock()
-            .unwrap()
-            .push(derive_grant_pda(&commitment).0);
+        worker.chain.grant(
+            derive_grant_pda(&commitment).0,
+            execute_drt_config(&pool_pda),
+        );
         worker.chain.lands.store(true, SeqCst);
 
         let path = format!("/v1/drt/pools/{pool_pda}/revoke-grant");
@@ -1157,5 +1179,36 @@ pub(crate) mod tests {
         );
         assert_eq!(send(&worker.app, request).await.0, StatusCode::FORBIDDEN);
         assert!(worker.chain.sent().is_empty());
+    }
+
+    #[tokio::test]
+    async fn only_the_programs_grant_for_this_drt_counts_as_a_burn() {
+        let worker = worker();
+        let owner = worker.admin("oid-owner").await;
+        let pool_pda = analysis_pool(&worker, &owner, 2).await;
+        let (_, analyst_id) = analyst(&worker.app, "oid-ana", &[]).await;
+        worker.chain.lands.store(true, SeqCst);
+        let path = format!("/v1/drt/pools/{pool_pda}/grant");
+        let body = json!({ "analyst_user_id": analyst_id, "analysis_id": ANALYSIS });
+        let pda = grant_pda(&worker, &analyst_id);
+
+        // Lamports someone sent to the address are no burn: the grant burns.
+        worker.chain.accounts.lock().unwrap().push(pda);
+        let (status, _, granted) =
+            send(&worker.app, post(&path, &owner.token, &new_key(), &body)).await;
+        assert_eq!(status, StatusCode::OK, "{granted}");
+        assert_eq!(sent_call(&worker, 0).0, DISC_GRANT_RIGHT);
+
+        // A Grant another pool's DRT made at the address takes it: no burn
+        // of ours can land there.
+        let (_, other_id) = analyst(&worker.app, "oid-bo", &[]).await;
+        let taken = grant_pda(&worker, &other_id);
+        worker.chain.grant(taken, Pubkey::new_unique());
+        let body = json!({ "analyst_user_id": other_id, "analysis_id": ANALYSIS });
+        let (status, _, refused) =
+            send(&worker.app, post(&path, &owner.token, &new_key(), &body)).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+        assert_eq!(refused["code"], "grant_pda_taken");
+        assert_eq!(worker.chain.sent().len(), 1, "nothing more was sent");
     }
 }

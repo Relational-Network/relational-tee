@@ -24,6 +24,7 @@ use solana_pubkey::Pubkey;
 use solana_transaction::Transaction;
 use tracing::warn;
 
+use crate::blockchain::drt::accounts::{fetch_grant_state, is_pool, GrantState};
 use crate::blockchain::rpc::RpcError;
 use crate::blockchain::transactions::reached;
 use crate::blockchain::SolanaClient;
@@ -31,16 +32,62 @@ use crate::error::ApiError;
 use crate::idempotency::{Operation, StoredTx};
 
 /// What a chain step's effect is, so a retry can tell whether it happened.
+/// Each is checked by what the program made, not by an account merely
+/// existing: anyone can send lamports to an address, which makes an
+/// account there.
 pub enum Effect {
-    /// An account the transaction creates: a pool, or a Grant PDA.
-    Account(Pubkey),
-    /// An account the transaction closes: a revoked Grant PDA.
-    Closed(Pubkey),
+    /// The pool the transaction creates: the program's `Pool` account.
+    Pool(Pubkey),
+    /// A burn: the program's Grant at `pda` for `drt_config`.
+    Grant { pda: Pubkey, drt_config: Pubkey },
+    /// A Grant PDA the transaction closes: once its `drt_config` Grant is
+    /// gone.
+    Closed { pda: Pubkey, drt_config: Pubkey },
     /// The transaction itself, for a transfer.
     Transfer,
 }
 
 impl Effect {
+    /// Whether the effect has happened, as seen at `commitment`. A transfer
+    /// leaves nothing to look at, so it never has.
+    pub async fn happened(
+        &self,
+        solana: &SolanaClient,
+        commitment: &str,
+    ) -> Result<bool, ApiError> {
+        let rpc = solana.rpc();
+        let lookup = rpc_error("account lookup failed");
+        Ok(match self {
+            Self::Pool(pda) => is_pool(
+                rpc.get_account(pda, commitment)
+                    .await
+                    .map_err(lookup)?
+                    .as_ref(),
+            ),
+            Self::Grant { pda, drt_config } => {
+                fetch_grant_state(rpc, pda, drt_config, commitment)
+                    .await
+                    .map_err(lookup)?
+                    == GrantState::Live
+            }
+            Self::Closed { pda, drt_config } => {
+                fetch_grant_state(rpc, pda, drt_config, commitment)
+                    .await
+                    .map_err(lookup)?
+                    != GrantState::Live
+            }
+            Self::Transfer => false,
+        })
+    }
+
+    /// The account the effect is about, if any.
+    fn account(&self) -> Option<&Pubkey> {
+        match self {
+            Self::Pool(pda) | Self::Grant { pda, .. } | Self::Closed { pda, .. } => Some(pda),
+            Self::Transfer => None,
+        }
+    }
+
     /// The effect's signature if it has happened, as seen at `commitment`.
     async fn done(
         &self,
@@ -48,21 +95,16 @@ impl Effect {
         stored: Option<&str>,
         commitment: &str,
     ) -> Result<Option<String>, ApiError> {
-        let (account, created) = match self {
-            Self::Account(account) => (account, true),
-            Self::Closed(account) => (account, false),
-            Self::Transfer => return Ok(None),
+        let Some(account) = self.account() else {
+            return Ok(None);
         };
-        let exists = solana
-            .rpc()
-            .account_exists(account, commitment)
-            .await
-            .map_err(rpc_error("account lookup failed"))?;
-        Ok(match (created, exists) {
-            (true, true) => Some(creating_signature(solana, stored, account, commitment).await?),
-            (false, false) => Some(closing_signature(solana, stored, account, commitment).await?),
-            _ => None,
-        })
+        if !self.happened(solana, commitment).await? {
+            return Ok(None);
+        }
+        Ok(Some(match self {
+            Self::Closed { .. } => closing_signature(solana, stored, account, commitment).await?,
+            _ => creating_signature(solana, stored, account, commitment).await?,
+        }))
     }
 }
 
@@ -341,7 +383,7 @@ mod tests {
         s.chain.lands.store(true, SeqCst);
         s.chain.block_height.store(100 + VALID_FOR + 1, SeqCst);
 
-        let pool = Effect::Account(Pubkey::new_from_array([3; 32]));
+        let pool = Effect::Pool(Pubkey::new_from_array([3; 32]));
         let (signature, stored) = s.retry(&pool, "confirmed").await;
         assert_ne!(signature, first.signature);
         assert_eq!(stored.signature, signature, "the replacement is stored");
@@ -353,24 +395,61 @@ mod tests {
         let s = setup();
         let first = s.stored_then_died().await;
         s.chain.land(&first.signature, true);
-        let grant = Pubkey::new_from_array([4; 32]);
-        s.chain.accounts.lock().unwrap().push(grant);
+        let pda = Pubkey::new_from_array([4; 32]);
+        let drt_config = Pubkey::new_from_array([6; 32]);
+        s.chain.grant(pda, drt_config);
         s.chain.block_height.store(100 + VALID_FOR + 1, SeqCst);
 
-        let (signature, _) = s.retry(&Effect::Account(grant), "finalized").await;
+        let burn = Effect::Grant { pda, drt_config };
+        let (signature, _) = s.retry(&burn, "finalized").await;
         assert_eq!(signature, first.signature);
         assert!(s.chain.sent().is_empty());
     }
 
     #[tokio::test]
+    async fn only_the_programs_account_counts_as_an_effect() {
+        let pda = Pubkey::new_from_array([4; 32]);
+        let drt_config = Pubkey::new_from_array([6; 32]);
+        let burn = Effect::Grant { pda, drt_config };
+        let pool = Effect::Pool(pda);
+        for (what, effect) in [("burn", &burn), ("pool", &pool)] {
+            // Lamports sent to the address make an account there that the
+            // program didn't make: the burn or the pool is still to do.
+            let s = setup();
+            let first = s.stored_then_died().await;
+            s.chain.accounts.lock().unwrap().push(pda);
+            s.chain.lands.store(true, SeqCst);
+            s.chain.block_height.store(100 + VALID_FOR + 1, SeqCst);
+            let (signature, stored) = s.retry(effect, "finalized").await;
+            assert_ne!(signature, first.signature, "the {what} is sent anew");
+            assert_eq!(s.chain.sent(), [stored.transaction]);
+        }
+
+        // A Grant for another DRT isn't this burn.
+        let s = setup();
+        s.chain.grant(pda, Pubkey::new_from_array([7; 32]));
+        assert!(!burn.happened(&s.solana, "finalized").await.unwrap());
+        assert!(Effect::Closed { pda, drt_config }
+            .happened(&s.solana, "finalized")
+            .await
+            .unwrap());
+        s.chain.grant(pda, drt_config);
+        assert!(burn.happened(&s.solana, "finalized").await.unwrap());
+        s.chain.pool(pda, Pubkey::new_unique());
+        assert!(pool.happened(&s.solana, "finalized").await.unwrap());
+    }
+
+    #[tokio::test]
     async fn a_closed_account_is_never_closed_again() {
-        let grant = Pubkey::new_from_array([5; 32]);
+        let pda = Pubkey::new_from_array([5; 32]);
+        let drt_config = Pubkey::new_from_array([6; 32]);
+        let close = Effect::Closed { pda, drt_config };
 
         // The stored close landed, and the account is gone.
         let s = setup();
         let first = s.stored_then_died().await;
         s.chain.land(&first.signature, true);
-        let (signature, _) = s.retry(&Effect::Closed(grant), "finalized").await;
+        let (signature, _) = s.retry(&close, "finalized").await;
         assert_eq!(signature, first.signature);
         assert!(s.chain.sent().is_empty());
 
@@ -385,25 +464,19 @@ mod tests {
             json!({ "signature": "sig-close", "err": null }),
             json!({ "signature": "sig-grant", "err": null }),
         ];
-        let (signature, _) = s.retry(&Effect::Closed(grant), "finalized").await;
+        let (signature, _) = s.retry(&close, "finalized").await;
         assert_eq!(signature, "sig-close");
         assert!(s.chain.sent().is_empty());
 
-        // While the account exists, the close is sent.
+        // While the Grant exists, the close is sent.
         let s = setup();
-        s.chain.accounts.lock().unwrap().push(grant);
+        s.chain.grant(pda, drt_config);
         s.chain.lands.store(true, SeqCst);
         let mut op = s.open().await;
         let build = signed(&s.keypair, &s.transfer);
-        let signature = run(
-            &s.solana,
-            &mut op,
-            &Effect::Closed(grant),
-            "finalized",
-            build,
-        )
-        .await
-        .unwrap();
+        let signature = run(&s.solana, &mut op, &close, "finalized", build)
+            .await
+            .unwrap();
         assert_eq!(s.chain.sent().len(), 1);
         assert_eq!(op.stored_tx().unwrap().signature, signature);
     }

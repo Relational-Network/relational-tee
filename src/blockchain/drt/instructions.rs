@@ -245,7 +245,7 @@ mod tests {
     use solana_transaction::Transaction;
 
     use super::*;
-    use crate::blockchain::drt::accounts::fetch_drt_config;
+    use crate::blockchain::drt::accounts::{fetch_drt_config, fetch_grant_state, GrantState};
     use crate::blockchain::rpc::JsonRpcClient;
     use crate::config::DEFAULT_SOLANA_RPC_URL;
 
@@ -376,7 +376,13 @@ mod tests {
             "the rebuilt instruction is the landed one"
         );
         let (grant_pda, _) = derive_grant_pda(&landed.commitment);
-        assert!(rpc.account_exists(&grant_pda, "finalized").await.unwrap());
+        assert_eq!(
+            fetch_grant_state(&rpc, &grant_pda, &drt_config, "finalized")
+                .await
+                .unwrap(),
+            GrantState::Live,
+            "the landed grant reads as the program's Grant for its DRT"
+        );
         let config = fetch_drt_config(&rpc, &drt_config).await.unwrap();
         assert_eq!((config.pool, config.mint), (pool, mint));
 

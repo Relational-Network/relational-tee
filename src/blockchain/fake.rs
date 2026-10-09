@@ -8,6 +8,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use axum::extract::State;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -17,17 +19,30 @@ use solana_hash::Hash;
 use solana_pubkey::Pubkey;
 use solana_transaction::Transaction;
 
+use super::drt::idl_generated::DISC_GRANT_ACCOUNT;
+use super::drt::types::{GrantAccount, Pool, DISC_POOL_ACCOUNT};
 use super::types::devnet_config;
 use super::SolanaClient;
+use crate::config::drt_program_id;
+
+const SYSTEM_PROGRAM: &str = "11111111111111111111111111111111";
 
 /// How many blocks a blockhash stays valid for.
 pub const VALID_FOR: u64 = 150;
 
 #[derive(Default)]
 pub struct FakeChain {
+    /// Accounts that hold only lamports, owned by the System program, as
+    /// sending SOL to an address makes them.
     pub accounts: Mutex<Vec<Pubkey>>,
-    /// Accounts with data, which `getAccountInfo` returns.
+    /// Accounts with data, owned by the DRT program, which `getAccountInfo`
+    /// and `getMultipleAccounts` return.
     pub data: Mutex<Vec<(Pubkey, Vec<u8>)>>,
+    /// While set, account reads answer with this HTTP status, as a node
+    /// that is down (503) or rate-limiting (429) does.
+    pub refuse_reads: Mutex<Option<u16>>,
+    /// Every method called, in order.
+    pub calls: Mutex<Vec<String>>,
     /// Mints' supplies, which `getTokenSupply` returns; for any other mint
     /// it answers with an error.
     pub supplies: Mutex<Vec<(Pubkey, u64)>>,
@@ -57,33 +72,77 @@ impl FakeChain {
         self.sent.lock().unwrap().clone()
     }
 
+    /// The program's Grant at `pda`, for a burn of `drt_config`'s DRT.
+    pub fn grant(&self, pda: Pubkey, drt_config: Pubkey) {
+        let account = GrantAccount {
+            drt_config,
+            granted_at: 1,
+            bump: 255,
+        };
+        let data = [&DISC_GRANT_ACCOUNT[..], &borsh::to_vec(&account).unwrap()].concat();
+        self.close(&pda);
+        self.data.lock().unwrap().push((pda, data));
+    }
+
+    /// The program's Pool at `pda`, owned by `owner`.
+    pub fn pool(&self, pda: Pubkey, owner: Pubkey) {
+        let account = Pool {
+            uuid: [7; 16],
+            owner,
+            created_at: 0,
+            sealed: true,
+            bump: 255,
+        };
+        let data = [&DISC_POOL_ACCOUNT[..], &borsh::to_vec(&account).unwrap()].concat();
+        self.close(&pda);
+        self.data.lock().unwrap().push((pda, data));
+    }
+
+    /// Remove whatever account is at `pda`, as closing it does.
+    pub fn close(&self, pda: &Pubkey) {
+        self.data.lock().unwrap().retain(|(a, _)| a != pda);
+        self.accounts.lock().unwrap().retain(|a| a != pda);
+    }
+
+    /// The account at `address` as `getAccountInfo` returns it, or null.
+    fn account(&self, address: &str) -> Value {
+        let data = self
+            .data
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(a, _)| a.to_string() == address)
+            .map(|(_, data)| data.clone());
+        if let Some(data) = data {
+            return json!({ "lamports": 1, "owner": drt_program_id().to_string(),
+                "data": [BASE64.encode(data), "base64"] });
+        }
+        let lamports_only = self
+            .accounts
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|a| a.to_string() == address);
+        if lamports_only {
+            json!({ "lamports": 1, "owner": SYSTEM_PROGRAM, "data": ["", "base64"] })
+        } else {
+            Value::Null
+        }
+    }
+
     /// The call's result, or its JSON-RPC error.
     fn answer(&self, method: &str, params: &Value) -> Result<Value, Value> {
         let context = |value: Value| json!({ "context": { "slot": 1 }, "value": value });
         Ok(match method {
-            "getAccountInfo" => {
-                let address = params[0].as_str().unwrap();
-                let data = self
-                    .data
-                    .lock()
+            "getAccountInfo" => context(self.account(params[0].as_str().unwrap())),
+            "getMultipleAccounts" => context(Value::Array(
+                params[0]
+                    .as_array()
                     .unwrap()
                     .iter()
-                    .find(|(a, _)| a.to_string() == address)
-                    .map(|(_, data)| data.clone());
-                let exists = data.is_some()
-                    || self
-                        .accounts
-                        .lock()
-                        .unwrap()
-                        .iter()
-                        .any(|a| a.to_string() == address);
-                context(if exists {
-                    let data = BASE64.encode(data.unwrap_or_default());
-                    json!({ "lamports": 1, "data": [data, "base64"] })
-                } else {
-                    Value::Null
-                })
-            }
+                    .map(|a| self.account(a.as_str().unwrap()))
+                    .collect(),
+            )),
             "getSignatureStatuses" => {
                 let signature = params[0][0].as_str().unwrap();
                 let status = self
@@ -153,13 +212,18 @@ impl FakeChain {
     }
 }
 
-async fn rpc(State(chain): State<Arc<FakeChain>>, Json(req): Json<Value>) -> Json<Value> {
-    Json(
-        match chain.answer(req["method"].as_str().unwrap(), &req["params"]) {
-            Ok(result) => json!({ "jsonrpc": "2.0", "id": req["id"], "result": result }),
-            Err(error) => json!({ "jsonrpc": "2.0", "id": req["id"], "error": error }),
-        },
-    )
+async fn rpc(State(chain): State<Arc<FakeChain>>, Json(req): Json<Value>) -> Response {
+    let method = req["method"].as_str().unwrap();
+    chain.calls.lock().unwrap().push(method.into());
+    let reads = matches!(method, "getAccountInfo" | "getMultipleAccounts");
+    if let Some(status) = chain.refuse_reads.lock().unwrap().filter(|_| reads) {
+        return StatusCode::from_u16(status).unwrap().into_response();
+    }
+    Json(match chain.answer(method, &req["params"]) {
+        Ok(result) => json!({ "jsonrpc": "2.0", "id": req["id"], "result": result }),
+        Err(error) => json!({ "jsonrpc": "2.0", "id": req["id"], "error": error }),
+    })
+    .into_response()
 }
 
 /// Serve `chain` on an ephemeral port, and a client for it.

@@ -78,7 +78,9 @@ pub(crate) mod tests {
     use super::*;
     use crate::auth::entra::mint::Spec;
     use crate::auth::entra::tests::{config, entra_key};
-    use crate::blockchain::drt::pda::{derive_grant_pda, derive_user_ata, Commitments};
+    use crate::blockchain::drt::pda::{
+        derive_drt_config_pda, derive_grant_pda, derive_user_ata, Commitments,
+    };
     use crate::blockchain::drt::types::{Pool, APPEND_DRT_NAME, DISC_POOL_ACCOUNT};
     use crate::blockchain::fake::{self, FakeChain};
     use crate::config::MAX_BODY_SIZE;
@@ -427,11 +429,10 @@ pub(crate) mod tests {
             .await
             .unwrap();
         let chain = &worker.chain;
-        chain
-            .accounts
-            .lock()
-            .unwrap()
-            .push(derive_grant_pda(&earlier).0);
+        chain.grant(
+            derive_grant_pda(&earlier).0,
+            derive_drt_config_pda(&pool_pda, &APPEND_RIGHT_ID).0,
+        );
         *chain.history.lock().unwrap() = vec![json!({ "signature": "sig-earlier", "err": null })];
         chain.lands.store(true, std::sync::atomic::Ordering::SeqCst);
 
