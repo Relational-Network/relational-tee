@@ -169,6 +169,30 @@ pub async fn estimate_fee(
     }))
 }
 
+/// 400 `drt_not_transferable` if `mint` is any pool's Execute DRT. Analysis
+/// grants are burns of those DRTs, and the program lets whoever holds one
+/// burn it into a Grant, so they stay in their pool owner's wallet, whose
+/// key only the worker holds: then every analysis Grant on-chain is one the
+/// worker made.
+async fn refuse_execute_drts(state: &AppState, mint: &str) -> Result<(), ApiError> {
+    let Ok(mint) = Pubkey::from_str(mint) else {
+        return Ok(());
+    };
+    let execute = state.storage.pools().all().await?.into_iter().any(|doc| {
+        doc.analysis
+            .as_ref()
+            .and_then(|a| doc.drts.get(&a.analysis_id))
+            .is_some_and(|drt| Pubkey::from_str(&drt.mint).ok() == Some(mint))
+    });
+    if execute {
+        return Err(ApiError::bad_request(
+            "a pool's Execute DRTs stay in its owner's wallet: grant analysts instead",
+        )
+        .with_code("drt_not_transferable"));
+    }
+    Ok(())
+}
+
 /// Sign and broadcast a transaction from the wallet.
 ///
 /// The transfer follows the stored-transaction rule, so retries with the
@@ -187,7 +211,7 @@ pub async fn estimate_fee(
     request_body = SendTransactionRequest,
     responses(
         (status = 200, description = "Transaction sent", body = SendTransactionResponse),
-        (status = 400, description = "An amount of zero, an invalid token, no Idempotency-Key, or Solana refused the transaction (`transaction_rejected`)"),
+        (status = 400, description = "An amount of zero, an invalid token, a pool's Execute DRT (`drt_not_transferable`), no Idempotency-Key, or Solana refused the transaction (`transaction_rejected`)"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden"),
         (status = 404, description = "Wallet not found"),
@@ -215,6 +239,9 @@ pub async fn send_transaction(
 
     if payload.amount == 0 {
         return Err(ApiError::bad_request("amount must be greater than zero"));
+    }
+    if let Some(mint) = payload.token.strip_prefix("spl:") {
+        refuse_execute_drts(&state, mint).await?;
     }
 
     // Load keypair (never leaves the worker) and verify it matches the wallet.
@@ -364,4 +391,56 @@ pub async fn get_transaction_status(
         })?;
 
     Ok(Json(TransactionStatusResponse { transaction }))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::Ordering::SeqCst;
+
+    use axum::body::Body;
+    use axum::http::{header, Request, StatusCode};
+    use serde_json::json;
+
+    use crate::api::credentials::tests::{send, worker};
+    use crate::api::grants::tests::{analysis_pool, ANALYSIS};
+    use crate::blockchain::drt::types::APPEND_DRT_NAME;
+    use crate::idempotency::KEY_HEADER;
+
+    #[tokio::test]
+    async fn a_pools_execute_drts_stay_in_its_owners_wallet() {
+        let worker = worker();
+        let owner = worker.admin("oid-owner").await;
+        let pool_pda = analysis_pool(&worker, &owner, 2).await;
+        worker.chain.lands.store(true, SeqCst);
+        let doc = worker
+            .storage
+            .pools()
+            .get(&pool_pda.to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        let send_drt = |name: &str| {
+            let body = json!({
+                "recipient": solana_pubkey::Pubkey::new_unique().to_string(),
+                "amount": 1,
+                "token": format!("spl:{}", doc.drts[name].mint),
+                "decimals": 0,
+            });
+            Request::post(format!("/v1/wallets/{}/send", owner.wallet_id))
+                .header(header::AUTHORIZATION, format!("Bearer {}", owner.token))
+                .header(&KEY_HEADER, uuid::Uuid::new_v4().to_string())
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+
+        let (status, _, refused) = send(&worker.app, send_drt(ANALYSIS)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+        assert_eq!(refused["code"], "drt_not_transferable");
+        assert!(worker.chain.sent().is_empty());
+
+        let (status, _, sent) = send(&worker.app, send_drt(APPEND_DRT_NAME)).await;
+        assert_eq!(status, StatusCode::OK, "append DRTs still send: {sent}");
+        assert_eq!(worker.chain.sent().len(), 1);
+    }
 }
