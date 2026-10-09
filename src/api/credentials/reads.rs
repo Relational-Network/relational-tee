@@ -333,20 +333,22 @@ pub async fn pool_summary(
     path = "/v1/drt/pools/list",
     tag = "Credentials",
     summary = "List all pools",
-    description = "Browse all credential pools. Supports filtering by state, search by name, sorting, and cursor pagination.",
+    description = "Browse all credential pools. Supports filtering by state, search by name, sorting, and cursor pagination. Needs `pools:read`: anyone in the tenant can sign in, and pool names are for admins.",
     security(("bearer_auth" = [])),
     params(ListAllPoolsQuery),
     responses(
         (status = 200, description = "Pool list", body = AllPoolsResponse),
         (status = 400, description = "Invalid cursor, state or sort"),
         (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Needs pools:read"),
     )
 )]
 pub async fn list_all_pools(
-    _caller: Caller,
+    caller: Caller,
     State(state): State<AppState>,
     Query(query): Query<ListAllPoolsQuery>,
 ) -> Result<Json<AllPoolsResponse>, ApiError> {
+    caller.require(Permission::PoolsRead)?;
     let search = query.search.as_deref().map(str::to_lowercase);
     let mut entries: Vec<MarketplacePoolEntry> = Vec::new();
     for doc in state.storage.pools().all().await? {

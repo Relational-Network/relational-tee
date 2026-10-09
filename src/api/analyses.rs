@@ -1104,7 +1104,6 @@ pub(crate) mod tests {
         let (elsewhere, elsewhere_id) = analyst(&worker.app, "oid-region-e").await;
         // A groups overage marker means nothing: rows come from the grant.
         let mut spec = Spec::valid(&config());
-        spec.roles = vec!["Analyst".into()];
         spec.groups_overage = true;
         let overage = spec.sign(entra_key()).unwrap();
         let overage_id = sign_in(&worker.app, &overage).await;
@@ -1135,7 +1134,7 @@ pub(crate) mod tests {
                 StatusCode::FORBIDDEN,
                 "invalid_grant_scope",
             ),
-            (&nobody, json!({}), StatusCode::FORBIDDEN, "forbidden"),
+            (&nobody, json!({}), StatusCode::FORBIDDEN, "no_grant"),
             (
                 &granted,
                 json!({ "scope": { "employer_group": "Group C" } }),
@@ -1269,7 +1268,7 @@ pub(crate) mod tests {
             *counts.entry(r.outcome.as_str()).or_default() += 1;
             counts
         });
-        assert_eq!(outcomes["no_grant"], 2);
+        assert_eq!(outcomes["no_grant"], 3);
         assert_eq!(outcomes["no_employer_scope"], 1);
         assert_eq!(outcomes["invalid_grant_scope"], 1);
         assert_eq!(outcomes["invalid_query"], 7);

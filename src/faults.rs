@@ -244,7 +244,11 @@ impl Suite {
     async fn signed_in(&self, oid: &str, role: &str) -> Result<User, String> {
         let mut spec = crate::auth::entra::mint::Spec::valid(&self.entra);
         spec.oid = oid.into();
-        spec.roles = vec![role.into()];
+        spec.roles = [role]
+            .into_iter()
+            .filter(|r| !r.is_empty())
+            .map(String::from)
+            .collect();
         spec.email = Some(format!("{oid}@faults.invalid"));
         spec.name = Some("Fault suite".into());
         let token = spec.sign(&self.signer)?;
@@ -551,7 +555,8 @@ async fn kills_during_grants(s: &Suite) -> Result<(), String> {
     let create = s.pool_call_with(&name, 1, SAGA_POINTS.len() as u64);
     let pool = s.api.settle(&create).await?.expect(201)?.str("pool_pda")?;
     for point in SAGA_POINTS {
-        let analyst = s.signed_in(&uuid(), "Analyst").await?;
+        // Analysts need no app role.
+        let analyst = s.signed_in(&uuid(), "").await?;
         let before = s.remaining_of(&pool, ANALYSIS).await?;
         let grant = s.grant_call(&pool, "grant", &analyst);
         s.api.crash(&grant, point).await?;

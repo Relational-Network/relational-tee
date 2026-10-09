@@ -19,9 +19,10 @@
 //! | `analyses:run` | Running a pool's analysis: with a grant, or as `Admin` |
 //!
 //! Wallet creation, deletion and sends, and the `/v1/admin/…` routes, need
-//! the `Admin` role itself. `Admin` grants every permission, `Analyst` only
-//! `analyses:run`, and no role none, which leaves `/v1/users/me` and the
-//! pool list.
+//! the `Admin` role itself. `Admin` grants every permission. Every other
+//! signed-in caller gets `analyses:run` and nothing else: Entra only says
+//! who they are, and what they may run, and which rows, comes from their
+//! grants, which the chain must show.
 //!
 //! An analysis shows `Admin` callers every row, and an analyst only the rows
 //! their grant's targets give.
@@ -44,9 +45,6 @@ use crate::storage::identities::SignIn;
 
 /// The app role that administers the pilot.
 pub const ADMIN: &str = "Admin";
-
-/// The app role that runs analyses through grants.
-pub const ANALYST: &str = "Analyst";
 
 /// What a caller may do, as the dashboard names it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
@@ -87,14 +85,14 @@ impl Permission {
     }
 }
 
-/// The permissions `roles` grant.
+/// The permissions a signed-in caller with `roles` has: every one for
+/// `Admin`, and otherwise `analyses:run`, which runs only what their grants
+/// allow. No other role means anything.
 pub fn permissions(roles: &[String]) -> Vec<Permission> {
     if roles.iter().any(|r| r == ADMIN) {
         Permission::ALL.to_vec()
-    } else if roles.iter().any(|r| r == ANALYST) {
-        vec![Permission::AnalysesRun]
     } else {
-        Vec::new()
+        vec![Permission::AnalysesRun]
     }
 }
 
@@ -184,16 +182,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn admin_grants_every_permission_analyst_one_and_no_role_none() {
+    fn admin_grants_every_permission_and_anyone_else_runs_their_grants() {
         let admin = permissions(&["Admin".into()]);
         assert_eq!(admin, Permission::ALL);
         assert_eq!(
             permissions(&["Analyst".into(), "Admin".into()]),
             Permission::ALL
         );
-        assert_eq!(permissions(&["Analyst".into()]), [Permission::AnalysesRun]);
-        assert!(permissions(&[]).is_empty());
-        assert!(permissions(&["admin".into(), "analyst".into()]).is_empty());
+        for roles in [
+            vec![],
+            vec!["Analyst".to_string()],
+            vec!["admin".to_string()],
+        ] {
+            assert_eq!(permissions(&roles), [Permission::AnalysesRun], "{roles:?}");
+        }
         assert_eq!(
             serde_json::to_value(admin).unwrap(),
             serde_json::json!([

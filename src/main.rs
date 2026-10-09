@@ -93,7 +93,7 @@ Protected endpoints need an Entra ID access token for this API, with the `access
 
 ### Permissions:
 
-The `Admin` app role grants `pools:read`, `pools:create`, `pools:write`, `wallets:read`, `users:read` and `analyses:run`, and is itself required for wallet creation, deletion and sends and for `/v1/admin/…`. The `Analyst` app role grants only `analyses:run`. A caller with no role can call only `/v1/users/me` and the pool list. `GET /v1/users/me` lists the caller's permissions.
+The `Admin` app role grants `pools:read`, `pools:create`, `pools:write`, `wallets:read`, `users:read` and `analyses:run`, and is itself required for wallet creation, deletion and sends and for `/v1/admin/…`. Every other signed-in caller gets only `analyses:run`: they run the analyses their grants allow, and no app role is needed. `GET /v1/users/me` lists the caller's permissions.
 
 An analysis shows admins every row. An analyst sees only the rows of their grant's targets (employers, employer groups, or another scope key the analysis declares), which the pool's owner sets when granting and can change with `POST …/grant-scope`; the chain must also show the grant's Grant PDA. A grant with no targets sees nothing.
 "#
@@ -925,17 +925,21 @@ mod tests {
         assert_eq!(me["email"], "Ada@Example.com");
         assert_eq!(me["display_name"], "Ada");
 
-        // A caller with no role sees only themselves and the pool list:
-        // every other documented read refuses them.
+        // A caller with no role sees themselves and the analyses they're
+        // granted, none yet: every other documented read refuses them.
         let (status, them) = get_as(&app, &nobody, "/v1/users/me").await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(them["permissions"], serde_json::json!([]));
-        assert_eq!(
-            get_as(&app, &nobody, "/v1/drt/pools/list").await.0,
-            StatusCode::OK
-        );
+        assert_eq!(them["permissions"], serde_json::json!(["analyses:run"]));
+        let (status, granted) = get_as(&app, &nobody, "/v1/drt/me/analyses").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(granted["analyses"], serde_json::json!([]));
         let reads = secured_reads();
-        for uri in ["/v1/users", "/v1/wallets", "/v1/admin/wallets"] {
+        for uri in [
+            "/v1/users",
+            "/v1/wallets",
+            "/v1/admin/wallets",
+            "/v1/drt/pools/list",
+        ] {
             assert!(reads.iter().any(|read| read == uri), "{uri}");
         }
         for uri in reads {
@@ -956,7 +960,7 @@ mod tests {
         assert_eq!(next["users"][0]["user_id"], them["user_id"]);
         assert!(next.get("next_cursor").is_none());
 
-        // An analyst may run analyses, and nothing else.
+        // An `Analyst` role, from before analysts needed none, adds nothing.
         let analyst = token(&["Analyst"], "cy@example.com");
         let (_, cy) = get_as(&app, &analyst, "/v1/users/me").await;
         assert_eq!(cy["permissions"], serde_json::json!(["analyses:run"]));
@@ -1055,8 +1059,15 @@ mod tests {
 
     /// The operations any caller with a valid token may call, a caller with
     /// no app role included.
+    /// Reads any signed-in caller may make: who they are, and what they're
+    /// granted.
     const FOR_ANY_CALLER: [(&str, &str); 2] =
-        [("get", "/v1/users/me"), ("get", "/v1/drt/pools/list")];
+        [("get", "/v1/users/me"), ("get", "/v1/drt/me/analyses")];
+
+    /// Reads any signed-in caller may make that answer by their grants:
+    /// they document 403 for a caller without one.
+    const BY_GRANT: [(&str, &str); 1] =
+        [("get", "/v1/drt/pools/{pool_pda}/analyses/{analysis_id}")];
 
     #[test]
     fn the_openapi_document_declares_path_parameters_error_bodies_and_refusals() {
@@ -1126,7 +1137,11 @@ mod tests {
             let Some(read) = operations.get("get") else {
                 continue;
             };
-            if read.get("security").is_none() || FOR_ANY_CALLER.contains(&("get", path.as_str())) {
+            let any_caller = FOR_ANY_CALLER
+                .iter()
+                .chain(&BY_GRANT)
+                .any(|read| *read == ("get", path.as_str()));
+            if read.get("security").is_none() || any_caller {
                 continue;
             }
             let mut uri = path.clone();

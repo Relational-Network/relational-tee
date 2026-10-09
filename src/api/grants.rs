@@ -1071,12 +1071,11 @@ pub async fn list_grants(
     path = "/v1/drt/me/analyses",
     tag = "Grants",
     summary = "My analyses",
-    description = "The analyses the caller may run, by pool name: for an admin every pool's, with every row; for an analyst those they hold an active grant to that the chain shows. Needs `analyses:run`.",
+    description = "The analyses the caller may run, by pool name: for an admin every pool's, with every row; for anyone else those they hold an active grant to that the chain shows, none until they're granted. Any signed-in caller.",
     security(("bearer_auth" = [])),
     responses(
         (status = 200, description = "The caller's analyses", body = MyAnalysesResponse),
         (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Needs analyses:run"),
         (status = 503, description = "The chain can't be read to check a grant (`rpc_unavailable`)"),
     )
 )]
@@ -1189,11 +1188,11 @@ pub(crate) mod tests {
         pool_pda
     }
 
-    /// An analyst who has signed in: their token and user ID.
+    /// An analyst, who needs no app role, after signing in: their token
+    /// and user ID.
     pub(crate) async fn analyst(app: &axum::Router, oid: &str) -> (String, String) {
         let mut spec = Spec::valid(&config());
         spec.oid = oid.into();
-        spec.roles = vec!["Analyst".into()];
         spec.email = Some(format!("{oid}@example.com"));
         let token = spec.sign(entra_key()).unwrap();
         let user_id = sign_in(app, &token).await;
@@ -1822,7 +1821,6 @@ pub(crate) mod tests {
         // Their first sign-in finds the grant waiting.
         let mut spec = Spec::valid(&config());
         spec.oid = oid.into();
-        spec.roles = vec!["Analyst".into()];
         spec.email = Some("blair@example.com".into());
         let token = spec.sign(entra_key()).unwrap();
         assert_eq!(sign_in(&worker.app, &token).await, user_id);
