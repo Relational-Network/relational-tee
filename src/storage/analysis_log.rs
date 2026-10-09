@@ -22,6 +22,12 @@ pub struct AnalysisRecord {
     /// The grant the caller ran it through; none for an admin, who needs none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grant_id: Option<String>,
+    /// The chain reading the grant was checked against: its slot, and when
+    /// the worker read it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain_slot: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain_verified_at: Option<DateTime<Utc>>,
     pub pool_pda: String,
     pub analysis_id: String,
     pub definition_sha256: String,
@@ -99,6 +105,8 @@ mod tests {
             at: "2026-10-05T09:30:00Z".parse().unwrap(),
             user_id: "u-1".into(),
             grant_id: Some("g-1".into()),
+            chain_slot: Some(1),
+            chain_verified_at: Some("2026-10-05T09:29:00Z".parse().unwrap()),
             pool_pda: "P1".into(),
             analysis_id: "awards-report-v1".into(),
             definition_sha256: "ab".repeat(32),

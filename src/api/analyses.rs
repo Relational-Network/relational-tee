@@ -42,6 +42,7 @@ use crate::auth::{Caller, Permission};
 use crate::error::ApiError;
 use crate::state::AppState;
 use crate::storage::analysis_log::AnalysisRecord;
+use crate::storage::chain::Seen;
 use crate::storage::pools::{AnalysisRef, PoolDoc};
 
 // ============================================================================
@@ -166,16 +167,23 @@ async fn load(
     Ok((doc, analysis))
 }
 
+/// The grant a request runs through, and the chain reading that showed it.
+struct Through {
+    grant_id: String,
+    seen: Seen,
+}
+
 /// The grant the caller runs the analysis through (none for an admin), and
 /// the rows they see, as `def` can apply them. Fails closed: no active
-/// grant, or no scope this analysis applies, is 403.
+/// grant, no scope this analysis applies, or a grant the chain doesn't
+/// show, is 403.
 async fn authorize(
     state: &AppState,
     caller: &Caller,
     doc: &PoolDoc,
     analysis: &AnalysisRef,
     def: &Definition,
-) -> Result<(Option<String>, Scope), ApiError> {
+) -> Result<(Option<Through>, Scope), ApiError> {
     if caller.is_admin() {
         return Ok((None, Scope::All));
     }
@@ -194,7 +202,15 @@ async fn authorize(
             )
             .with_code("no_employer_scope")
         })?;
-    Ok((Some(grant.grant_id.clone()), scope))
+    let seen = state
+        .grant_checks
+        .verify(&state.storage, &state.solana_client, doc, grant)
+        .await?;
+    let through = Through {
+        grant_id: grant.grant_id.clone(),
+        seen,
+    };
+    Ok((Some(through), scope))
 }
 
 /// 415 unless the request's body is JSON.
@@ -264,6 +280,8 @@ impl Logged {
                 at: Utc::now(),
                 user_id: caller.user_id.clone(),
                 grant_id: None,
+                chain_slot: None,
+                chain_verified_at: None,
                 pool_pda: doc.pool_pda.clone(),
                 analysis_id: analysis.analysis_id.clone(),
                 definition_sha256: analysis.code_hash_hex.clone(),
@@ -273,6 +291,15 @@ impl Logged {
                 total_matched: None,
                 outcome: String::new(),
             },
+        }
+    }
+
+    /// The grant the request runs through, and the chain reading of it.
+    fn through(&mut self, through: Option<Through>) {
+        if let Some(through) = through {
+            self.record.grant_id = Some(through.grant_id);
+            self.record.chain_slot = Some(through.seen.slot);
+            self.record.chain_verified_at = Some(through.seen.at);
         }
     }
 
@@ -405,8 +432,9 @@ fn summary(
     responses(
         (status = 200, description = "The analysis", body = AnalysisSummary),
         (status = 401, description = "Unauthorized"),
-        (status = 403, description = "No active grant (`no_grant`), or no employer scope (`no_employer_scope`, `groups_overage`)"),
+        (status = 403, description = "No active grant (`no_grant`), a grant the chain doesn't show (`grant_not_live`), or no employer scope (`no_employer_scope`, `groups_overage`)"),
         (status = 404, description = "Pool or analysis not found"),
+        (status = 503, description = "The chain can't be read to check the grant (`rpc_unavailable`)"),
     )
 )]
 pub async fn get_analysis(
@@ -441,11 +469,11 @@ pub async fn get_analysis(
         (status = 200, description = "The options", body = OptionsResponse),
         (status = 400, description = "The filters don't fit the analysis (`invalid_query`)"),
         (status = 401, description = "Unauthorized"),
-        (status = 403, description = "No active grant, or no employer scope"),
+        (status = 403, description = "No active grant (`no_grant`), a grant the chain doesn't show (`grant_not_live`), or no employer scope"),
         (status = 404, description = "Pool or analysis not found"),
         (status = 415, description = "The body isn't JSON"),
         (status = 422, description = "The options ran out of time (`analysis_timeout`)"),
-        (status = 503, description = "The worker is busy (`analysis_busy`, with Retry-After), or the analysis log is unavailable"),
+        (status = 503, description = "The worker is busy (`analysis_busy`, with Retry-After), the analysis log is unavailable, or the chain can't be read to check the grant (`rpc_unavailable`)"),
     )
 )]
 pub async fn filtered_options(
@@ -480,7 +508,7 @@ async fn options_for(
             .definition(&state.storage, &analysis.code_hash_hex)
             .await?;
         let (grant, scope) = authorize(state, caller, &doc, &analysis, &def).await?;
-        logged.record.grant_id = grant;
+        logged.through(grant);
         let request: OptionsRequest = parse(body)?;
         let query = filters_only(&def, request.filters)?;
         let table = state
@@ -533,11 +561,11 @@ async fn options_for(
         (status = 200, description = "The values", body = SearchResponse),
         (status = 400, description = "Not a search filter, a search or limit out of range, or filters that don't fit the analysis (`invalid_query`)"),
         (status = 401, description = "Unauthorized"),
-        (status = 403, description = "No active grant, or no employer scope"),
+        (status = 403, description = "No active grant (`no_grant`), a grant the chain doesn't show (`grant_not_live`), or no employer scope"),
         (status = 404, description = "Pool or analysis not found"),
         (status = 415, description = "The body isn't JSON"),
         (status = 422, description = "The search ran out of time (`analysis_timeout`)"),
-        (status = 503, description = "The worker is busy (`analysis_busy`, with Retry-After), or the analysis log is unavailable"),
+        (status = 503, description = "The worker is busy (`analysis_busy`, with Retry-After), the analysis log is unavailable, or the chain can't be read to check the grant (`rpc_unavailable`)"),
     )
 )]
 pub async fn filtered_search(
@@ -578,7 +606,7 @@ async fn search_for(
             .definition(&state.storage, &analysis.code_hash_hex)
             .await?;
         let (grant, scope) = authorize(state, caller, &doc, &analysis, &def).await?;
-        logged.record.grant_id = grant;
+        logged.through(grant);
         let request: SearchRequest = parse(body)?;
         let query = filters_only(&def, request.filters)?;
         let limit = request.limit.unwrap_or(DEFAULT_SEARCH_LIMIT);
@@ -627,11 +655,11 @@ async fn search_for(
         (status = 200, description = "A page of rows", body = Page),
         (status = 400, description = "The query doesn't fit the analysis (`invalid_query`)"),
         (status = 401, description = "Unauthorized"),
-        (status = 403, description = "No active grant, or no employer scope"),
+        (status = 403, description = "No active grant (`no_grant`), a grant the chain doesn't show (`grant_not_live`), or no employer scope"),
         (status = 404, description = "Pool or analysis not found"),
         (status = 415, description = "The body isn't JSON"),
         (status = 422, description = "The query ran out of time (`analysis_timeout`)"),
-        (status = 503, description = "The worker is busy (`analysis_busy`, with Retry-After), or the analysis log is unavailable"),
+        (status = 503, description = "The worker is busy (`analysis_busy`, with Retry-After), the analysis log is unavailable, or the chain can't be read to check the grant (`rpc_unavailable`)"),
     )
 )]
 pub async fn run_query(
@@ -652,7 +680,7 @@ pub async fn run_query(
             .definition(&state.storage, &analysis.code_hash_hex)
             .await?;
         let (grant, scope) = authorize(&state, &caller, &doc, &analysis, &def).await?;
-        logged.record.grant_id = grant;
+        logged.through(grant);
         let request: QueryRequest = parse(&body)?;
         let query = query::Query::check(&def, &request).map_err(query_error)?;
         if let Some(asked) = logged.record.request.as_object_mut() {
@@ -697,9 +725,10 @@ pub(crate) mod tests {
     use super::*;
     use crate::analysis::definition::tests::AWARDS_REPORT;
     use crate::api::credentials::tests::{send, sign_in, worker, Admin, Worker};
-    use crate::api::grants::tests::{analysis_pool, analyst, ANALYSIS};
+    use crate::api::grants::tests::{analysis_pool, analyst, execute_drt_config, ANALYSIS};
     use crate::auth::entra::mint::Spec;
     use crate::auth::entra::tests::{config, entra_key};
+    use crate::blockchain::drt::pda::derive_grant_pda;
     use crate::data_validation::tests::{awards_schema, AWARDS_HEADER};
     use crate::storage::pools::{Grant, GrantRevocation, Upload, INITIAL};
     use crate::storage::scopes::tests::{entry, fixture, GROUP_A_ANALYSTS, NETWORK_ANALYSTS};
@@ -762,8 +791,14 @@ pub(crate) mod tests {
         pool_pda
     }
 
-    /// `analyst` holds an active grant to the pool's analysis.
+    /// `analyst` holds an active grant to the pool's analysis, which the
+    /// chain shows.
     pub(crate) async fn grant(worker: &Worker, pool_pda: &Pubkey, analyst: &str) {
+        let commitment: [u8; 32] = Sha256::digest(analyst).into();
+        worker.chain.grant(
+            derive_grant_pda(&commitment).0,
+            execute_drt_config(pool_pda),
+        );
         worker
             .storage
             .pools()
@@ -772,7 +807,7 @@ pub(crate) mod tests {
                     grant_id: format!("g-{analyst}"),
                     analyst: analyst.into(),
                     drt_name: ANALYSIS.into(),
-                    commitment: hex::encode(Sha256::digest(analyst)),
+                    commitment: hex::encode(commitment),
                     granted_by: "admin".into(),
                     granted_at: Utc::now(),
                     signature: Some("sig-grant".into()),
@@ -1230,5 +1265,69 @@ pub(crate) mod tests {
             .find(|r| r.request.get("scope").is_some())
             .expect("the scope override is recorded as sent");
         assert_eq!(override_attempt.outcome, "invalid_query");
+    }
+
+    #[tokio::test]
+    async fn an_analyst_needs_the_chain_to_show_their_grant() {
+        let worker = worker();
+        let owner = worker.admin("oid-owner").await;
+        let pool_pda = awards_pool(&worker, &owner).await;
+        let scopes = worker.storage.employer_scopes();
+        scopes.replace(0, fixture(), "admin").await.unwrap();
+        let (shown, shown_id) = analyst(&worker.app, "oid-shown", &[GROUP_A_ANALYSTS]).await;
+        let (unseen, unseen_id) = analyst(&worker.app, "oid-unseen", &[GROUP_A_ANALYSTS]).await;
+        grant(&worker, &pool_pda, &shown_id).await;
+        grant(&worker, &pool_pda, &unseen_id).await;
+        // The document says active, but the chain has no Grant: as after a
+        // restore of an older pool document undid a revocation.
+        let commitment: [u8; 32] = Sha256::digest(&unseen_id).into();
+        worker.chain.close(&derive_grant_pda(&commitment).0);
+        let query = format!("/v1/drt/pools/{pool_pda}/analyses/{ANALYSIS}/query");
+
+        let (status, _, page) = send(&worker.app, post(&query, &shown, &json!({}))).await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        let (status, _, refused) = send(&worker.app, post(&query, &unseen, &json!({}))).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{refused}");
+        assert_eq!(refused["code"], "grant_not_live");
+
+        let mine = |token: String| {
+            let app = worker.app.clone();
+            async move {
+                let (status, _, mine) = send(&app, get("/v1/drt/me/analyses", &token)).await;
+                assert_eq!(status, StatusCode::OK, "{mine}");
+                mine["analyses"].as_array().unwrap().len()
+            }
+        };
+        assert_eq!(mine(shown.clone()).await, 1);
+        assert_eq!(mine(unseen.clone()).await, 0, "only grants the chain shows");
+
+        // The log ties each query to the chain reading that allowed it.
+        let today = Utc::now().format("%Y-%m-%d").to_string();
+        let log = worker
+            .storage
+            .analysis_log()
+            .on(&pool_pda.to_string(), &today)
+            .await
+            .unwrap();
+        let allowed = log.iter().find(|r| r.user_id == shown_id).unwrap();
+        assert_eq!(allowed.chain_slot, Some(1));
+        assert!(allowed.chain_verified_at.is_some());
+        let denied = log.iter().find(|r| r.user_id == unseen_id).unwrap();
+        assert_eq!(denied.outcome, "grant_not_live");
+
+        // The grants list shows what the chain showed.
+        let grants = format!("/v1/drt/pools/{pool_pda}/grants");
+        let (_, _, listed) = send(&worker.app, get(&grants, &owner.token)).await;
+        let on_chain = |analyst: &str| {
+            listed["grants"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|g| g["analyst_user_id"] == analyst)
+                .map(|g| g["on_chain"].clone())
+                .unwrap()
+        };
+        assert_eq!(on_chain(&shown_id), "live");
+        assert_eq!(on_chain(&unseen_id), "closed");
     }
 }

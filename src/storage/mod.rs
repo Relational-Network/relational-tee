@@ -32,6 +32,7 @@ use crate::store::sealed::Sealed;
 use crate::store::{valid_segment, ObjectStore, Replaced, STATE};
 
 pub mod analysis_log;
+pub mod chain;
 pub mod identities;
 pub mod pools;
 pub mod scopes;
@@ -87,6 +88,10 @@ impl Storage {
 
     pub fn employer_scopes(&self) -> scopes::Scopes<'_> {
         scopes::Scopes::new(self)
+    }
+
+    pub fn chain_views(&self) -> chain::ChainViews<'_> {
+        chain::ChainViews::new(self)
     }
 
     pub fn analysis_log(&self) -> analysis_log::AnalysisLog<'_> {

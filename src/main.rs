@@ -640,6 +640,7 @@ async fn main() {
         solana_client: Arc::new(solana_client),
         commitments,
         history,
+        grant_checks: Arc::default(),
         fetcher: Arc::new(analysis::fetch::GitHub::new()),
         analyses: Arc::default(),
     };

@@ -7,9 +7,11 @@
 //! SQLite table of only the rows the caller's employer scope allows
 //! ([`table`]), and runs the definition's SQL on it with the request's
 //! values bound as parameters ([`query`]). [`runner`] caches the
-//! definitions, datasets and tables, and bounds how much runs at once.
+//! definitions, datasets and tables, and bounds how much runs at once, and
+//! [`chain_view`] checks that the chain shows each analyst's grant.
 
 pub mod cache;
+pub mod chain_view;
 pub mod dates;
 pub mod definition;
 pub mod fetch;

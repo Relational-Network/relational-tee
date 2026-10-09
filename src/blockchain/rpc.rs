@@ -57,6 +57,11 @@ impl RpcError {
         }
     }
 
+    /// Whether the node refused the call for its rate limit.
+    pub fn rate_limited(&self) -> bool {
+        self.http_status == Some(429)
+    }
+
     /// Why the node refused to send a transaction, if its preflight
     /// simulation failed for a reason a resend can't cure. A blockhash the
     /// node doesn't know (it's behind, or the blockhash expired) or a

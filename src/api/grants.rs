@@ -17,7 +17,7 @@
 //! recorded, so each Grant PDA belongs to one grant at a time. A grant
 //! staged before a revocation is never recorded after it.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
 
 use axum::{
@@ -50,6 +50,7 @@ use crate::error::ApiError;
 use crate::idempotency::{Idempotent, JsonBody};
 use crate::ids;
 use crate::state::AppState;
+use crate::storage::chain::Seen;
 use crate::storage::identities::Identity;
 use crate::storage::pools::{DrtMetadata, Grant, GrantRevocation, PoolDoc, Recording};
 use crate::storage::staged::{Saga, Staged};
@@ -97,6 +98,15 @@ pub struct GrantEntry {
     /// The `revoke_grant` transaction that closed the Grant PDA.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub revoke_signature: Option<String>,
+    /// The grant's Grant PDA, the on-chain receipt of its burn.
+    pub grant_pda: String,
+    /// What the chain last showed at the Grant PDA: `live` (the program's
+    /// Grant for the pool's Execute DRT), `closed`, or `unknown` when it
+    /// hasn't been read and couldn't be.
+    pub on_chain: String,
+    /// When the chain was last read for it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verified_at: Option<DateTime<Utc>>,
 }
 
 /// A pool's grants, newest first.
@@ -182,9 +192,18 @@ fn superseded() -> ApiError {
         .with_code("grant_superseded")
 }
 
-fn entry(state: &AppState, grant: &Grant, analyst: Option<&Identity>) -> GrantEntry {
+/// What the chain showed of a grant: its PDA, and the reading, if any.
+type OnChain = (Pubkey, Option<Seen>);
+
+fn entry(
+    state: &AppState,
+    grant: &Grant,
+    analyst: Option<&Identity>,
+    on_chain: Option<&OnChain>,
+) -> GrantEntry {
     let revoked = grant.revoked.as_ref();
     let signature = grant.signature.clone();
+    let seen = on_chain.and_then(|(_, seen)| *seen);
     GrantEntry {
         grant_id: grant.grant_id.clone(),
         analyst_user_id: grant.analyst.clone(),
@@ -204,7 +223,44 @@ fn entry(state: &AppState, grant: &Grant, analyst: Option<&Identity>) -> GrantEn
         revoked_by: revoked.map(|r| r.revoked_by.clone()),
         revoked_at: revoked.map(|r| r.revoked_at),
         revoke_signature: revoked.and_then(|r| r.signature.clone()),
+        grant_pda: grant
+            .commitment_bytes()
+            .map(|c| derive_grant_pda(&c).0.to_string())
+            .unwrap_or_default(),
+        on_chain: match seen {
+            Some(seen) if seen.live => "live",
+            Some(_) => "closed",
+            None => "unknown",
+        }
+        .into(),
+        verified_at: seen.map(|s| s.at),
     }
+}
+
+/// What the chain shows of `doc`'s grants, read again if the readings are
+/// old.
+async fn statuses(state: &AppState, doc: &PoolDoc) -> BTreeMap<String, OnChain> {
+    state
+        .grant_checks
+        .statuses(&state.storage, &state.solana_client, doc)
+        .await
+}
+
+/// Read the chain again for `doc`'s grants, after a burn or a close, so
+/// every reading on this worker is current. A failure only means the next
+/// request reads it.
+async fn reread(state: &AppState, doc: &PoolDoc) -> BTreeMap<String, OnChain> {
+    if let Err(e) = state
+        .grant_checks
+        .refresh(&state.storage, &state.solana_client, doc)
+        .await
+    {
+        warn!(pool = %doc.pool_pda, error = %e, "Reading grants on-chain failed");
+    }
+    state
+        .grant_checks
+        .statuses(&state.storage, &state.solana_client, doc)
+        .await
 }
 
 // ============================================================================
@@ -270,9 +326,14 @@ pub async fn grant_analysis(
         .find(|g| g.grant_id == grant_id)
         .or_else(|| doc.active_grant(&analyst.user_id, &payload.analysis_id));
     if let Some(existing) = existing {
-        return op
-            .finish(StatusCode::OK, &entry(&state, existing, Some(&analyst)))
-            .await;
+        let on_chain = statuses(&state, &doc).await;
+        let entry = entry(
+            &state,
+            existing,
+            Some(&analyst),
+            on_chain.get(&existing.grant_id),
+        );
+        return op.finish(StatusCode::OK, &entry).await;
     }
     let pending = doc
         .latest_grant(&analyst.user_id, &payload.analysis_id)
@@ -351,9 +412,14 @@ pub async fn grant_analysis(
     match doc.recording(&grant) {
         Recording::Add => {}
         Recording::Present(present) => {
-            return op
-                .finish(StatusCode::OK, &entry(&state, present, Some(&analyst)))
-                .await
+            let on_chain = statuses(&state, &doc).await;
+            let entry = entry(
+                &state,
+                present,
+                Some(&analyst),
+                on_chain.get(&present.grant_id),
+            );
+            return op.finish(StatusCode::OK, &entry).await;
         }
         Recording::Superseded(_) => return Err(superseded()),
     }
@@ -418,8 +484,14 @@ pub async fn grant_analysis(
         signature = %signature,
         "Analyst granted"
     );
-    op.finish(StatusCode::OK, &entry(&state, recorded, Some(&analyst)))
-        .await
+    let on_chain = reread(&state, &doc).await;
+    let entry = entry(
+        &state,
+        recorded,
+        Some(&analyst),
+        on_chain.get(&recorded.grant_id),
+    );
+    op.finish(StatusCode::OK, &entry).await
 }
 
 // ============================================================================
@@ -584,9 +656,14 @@ pub async fn revoke_grant(
         .as_ref()
         .is_some_and(|r| r.signature.is_some())
     {
-        return op
-            .finish(StatusCode::OK, &entry(&state, grant, analyst.as_ref()))
-            .await;
+        let on_chain = statuses(&state, &doc).await;
+        let entry = entry(
+            &state,
+            grant,
+            analyst.as_ref(),
+            on_chain.get(&grant.grant_id),
+        );
+        return op.finish(StatusCode::OK, &entry).await;
     }
     crate::fault::point("staged");
 
@@ -643,8 +720,14 @@ pub async fn revoke_grant(
         signature = %signature,
         "Analyst grant revoked"
     );
-    op.finish(StatusCode::OK, &entry(&state, grant, analyst.as_ref()))
-        .await
+    let on_chain = reread(&state, &doc).await;
+    let entry = entry(
+        &state,
+        grant,
+        analyst.as_ref(),
+        on_chain.get(&grant.grant_id),
+    );
+    op.finish(StatusCode::OK, &entry).await
 }
 
 // ============================================================================
@@ -657,7 +740,7 @@ pub async fn revoke_grant(
     path = "/v1/drt/pools/{pool_pda}/grants",
     tag = "Grants",
     summary = "List a pool's grants",
-    description = "Every grant of the pool's analysis, active, being revoked or revoked, newest first, with each analyst's email and name as of their last sign-in. Needs `pools:read`.",
+    description = "Every grant of the pool's analysis, active, being revoked or revoked, newest first, with each analyst's email and name as of their last sign-in, its Grant PDA, and what the chain last showed there (read again when that's over 5 minutes old). Needs `pools:read`.",
     security(("bearer_auth" = [])),
     params(
         ("pool_pda" = String, Path, description = "Pool PDA address (base58)"),
@@ -684,11 +767,19 @@ pub async fn list_grants(
         .into_iter()
         .map(|i| (i.user_id.clone(), i))
         .collect();
+    let on_chain = statuses(&state, &doc).await;
     let grants = doc
         .grants
         .iter()
         .rev()
-        .map(|g| entry(&state, g, identities.get(&g.analyst)))
+        .map(|g| {
+            entry(
+                &state,
+                g,
+                identities.get(&g.analyst),
+                on_chain.get(&g.grant_id),
+            )
+        })
         .collect();
     Ok(Json(GrantsResponse {
         pool_pda: pool_pda_str,
@@ -706,12 +797,13 @@ pub async fn list_grants(
     path = "/v1/drt/me/analyses",
     tag = "Grants",
     summary = "My analyses",
-    description = "The analyses the caller may run, by pool name: for an admin every pool's, with every row; for an analyst those they hold an active grant to. Needs `analyses:run`.",
+    description = "The analyses the caller may run, by pool name: for an admin every pool's, with every row; for an analyst those they hold an active grant to that the chain shows. Needs `analyses:run`.",
     security(("bearer_auth" = [])),
     responses(
         (status = 200, description = "The caller's analyses", body = MyAnalysesResponse),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Needs analyses:run"),
+        (status = 503, description = "The chain can't be read to check a grant (`rpc_unavailable`)"),
     )
 )]
 pub async fn my_analyses(
@@ -720,32 +812,37 @@ pub async fn my_analyses(
 ) -> Result<Json<MyAnalysesResponse>, ApiError> {
     caller.require(Permission::AnalysesRun)?;
     let admin = caller.is_admin();
-    let mut analyses: Vec<MyAnalysis> = state
-        .storage
-        .pools()
-        .all()
-        .await?
-        .into_iter()
-        .filter_map(|doc| {
-            let analysis = doc.analysis.as_ref()?;
-            let granted_at = if admin {
-                None
-            } else {
-                Some(
-                    doc.active_grant(&caller.user_id, &analysis.analysis_id)?
-                        .granted_at,
-                )
+    let mut analyses = Vec::new();
+    for doc in state.storage.pools().all().await? {
+        let Some(analysis) = doc.analysis.as_ref() else {
+            continue;
+        };
+        let granted_at = if admin {
+            None
+        } else {
+            let Some(grant) = doc.active_grant(&caller.user_id, &analysis.analysis_id) else {
+                continue;
             };
-            Some(MyAnalysis {
-                pool_pda: doc.pool_pda.clone(),
-                pool_name: doc.pool_name.clone(),
-                analysis_id: analysis.analysis_id.clone(),
-                display_name: analysis.display_name.clone(),
-                access: if admin { "admin" } else { "grant" }.into(),
-                granted_at,
-            })
-        })
-        .collect();
+            // Only grants the chain shows; a reading the RPC can't give fails.
+            let verified = state
+                .grant_checks
+                .verify(&state.storage, &state.solana_client, &doc, grant)
+                .await;
+            match verified {
+                Ok(_) => Some(grant.granted_at),
+                Err(e) if e.code == "grant_not_live" => continue,
+                Err(e) => return Err(e),
+            }
+        };
+        analyses.push(MyAnalysis {
+            pool_pda: doc.pool_pda.clone(),
+            pool_name: doc.pool_name.clone(),
+            analysis_id: analysis.analysis_id.clone(),
+            display_name: analysis.display_name.clone(),
+            access: if admin { "admin" } else { "grant" }.into(),
+            granted_at,
+        });
+    }
     analyses.sort_by(|a, b| (&a.pool_name, &a.pool_pda).cmp(&(&b.pool_name, &b.pool_pda)));
     Ok(Json(MyAnalysesResponse { analyses }))
 }

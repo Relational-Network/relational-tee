@@ -20,7 +20,9 @@ use solana_pubkey::Pubkey;
 use solana_transaction::Transaction;
 
 use super::drt::idl_generated::DISC_GRANT_ACCOUNT;
-use super::drt::types::{GrantAccount, Pool, DISC_POOL_ACCOUNT};
+use super::drt::types::{
+    GrantAccount, Pool, DISC_GRANT_RIGHT, DISC_POOL_ACCOUNT, DISC_REVOKE_GRANT,
+};
 use super::types::devnet_config;
 use super::SolanaClient;
 use crate::config::drt_program_id;
@@ -102,6 +104,33 @@ impl FakeChain {
     pub fn close(&self, pda: &Pubkey) {
         self.data.lock().unwrap().retain(|(a, _)| a != pda);
         self.accounts.lock().unwrap().retain(|a| a != pda);
+    }
+
+    /// How many times `method` was called.
+    pub fn called(&self, method: &str) -> usize {
+        self.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|m| *m == method)
+            .count()
+    }
+
+    /// What a landed transaction does to the DRT program's Grants, as the
+    /// program does it: `grant_right` opens one, `revoke_grant` closes it.
+    fn apply(&self, tx: &Transaction) {
+        let keys = &tx.message.account_keys;
+        for ix in &tx.message.instructions {
+            if keys[ix.program_id_index as usize] != drt_program_id() || ix.data.len() < 8 {
+                continue;
+            }
+            let account = |i: usize| keys[ix.accounts[i] as usize];
+            if ix.data[..8] == DISC_GRANT_RIGHT {
+                self.grant(account(5), account(1));
+            } else if ix.data[..8] == DISC_REVOKE_GRANT {
+                self.close(&account(3));
+            }
+        }
     }
 
     /// The account at `address` as `getAccountInfo` returns it, or null.
@@ -204,6 +233,7 @@ impl FakeChain {
                 let signature = tx.signatures[0].to_string();
                 if self.lands.load(Ordering::SeqCst) {
                     self.land(&signature, true);
+                    self.apply(&tx);
                 }
                 json!(signature)
             }

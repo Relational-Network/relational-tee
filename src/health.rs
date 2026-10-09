@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::{extract::State, http::StatusCode, Json};
-use chrono::DateTime;
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 use tokio::time::Instant;
 use tracing::{info, warn};
@@ -261,6 +261,11 @@ pub struct HealthDetails {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub jwks_cache_age_seconds: Option<u64>,
     pub solana_rpc: RpcDetails,
+    /// Seconds since the chain was read for the oldest analyst grant in
+    /// use, if any was in use in the last 5 minutes. While the RPC is down
+    /// it grows, and grants are honoured until it passes 24 hours.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grant_readings_age_seconds: Option<u64>,
     /// The SHA-256 of the running CCE policy, from the attestation token.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_data: Option<String>,
@@ -274,7 +279,7 @@ pub struct HealthDetails {
     path = "/health",
     tag = "Health",
     summary = "Health details",
-    description = "Details for operators: keys held, certificate expiry, storage canary age, key cache age, Solana RPC status, version and host data. Always 200; use /health/ready for routing.",
+    description = "Details for operators: keys held, certificate expiry, storage canary age, key cache age, Solana RPC status, the age of the analyst grant readings in use, version and host data. Always 200; use /health/ready for routing.",
     responses(
         (status = 200, description = "Details", body = HealthDetails),
     )
@@ -341,6 +346,10 @@ pub async fn health(State(state): State<AppState>) -> Json<HealthDetails> {
         },
         jwks_cache_age_seconds,
         solana_rpc: rpc,
+        grant_readings_age_seconds: state
+            .grant_checks
+            .oldest_in_use()
+            .map(|at| (Utc::now() - at).num_seconds().max(0) as u64),
         host_data: token.as_ref().and_then(|t| t.host_data.clone()),
         attestation_expires_at: token
             .and_then(|t| DateTime::from_timestamp(t.expires_at, 0))

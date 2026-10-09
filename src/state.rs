@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use crate::analysis::chain_view::GrantChecks;
 use crate::analysis::fetch::Fetcher;
 use crate::analysis::runner::Analyses;
 use crate::attestation::Attestation;
@@ -51,6 +52,8 @@ pub struct AppState {
     pub commitments: Arc<Commitments>,
     /// Wallet history pages and parsed transactions, read from the chain.
     pub history: Arc<History>,
+    /// What the chain showed of analysts' grants.
+    pub grant_checks: Arc<GrantChecks>,
 
     // ── Analyses ────────────────────────────────────────────────
     /// Where pool creation fetches analysis definitions.
@@ -101,6 +104,7 @@ impl AppState {
             )),
             commitments: Arc::new(Commitments::derive(&keys.get(KeyName::Commitment).current)),
             history: Arc::new(History::new(8, std::time::Duration::from_secs(30), 8)),
+            grant_checks: Arc::default(),
             fetcher: Arc::new(crate::analysis::fetch::tests::Fixed::awards_report()),
             analyses: Arc::default(),
         }
