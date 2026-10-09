@@ -599,7 +599,7 @@ mod tests {
     use super::*;
     use crate::analysis::definition::tests::{awards_report, AWARDS_REPORT};
     use crate::analysis::table::tests::only;
-    use crate::analysis::table::{Conditions, Scope};
+    use crate::analysis::table::{check_targets, Conditions, Scope, Target};
 
     const HEADER: &str = "Staff Number,Membership Number,Title,First Name,Surname,Date of Birth,\
                           Employer,Employer Group,Award,Award Grade,Exam Board Date";
@@ -773,16 +773,15 @@ mod tests {
         );
         assert_eq!(rows(&only(&[&[]])), 0, "no conditions match nothing");
 
-        // The awards report declares no surname key, so an entry on it
-        // applies nowhere there.
+        // The awards report declares no surname key, so no grant targets
+        // one there; a definition that declares it takes it.
         let awards = awards_report();
-        let bravo = only(&[&[("surname", "Bravo")]]);
-        assert_eq!(bravo.for_definition(&awards), None);
-        assert_eq!(
-            only(&[&[("surname", "Bravo")], &[("employer", "Bank C")]]).for_definition(&awards),
-            Some(only(&[&[("employer", "Bank C")]]))
-        );
-        assert_eq!(Scope::All.for_definition(&awards), Some(Scope::All));
+        let bravo = Target {
+            key: "surname".into(),
+            value: "Bravo".into(),
+        };
+        assert!(check_targets(&awards, std::slice::from_ref(&bravo)).is_err());
+        assert!(check_targets(&def, &[bravo]).is_ok());
         let bank_c_or_bravo = Table::build(
             &awards,
             &[&first, &second],

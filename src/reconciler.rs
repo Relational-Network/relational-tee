@@ -427,6 +427,7 @@ mod tests {
             (ana.grant_id.as_str(), ana.signature.as_deref()),
             ("g-ana", Some("sig-grant"))
         );
+        assert!(ana.targets().is_some(), "the staged targets are recorded");
         assert!(doc.active_grant("bo", "awards-report-v1").is_none());
         assert_eq!(
             reconcile(&storage, &solana, Timing::default().min_age)

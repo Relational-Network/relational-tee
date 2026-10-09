@@ -369,11 +369,16 @@ impl Suite {
     }
 
     fn grant_call(&self, pool: &str, route: &str, analyst: &User) -> Call {
+        let mut body = json!({ "analyst_user_id": analyst.user_id, "analysis_id": ANALYSIS });
+        if route == "grant" {
+            // The synthetic fixture's employer group.
+            body["scope"] = json!([{ "key": "employer_group", "value": "Group A" }]);
+        }
         self.call(
             &self.owner,
             Method::POST,
             format!("/v1/drt/pools/{pool}/{route}"),
-            Body::Json(json!({ "analyst_user_id": analyst.user_id, "analysis_id": ANALYSIS })),
+            Body::Json(body),
         )
     }
 

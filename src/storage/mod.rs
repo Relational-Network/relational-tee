@@ -35,7 +35,6 @@ pub mod analysis_log;
 pub mod chain;
 pub mod identities;
 pub mod pools;
-pub mod scopes;
 pub mod scripts;
 pub mod staged;
 pub mod wallets;
@@ -84,10 +83,6 @@ impl Storage {
 
     pub fn scripts(&self) -> scripts::Scripts<'_> {
         scripts::Scripts::new(self)
-    }
-
-    pub fn employer_scopes(&self) -> scopes::Scopes<'_> {
-        scopes::Scopes::new(self)
     }
 
     pub fn chain_views(&self) -> chain::ChainViews<'_> {

@@ -24,8 +24,7 @@
 //! pool list.
 //!
 //! An analysis shows `Admin` callers every row, and an analyst only the rows
-//! the employer-scope mapping gives their Entra groups
-//! ([`Caller::row_scope`]).
+//! their grant's targets give.
 
 pub mod entra;
 pub mod jwks;
@@ -39,13 +38,9 @@ use serde::Serialize;
 use tracing::warn;
 use utoipa::ToSchema;
 
-use crate::analysis::table::Scope;
 use crate::error::ApiError;
 use crate::state::AppState;
 use crate::storage::identities::SignIn;
-use crate::storage::scopes::EmployerScopes;
-
-pub use entra::Groups;
 
 /// The app role that administers the pilot.
 pub const ADMIN: &str = "Admin";
@@ -111,33 +106,12 @@ pub struct Caller {
     pub email: String,
     pub display_name: String,
     pub roles: Vec<String>,
-    pub groups: Groups,
     pub permissions: Vec<Permission>,
 }
 
 impl Caller {
     pub fn is_admin(&self) -> bool {
         self.roles.iter().any(|r| r == ADMIN)
-    }
-
-    /// The rows of an analysis this caller may see: every row for `Admin`;
-    /// otherwise the scopes `mapping` gives their groups. A caller whose
-    /// groups are unknown, or none of whose groups is mapped, gets 403.
-    pub fn row_scope(&self, mapping: &EmployerScopes) -> Result<Scope, ApiError> {
-        if self.is_admin() {
-            return Ok(Scope::All);
-        }
-        match &self.groups {
-            Groups::Overage => Err(ApiError::forbidden(
-                "your account is in more groups than an access token can list, so its \
-                 employer scope is unknown; ask an admin",
-            )
-            .with_code("groups_overage")),
-            Groups::Listed(groups) => mapping.rows_for(groups).ok_or_else(|| {
-                ApiError::forbidden("none of your groups has an employer scope; ask an admin")
-                    .with_code("no_employer_scope")
-            }),
-        }
     }
 
     /// 403 unless the caller has `permission`.
@@ -201,7 +175,6 @@ impl FromRequestParts<AppState> for Caller {
             email,
             display_name,
             roles: claims.roles,
-            groups: claims.groups,
         })
     }
 }
@@ -209,9 +182,6 @@ impl FromRequestParts<AppState> for Caller {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use crate::analysis::table::tests::only;
-    use crate::storage::scopes::tests::{fixture, GROUP_A_ANALYSTS};
 
     #[test]
     fn admin_grants_every_permission_analyst_one_and_no_role_none() {
@@ -234,68 +204,6 @@ mod tests {
                 "users:read",
                 "analyses:run"
             ])
-        );
-    }
-
-    fn caller(roles: &[&str], groups: Groups) -> Caller {
-        let roles: Vec<String> = roles.iter().map(|r| r.to_string()).collect();
-        Caller {
-            user_id: "u-1".into(),
-            email: String::new(),
-            display_name: String::new(),
-            permissions: permissions(&roles),
-            roles,
-            groups,
-        }
-    }
-
-    #[test]
-    fn admins_see_every_row_and_analysts_only_their_groups_rows() {
-        let mapping = EmployerScopes {
-            version: 1,
-            scopes: fixture(),
-            ..Default::default()
-        };
-        let group_a = Groups::Listed(vec![GROUP_A_ANALYSTS.into()]);
-        assert_eq!(
-            caller(&["Admin"], Groups::Overage)
-                .row_scope(&mapping)
-                .unwrap(),
-            Scope::All
-        );
-        assert_eq!(
-            caller(&["Admin"], Groups::Listed(vec![]))
-                .row_scope(&EmployerScopes::default())
-                .unwrap(),
-            Scope::All
-        );
-        assert_eq!(
-            caller(&["Analyst"], group_a.clone())
-                .row_scope(&mapping)
-                .unwrap(),
-            only(&[&[("employer_group", "Group A")]])
-        );
-
-        // Fail closed: unknown groups, unmapped groups, or no mapping.
-        let refused = |caller: Caller, mapping: &EmployerScopes| {
-            let e = caller.row_scope(mapping).unwrap_err();
-            assert_eq!(e.status, axum::http::StatusCode::FORBIDDEN);
-            e.code
-        };
-        assert_eq!(
-            refused(caller(&["Analyst"], Groups::Overage), &mapping),
-            "groups_overage"
-        );
-        assert_eq!(
-            refused(
-                caller(&["Analyst"], Groups::Listed(vec!["other".into()])),
-                &mapping
-            ),
-            "no_employer_scope"
-        );
-        assert_eq!(
-            refused(caller(&["Analyst"], group_a), &EmployerScopes::default()),
-            "no_employer_scope"
         );
     }
 }

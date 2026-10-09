@@ -17,8 +17,9 @@
 //! recorded, so each Grant PDA belongs to one grant at a time. A grant
 //! staged before a revocation is never recorded after it.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::str::FromStr;
+use std::sync::Arc;
 
 use axum::{
     extract::{Path, State},
@@ -34,6 +35,8 @@ use solana_signer::Signer;
 use tracing::{info, warn};
 use utoipa::ToSchema;
 
+use crate::analysis::definition::Definition;
+use crate::analysis::table::{check_targets, Target};
 use crate::api::credentials::{decode_right_id, parse_pda, pool_not_found};
 use crate::api::pools::{explorer_url, load_pool, signed, verify_pool_ownership};
 use crate::audit;
@@ -52,7 +55,7 @@ use crate::ids;
 use crate::state::AppState;
 use crate::storage::chain::Seen;
 use crate::storage::identities::Identity;
-use crate::storage::pools::{DrtMetadata, Grant, GrantRevocation, PoolDoc, Recording};
+use crate::storage::pools::{DrtMetadata, Grant, GrantRevocation, GrantScope, PoolDoc, Recording};
 use crate::storage::staged::{Saga, Staged};
 use crate::storage::Change;
 
@@ -60,7 +63,7 @@ use crate::storage::Change;
 // Request / Response types
 // ============================================================================
 
-/// An analyst and one of the pool's analyses.
+/// An analyst, one of the pool's analyses, and the rows they see.
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GrantRequest {
@@ -68,6 +71,53 @@ pub struct GrantRequest {
     pub analyst_user_id: String,
     /// The pool's analysis: its `analysis_id`.
     pub analysis_id: String,
+    /// What the analyst sees: the rows of any of these, such as employer
+    /// group "Group A" and employer "Bank B". Keys are the analysis's scope
+    /// keys, values as the data holds them.
+    pub scope: Vec<Target>,
+}
+
+/// An analyst and one of the pool's analyses.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RevokeGrantRequest {
+    /// The analyst's `user_id`.
+    pub analyst_user_id: String,
+    /// The pool's analysis: its `analysis_id`.
+    pub analysis_id: String,
+}
+
+/// New targets for an analyst's active grant.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GrantScopeRequest {
+    /// The analyst's `user_id`.
+    pub analyst_user_id: String,
+    /// The pool's analysis: its `analysis_id`.
+    pub analysis_id: String,
+    /// The grant's `scope_revision` the edit started from.
+    pub revision: usize,
+    /// What the analyst sees from now on.
+    pub scope: Vec<Target>,
+}
+
+/// A target, with the CSV header of the column it restricts.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ScopeTarget {
+    pub key: String,
+    pub header: String,
+    pub value: String,
+}
+
+/// One setting of a grant's targets.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ScopeChange {
+    /// 1 for the targets the grant was made with.
+    pub revision: usize,
+    pub scope: Vec<ScopeTarget>,
+    /// The `user_id` who set them.
+    pub set_by: String,
+    pub set_at: DateTime<Utc>,
 }
 
 /// A grant.
@@ -79,6 +129,13 @@ pub struct GrantEntry {
     pub analyst_email: String,
     pub analyst_display_name: String,
     pub analysis_id: String,
+    /// What the analyst sees now: the rows of any of these. Empty for a
+    /// grant that sees none.
+    pub scope: Vec<ScopeTarget>,
+    /// How many times the targets were set; an edit names it.
+    pub scope_revision: usize,
+    /// Every setting of the targets, oldest first.
+    pub scope_history: Vec<ScopeChange>,
     /// `active`, `revoking` (access has ended, and the Grant PDA's close
     /// hasn't been recorded yet: revoke again to finish it) or `revoked`.
     pub status: String,
@@ -149,6 +206,22 @@ fn analysis_drt<'a>(doc: &'a PoolDoc, analysis_id: &str) -> Result<&'a DrtMetada
         .ok_or_else(|| ApiError::not_found(format!("this pool has no analysis {analysis_id:?}")))
 }
 
+/// The definition of `doc`'s analysis.
+async fn analysis_definition(state: &AppState, doc: &PoolDoc) -> Result<Arc<Definition>, ApiError> {
+    let analysis = doc
+        .analysis
+        .as_ref()
+        .ok_or_else(|| ApiError::not_found("this pool has no analysis"))?;
+    state
+        .analyses
+        .definition(&state.storage, &analysis.code_hash_hex)
+        .await
+}
+
+fn invalid_scope(message: String) -> ApiError {
+    ApiError::bad_request(message).with_code("invalid_scope")
+}
+
 /// The keypair of the caller's active wallet, which must own the pool:
 /// only the owner holds its DRTs and may close its grants.
 async fn owner_keypair(
@@ -195,11 +268,50 @@ fn superseded() -> ApiError {
 /// What the chain showed of a grant: its PDA, and the reading, if any.
 type OnChain = (Pubkey, Option<Seen>);
 
+/// Each scope key of a definition, and the CSV header of its column.
+type Headers = BTreeMap<String, String>;
+
+fn headers(def: &Definition) -> Headers {
+    def.scope
+        .iter()
+        .map(|(key, column)| {
+            let header = def.column(column).map_or(key, |c| &c.header);
+            (key.clone(), header.clone())
+        })
+        .collect()
+}
+
+/// The headers of `doc`'s analysis's scope keys, if it has an analysis.
+async fn pool_headers(state: &AppState, doc: &PoolDoc) -> Result<Headers, ApiError> {
+    match &doc.analysis {
+        Some(analysis) => {
+            let def = state
+                .analyses
+                .definition(&state.storage, &analysis.code_hash_hex)
+                .await?;
+            Ok(headers(&def))
+        }
+        None => Ok(Headers::new()),
+    }
+}
+
+fn described(targets: &BTreeSet<Target>, headers: &Headers) -> Vec<ScopeTarget> {
+    targets
+        .iter()
+        .map(|t| ScopeTarget {
+            key: t.key.clone(),
+            header: headers.get(&t.key).unwrap_or(&t.key).clone(),
+            value: t.value.clone(),
+        })
+        .collect()
+}
+
 fn entry(
     state: &AppState,
     grant: &Grant,
     analyst: Option<&Identity>,
     on_chain: Option<&OnChain>,
+    headers: &Headers,
 ) -> GrantEntry {
     let revoked = grant.revoked.as_ref();
     let signature = grant.signature.clone();
@@ -210,6 +322,22 @@ fn entry(
         analyst_email: analyst.map(|i| i.email.clone()).unwrap_or_default(),
         analyst_display_name: analyst.map(|i| i.display_name.clone()).unwrap_or_default(),
         analysis_id: grant.drt_name.clone(),
+        scope: grant
+            .targets()
+            .map(|t| described(t, headers))
+            .unwrap_or_default(),
+        scope_revision: grant.scope_revision(),
+        scope_history: grant
+            .scopes
+            .iter()
+            .enumerate()
+            .map(|(i, s)| ScopeChange {
+                revision: i + 1,
+                scope: described(&s.targets, headers),
+                set_by: s.set_by.clone(),
+                set_at: s.set_at,
+            })
+            .collect(),
         status: match revoked {
             None => "active",
             Some(r) if r.signature.is_none() => "revoking",
@@ -310,28 +438,35 @@ pub async fn grant_analysis(
     let pool_pda = parse_pda(&pool_pda_str)?;
     let doc = load_pool(&state, &pool_pda_str).await?;
     let drt = analysis_drt(&doc, &payload.analysis_id)?.clone();
+    let def = analysis_definition(&state, &doc).await?;
+    let targets = check_targets(&def, &payload.scope).map_err(invalid_scope)?;
+    let headers = headers(&def);
     let analyst = state
         .storage
         .identities()
         .by_user_id(&payload.analyst_user_id)
         .await?
-        .ok_or_else(|| ApiError::not_found("no user with that user_id has signed in"))?;
+        .ok_or_else(|| ApiError::not_found("no user with that user_id is known"))?;
     let grant_id = ids::grant_id(&caller.user_id, &pool_pda_str, &request.key);
     audit::grant(&grant_id);
 
     // This request's grant, or another active one: nothing to burn.
-    let existing = doc
-        .grants
-        .iter()
-        .find(|g| g.grant_id == grant_id)
-        .or_else(|| doc.active_grant(&analyst.user_id, &payload.analysis_id));
-    if let Some(existing) = existing {
+    let mine = doc.grants.iter().find(|g| g.grant_id == grant_id);
+    let active = doc.active_grant(&analyst.user_id, &payload.analysis_id);
+    if mine.is_none() && active.is_some_and(|g| g.targets() != Some(&targets)) {
+        return Err(ApiError::conflict(
+            "the analyst already has a grant to this analysis with other targets; change its scope instead",
+        )
+        .with_code("grant_active"));
+    }
+    if let Some(existing) = mine.or(active) {
         let on_chain = statuses(&state, &doc).await;
         let entry = entry(
             &state,
             existing,
             Some(&analyst),
             on_chain.get(&existing.grant_id),
+            &headers,
         );
         return op.finish(StatusCode::OK, &entry).await;
     }
@@ -399,6 +534,12 @@ pub async fn grant_analysis(
                         granted_at: Utc::now(),
                         signature: None,
                         revoked: None,
+                        scopes: vec![GrantScope {
+                            targets: targets.clone(),
+                            set_by: caller.user_id.clone(),
+                            set_at: Utc::now(),
+                            change_id: grant_id.clone(),
+                        }],
                     },
                 },
             },
@@ -418,6 +559,7 @@ pub async fn grant_analysis(
                 present,
                 Some(&analyst),
                 on_chain.get(&present.grant_id),
+                &headers,
             );
             return op.finish(StatusCode::OK, &entry).await;
         }
@@ -490,6 +632,7 @@ pub async fn grant_analysis(
         recorded,
         Some(&analyst),
         on_chain.get(&recorded.grant_id),
+        &headers,
     );
     op.finish(StatusCode::OK, &entry).await
 }
@@ -513,7 +656,7 @@ pub async fn grant_analysis(
         ("pool_pda" = String, Path, description = "Pool PDA address (base58)"),
         ("Idempotency-Key" = String, Header, format = "uuid", description = "A UUID naming this user action; reuse it on every retry"),
     ),
-    request_body = GrantRequest,
+    request_body = RevokeGrantRequest,
     responses(
         (status = 200, description = "The revoked grant", body = GrantEntry),
         (status = 400, description = "No Idempotency-Key, or Solana refused the close (`transaction_rejected`)"),
@@ -533,7 +676,7 @@ pub async fn revoke_grant(
     JsonBody {
         value: payload,
         bytes,
-    }: JsonBody<GrantRequest>,
+    }: JsonBody<RevokeGrantRequest>,
 ) -> Result<Response, ApiError> {
     caller.require(Permission::PoolsWrite)?;
     let mut op = open_or_replay!(state, &caller.user_id, request, &bytes);
@@ -634,6 +777,7 @@ pub async fn revoke_grant(
                         granted_at: revocation.revoked_at,
                         signature: None,
                         revoked: Some(revocation.clone()),
+                        scopes: Vec::new(),
                     });
                     Ok(Change::Changed)
                 }
@@ -657,11 +801,13 @@ pub async fn revoke_grant(
         .is_some_and(|r| r.signature.is_some())
     {
         let on_chain = statuses(&state, &doc).await;
+        let headers = pool_headers(&state, &doc).await?;
         let entry = entry(
             &state,
             grant,
             analyst.as_ref(),
             on_chain.get(&grant.grant_id),
+            &headers,
         );
         return op.finish(StatusCode::OK, &entry).await;
     }
@@ -721,11 +867,137 @@ pub async fn revoke_grant(
         "Analyst grant revoked"
     );
     let on_chain = reread(&state, &doc).await;
+    let headers = pool_headers(&state, &doc).await?;
     let entry = entry(
         &state,
         grant,
         analyst.as_ref(),
         on_chain.get(&grant.grant_id),
+        &headers,
+    );
+    op.finish(StatusCode::OK, &entry).await
+}
+
+// ============================================================================
+// POST /v1/drt/pools/{pool_pda}/grant-scope
+// ============================================================================
+
+/// Change which rows an analyst's active grant sees.
+#[utoipa::path(
+    post,
+    path = "/v1/drt/pools/{pool_pda}/grant-scope",
+    tag = "Grants",
+    summary = "Change a grant's targets",
+    description = "Set the targets of an analyst's active grant: from the next request on, the analyst sees the rows of any of them. Nothing is burned or sent on-chain. The edit names the grant's `scope_revision` it started from: a stale one gets `409 version_conflict`, and one that sets the targets the grant already has changes nothing. Every setting is kept in the grant's `scope_history`. Needs `pools:write` and pool ownership. Idempotent.",
+    security(("bearer_auth" = [])),
+    params(
+        ("pool_pda" = String, Path, description = "Pool PDA address (base58)"),
+        ("Idempotency-Key" = String, Header, format = "uuid", description = "A UUID naming this user action; reuse it on every retry"),
+    ),
+    request_body = GrantScopeRequest,
+    responses(
+        (status = 200, description = "The grant", body = GrantEntry),
+        (status = 400, description = "Targets the analysis can't apply (`invalid_scope`), or no Idempotency-Key"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Not the pool's owner"),
+        (status = 404, description = "Pool or analysis not found, or the analyst has no grant (`no_grant`)"),
+        (status = 409, description = "The grant is revoked (`grant_not_active`), or its targets changed since `revision` (`version_conflict`)"),
+        (status = 422, description = "The Idempotency-Key was used for a different request"),
+    )
+)]
+pub async fn set_grant_scope(
+    caller: Caller,
+    request: Idempotent,
+    State(state): State<AppState>,
+    Path(pool_pda_str): Path<String>,
+    JsonBody {
+        value: payload,
+        bytes,
+    }: JsonBody<GrantScopeRequest>,
+) -> Result<Response, ApiError> {
+    caller.require(Permission::PoolsWrite)?;
+    let mut op = open_or_replay!(state, &caller.user_id, request, &bytes);
+    let doc = load_pool(&state, &pool_pda_str).await?;
+    analysis_drt(&doc, &payload.analysis_id)?;
+    // No chain step, so the owner is checked against the pool document.
+    let wallet = crate::api::get_active_wallet_for_user(&state, &caller.user_id).await?;
+    if wallet.wallet_id != doc.owner_wallet_id {
+        return Err(ApiError::forbidden(
+            "only the pool's owner changes its grants",
+        ));
+    }
+    let def = analysis_definition(&state, &doc).await?;
+    let targets = check_targets(&def, &payload.scope).map_err(invalid_scope)?;
+    let (analyst_id, analysis_id) = (&payload.analyst_user_id, &payload.analysis_id);
+    let change = GrantScope {
+        targets,
+        set_by: caller.user_id.clone(),
+        set_at: Utc::now(),
+        change_id: request.key.clone(),
+    };
+
+    op.begin().await?;
+    let mut target = String::new();
+    let doc = state
+        .storage
+        .pools()
+        .update::<ApiError>(&pool_pda_str, |doc| {
+            let latest = doc
+                .grants
+                .iter_mut()
+                .rev()
+                .find(|g| &g.analyst == analyst_id && &g.drt_name == analysis_id);
+            let Some(grant) = latest else {
+                return Err(
+                    ApiError::not_found("the analyst has no grant to this analysis")
+                        .with_code("no_grant"),
+                );
+            };
+            target = grant.grant_id.clone();
+            if grant.scopes.iter().any(|s| s.change_id == change.change_id) {
+                return Ok(Change::Unchanged);
+            }
+            if grant.revoked.is_some() {
+                return Err(ApiError::conflict(
+                    "the analyst's grant is revoked; grant them again to give them rows",
+                )
+                .with_code("grant_not_active"));
+            }
+            if grant.targets() == Some(&change.targets) {
+                return Ok(Change::Unchanged);
+            }
+            if grant.scope_revision() != payload.revision {
+                return Err(ApiError::conflict(format!(
+                    "the grant's targets changed after revision {}; reload them and edit again",
+                    payload.revision
+                ))
+                .with_code("version_conflict"));
+            }
+            grant.scopes.push(change.clone());
+            Ok(Change::Changed)
+        })
+        .await?
+        .ok_or_else(|| pool_not_found(&pool_pda_str))?;
+    audit::grant(&target);
+    let grant = doc
+        .grants
+        .iter()
+        .find(|g| g.grant_id == target)
+        .ok_or_else(|| ApiError::internal("the grant vanished"))?;
+    let analyst = state.storage.identities().by_user_id(analyst_id).await?;
+    let on_chain = statuses(&state, &doc).await;
+    info!(
+        pool = %pool_pda_str,
+        grant_id = %grant.grant_id,
+        revision = grant.scope_revision(),
+        "Grant scope set"
+    );
+    let entry = entry(
+        &state,
+        grant,
+        analyst.as_ref(),
+        on_chain.get(&grant.grant_id),
+        &headers(&def),
     );
     op.finish(StatusCode::OK, &entry).await
 }
@@ -768,6 +1040,7 @@ pub async fn list_grants(
         .map(|i| (i.user_id.clone(), i))
         .collect();
     let on_chain = statuses(&state, &doc).await;
+    let headers = pool_headers(&state, &doc).await?;
     let grants = doc
         .grants
         .iter()
@@ -778,6 +1051,7 @@ pub async fn list_grants(
                 g,
                 identities.get(&g.analyst),
                 on_chain.get(&g.grant_id),
+                &headers,
             )
         })
         .collect();
@@ -881,9 +1155,12 @@ pub(crate) mod tests {
             .pool(owner, Some(initial_upload(&owner.user_id)))
             .await;
         let url = crate::analysis::fetch::tests::AWARDS_REPORT_URL.to_string();
-        let hash = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(
-            crate::analysis::definition::tests::AWARDS_REPORT,
-        ));
+        let hash = worker
+            .storage
+            .scripts()
+            .put(crate::analysis::definition::tests::AWARDS_REPORT.as_bytes())
+            .await
+            .unwrap();
         worker
             .storage
             .pools()
@@ -912,20 +1189,24 @@ pub(crate) mod tests {
         pool_pda
     }
 
-    /// An analyst in `groups` who has signed in: their token and user ID.
-    pub(crate) async fn analyst(
-        app: &axum::Router,
-        oid: &str,
-        groups: &[&str],
-    ) -> (String, String) {
+    /// An analyst who has signed in: their token and user ID.
+    pub(crate) async fn analyst(app: &axum::Router, oid: &str) -> (String, String) {
         let mut spec = Spec::valid(&config());
         spec.oid = oid.into();
         spec.roles = vec!["Analyst".into()];
-        spec.groups = groups.iter().map(|g| g.to_string()).collect();
         spec.email = Some(format!("{oid}@example.com"));
         let token = spec.sign(entra_key()).unwrap();
         let user_id = sign_in(app, &token).await;
         (token, user_id)
+    }
+
+    /// A grant of the analysis to `analyst`, who sees employer group Group A.
+    pub(crate) fn granting(analyst: &str) -> Value {
+        json!({
+            "analyst_user_id": analyst,
+            "analysis_id": ANALYSIS,
+            "scope": [{ "key": "employer_group", "value": "Group A" }],
+        })
     }
 
     fn post(path: &str, token: &str, key: &str, body: &Value) -> Request<Body> {
@@ -983,10 +1264,10 @@ pub(crate) mod tests {
         let worker = worker();
         let owner = worker.admin("oid-owner").await;
         let pool_pda = analysis_pool(&worker, &owner, 2).await;
-        let (analyst_token, analyst_id) = analyst(&worker.app, "oid-ana", &[]).await;
+        let (analyst_token, analyst_id) = analyst(&worker.app, "oid-ana").await;
         worker.chain.lands.store(true, SeqCst);
         let path = format!("/v1/drt/pools/{pool_pda}/grant");
-        let body = json!({ "analyst_user_id": analyst_id, "analysis_id": ANALYSIS });
+        let body = granting(&analyst_id);
 
         let key = new_key();
         let (status, _, granted) = send(&worker.app, post(&path, &owner.token, &key, &body)).await;
@@ -1041,14 +1322,15 @@ pub(crate) mod tests {
         let worker = worker();
         let owner = worker.admin("oid-owner").await;
         let pool_pda = analysis_pool(&worker, &owner, 2).await;
-        let (_, analyst_id) = analyst(&worker.app, "oid-ana", &[]).await;
+        let (_, analyst_id) = analyst(&worker.app, "oid-ana").await;
         worker.chain.lands.store(true, SeqCst);
         let grant_path = format!("/v1/drt/pools/{pool_pda}/grant");
         let revoke_path = format!("/v1/drt/pools/{pool_pda}/revoke-grant");
         let body = json!({ "analyst_user_id": analyst_id, "analysis_id": ANALYSIS });
+        let grant_body = granting(&analyst_id);
         let (status, _, granted) = send(
             &worker.app,
-            post(&grant_path, &owner.token, &new_key(), &body),
+            post(&grant_path, &owner.token, &new_key(), &grant_body),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{granted}");
@@ -1081,7 +1363,7 @@ pub(crate) mod tests {
         // Until the close is recorded, the analyst can't be granted again.
         let (status, _, err) = send(
             &worker.app,
-            post(&grant_path, &owner.token, &new_key(), &body),
+            post(&grant_path, &owner.token, &new_key(), &grant_body),
         )
         .await;
         assert_eq!(
@@ -1120,7 +1402,7 @@ pub(crate) mod tests {
         // Now a grant burns again, as a new grant.
         let (status, _, regranted) = send(
             &worker.app,
-            post(&grant_path, &owner.token, &new_key(), &body),
+            post(&grant_path, &owner.token, &new_key(), &grant_body),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{regranted}");
@@ -1141,7 +1423,7 @@ pub(crate) mod tests {
         let worker = worker();
         let owner = worker.admin("oid-owner").await;
         let pool_pda = analysis_pool(&worker, &owner, 2).await;
-        let (_, analyst_id) = analyst(&worker.app, "oid-ana", &[]).await;
+        let (_, analyst_id) = analyst(&worker.app, "oid-ana").await;
         let commitment = worker
             .commitments
             .commitment(&analyst_id, &POOL_UUID, &EXECUTE_RIGHT_ID);
@@ -1157,6 +1439,7 @@ pub(crate) mod tests {
             granted_at: staged_at,
             signature: None,
             revoked: None,
+            scopes: Vec::new(),
         };
         let saga = Saga::Grant {
             pool_pda: pool_pda.to_string(),
@@ -1213,9 +1496,15 @@ pub(crate) mod tests {
         let owner = worker.admin("oid-owner").await;
         let other = worker.admin("oid-other").await;
         let pool_pda = analysis_pool(&worker, &owner, 0).await;
-        let (analyst_token, analyst_id) = analyst(&worker.app, "oid-ana", &[]).await;
+        let (analyst_token, analyst_id) = analyst(&worker.app, "oid-ana").await;
         let path = format!("/v1/drt/pools/{pool_pda}/grant");
-        let body = |analyst: &str, analysis: &str| json!({ "analyst_user_id": analyst, "analysis_id": analysis });
+        let body = |analyst: &str, analysis: &str| {
+            let mut body = granting(analyst);
+            body["analysis_id"] = json!(analysis);
+            body
+        };
+        let revoking =
+            |analyst: &str| json!({ "analyst_user_id": analyst, "analysis_id": ANALYSIS });
         for (token, body, status, code) in [
             (
                 &other.token,
@@ -1257,23 +1546,13 @@ pub(crate) mod tests {
         }
 
         let revoke = format!("/v1/drt/pools/{pool_pda}/revoke-grant");
-        let request = post(
-            &revoke,
-            &owner.token,
-            &new_key(),
-            &body(&analyst_id, ANALYSIS),
-        );
+        let request = post(&revoke, &owner.token, &new_key(), &revoking(&analyst_id));
         let (status, _, err) = send(&worker.app, request).await;
         assert_eq!(
             (status, err["code"].as_str()),
             (StatusCode::NOT_FOUND, Some("no_grant"))
         );
-        let request = post(
-            &revoke,
-            &other.token,
-            &new_key(),
-            &body(&analyst_id, ANALYSIS),
-        );
+        let request = post(&revoke, &other.token, &new_key(), &revoking(&analyst_id));
         assert_eq!(send(&worker.app, request).await.0, StatusCode::FORBIDDEN);
         assert!(worker.chain.sent().is_empty());
     }
@@ -1283,10 +1562,10 @@ pub(crate) mod tests {
         let worker = worker();
         let owner = worker.admin("oid-owner").await;
         let pool_pda = analysis_pool(&worker, &owner, 2).await;
-        let (_, analyst_id) = analyst(&worker.app, "oid-ana", &[]).await;
+        let (_, analyst_id) = analyst(&worker.app, "oid-ana").await;
         worker.chain.lands.store(true, SeqCst);
         let path = format!("/v1/drt/pools/{pool_pda}/grant");
-        let body = json!({ "analyst_user_id": analyst_id, "analysis_id": ANALYSIS });
+        let body = granting(&analyst_id);
         let pda = grant_pda(&worker, &analyst_id);
 
         // Lamports someone sent to the address are no burn: the grant burns.
@@ -1298,14 +1577,199 @@ pub(crate) mod tests {
 
         // A Grant another pool's DRT made at the address takes it: no burn
         // of ours can land there.
-        let (_, other_id) = analyst(&worker.app, "oid-bo", &[]).await;
+        let (_, other_id) = analyst(&worker.app, "oid-bo").await;
         let taken = grant_pda(&worker, &other_id);
         worker.chain.grant(taken, Pubkey::new_unique());
-        let body = json!({ "analyst_user_id": other_id, "analysis_id": ANALYSIS });
+        let body = granting(&other_id);
         let (status, _, refused) =
             send(&worker.app, post(&path, &owner.token, &new_key(), &body)).await;
         assert_eq!(status, StatusCode::CONFLICT, "{refused}");
         assert_eq!(refused["code"], "grant_pda_taken");
         assert_eq!(worker.chain.sent().len(), 1, "nothing more was sent");
+    }
+
+    #[tokio::test]
+    async fn a_grants_targets_change_without_a_burn_and_keep_their_history() {
+        let worker = worker();
+        let owner = worker.admin("oid-owner").await;
+        let other = worker.admin("oid-other").await;
+        let pool_pda = analysis_pool(&worker, &owner, 2).await;
+        let (analyst_token, analyst_id) = analyst(&worker.app, "oid-ana").await;
+        let (_, ungranted_id) = analyst(&worker.app, "oid-bo").await;
+        worker.chain.lands.store(true, SeqCst);
+        let grant_path = format!("/v1/drt/pools/{pool_pda}/grant");
+        let scope_path = format!("/v1/drt/pools/{pool_pda}/grant-scope");
+
+        // Targets are checked against the analysis.
+        for scope in [
+            json!([]),
+            json!([{ "key": "region", "value": "Region E" }]),
+            json!([{ "key": "employer", "value": " Bank B" }]),
+        ] {
+            let mut body = granting(&analyst_id);
+            body["scope"] = scope.clone();
+            let (status, _, err) = send(
+                &worker.app,
+                post(&grant_path, &owner.token, &new_key(), &body),
+            )
+            .await;
+            assert_eq!(
+                (status, err["code"].as_str()),
+                (StatusCode::BAD_REQUEST, Some("invalid_scope")),
+                "{scope}"
+            );
+        }
+        let mut compound = granting(&analyst_id);
+        compound["scope"] =
+            json!([{ "key": "employer", "value": "Bank B", "employer_group": "Group B" }]);
+        let (status, _, _) = send(
+            &worker.app,
+            post(&grant_path, &owner.token, &new_key(), &compound),
+        )
+        .await;
+        assert!(status.is_client_error(), "{status}");
+        assert!(worker.chain.sent().is_empty());
+
+        let (status, _, granted) = send(
+            &worker.app,
+            post(
+                &grant_path,
+                &owner.token,
+                &new_key(),
+                &granting(&analyst_id),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{granted}");
+        assert_eq!(granted["scope_revision"], 1);
+        assert_eq!(
+            granted["scope"],
+            json!([{ "key": "employer_group", "header": "Employer Group", "value": "Group A" }])
+        );
+        assert_eq!(granted["on_chain"], "live");
+
+        // Another grant with other targets is refused; the change is an edit.
+        let mut elsewhere = granting(&analyst_id);
+        elsewhere["scope"] = json!([{ "key": "employer", "value": "Bank B" }]);
+        let (status, _, err) = send(
+            &worker.app,
+            post(&grant_path, &owner.token, &new_key(), &elsewhere),
+        )
+        .await;
+        assert_eq!(
+            (status, err["code"].as_str()),
+            (StatusCode::CONFLICT, Some("grant_active"))
+        );
+
+        let change = |revision: usize, scope: Value| {
+            json!({ "analyst_user_id": analyst_id, "analysis_id": ANALYSIS,
+                "revision": revision, "scope": scope })
+        };
+        let wider = json!([
+            { "key": "employer_group", "value": "Group A" },
+            { "key": "employer", "value": "Bank B" },
+        ]);
+        let key = new_key();
+        let (status, _, changed) = send(
+            &worker.app,
+            post(&scope_path, &owner.token, &key, &change(1, wider.clone())),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{changed}");
+        assert_eq!(changed["scope_revision"], 2);
+        assert_eq!(changed["scope"].as_array().unwrap().len(), 2);
+        let history = changed["scope_history"].as_array().unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0]["revision"], 1);
+        assert_eq!(history[1]["set_by"], owner.user_id.as_str());
+        assert_eq!(
+            worker.chain.sent().len(),
+            1,
+            "only the grant's burn was sent"
+        );
+
+        // A retry replays; the same targets from a stale copy converge; other
+        // targets from a stale copy are refused.
+        let (status, headers, replayed) = send(
+            &worker.app,
+            post(&scope_path, &owner.token, &key, &change(1, wider.clone())),
+        )
+        .await;
+        assert_eq!((status, &replayed), (StatusCode::OK, &changed));
+        assert_eq!(headers[&REPLAYED_HEADER], "true");
+        let (status, _, same) = send(
+            &worker.app,
+            post(&scope_path, &owner.token, &new_key(), &change(1, wider)),
+        )
+        .await;
+        assert_eq!(
+            (status, &same["scope_revision"]),
+            (StatusCode::OK, &json!(2))
+        );
+        let narrower = json!([{ "key": "employer", "value": "Bank B" }]);
+        let (status, _, err) = send(
+            &worker.app,
+            post(
+                &scope_path,
+                &owner.token,
+                &new_key(),
+                &change(1, narrower.clone()),
+            ),
+        )
+        .await;
+        assert_eq!(
+            (status, err["code"].as_str()),
+            (StatusCode::CONFLICT, Some("version_conflict"))
+        );
+
+        // Only the pool's owner edits, and only a grant that exists and is active.
+        let (status, _, _) = send(
+            &worker.app,
+            post(
+                &scope_path,
+                &other.token,
+                &new_key(),
+                &change(2, narrower.clone()),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, _, _) = send(
+            &worker.app,
+            post(
+                &scope_path,
+                &analyst_token,
+                &new_key(),
+                &change(2, narrower.clone()),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let mut nobody = change(1, narrower.clone());
+        nobody["analyst_user_id"] = json!(ungranted_id);
+        let (status, _, err) = send(
+            &worker.app,
+            post(&scope_path, &owner.token, &new_key(), &nobody),
+        )
+        .await;
+        assert_eq!(
+            (status, err["code"].as_str()),
+            (StatusCode::NOT_FOUND, Some("no_grant"))
+        );
+
+        let revoke = format!("/v1/drt/pools/{pool_pda}/revoke-grant");
+        let body = json!({ "analyst_user_id": analyst_id, "analysis_id": ANALYSIS });
+        let (status, _, _) =
+            send(&worker.app, post(&revoke, &owner.token, &new_key(), &body)).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _, err) = send(
+            &worker.app,
+            post(&scope_path, &owner.token, &new_key(), &change(2, narrower)),
+        )
+        .await;
+        assert_eq!(
+            (status, err["code"].as_str()),
+            (StatusCode::CONFLICT, Some("grant_not_active"))
+        );
     }
 }

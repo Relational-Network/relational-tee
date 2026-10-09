@@ -33,6 +33,7 @@ fn event_for(method: &Method, route: &str) -> Option<&'static str> {
         ("POST", "/v1/drt/pools/{pool_pda}/revoke") => "credential_revoked",
         ("POST", "/v1/drt/pools/{pool_pda}/grant") => "grant_created",
         ("POST", "/v1/drt/pools/{pool_pda}/revoke-grant") => "grant_revoked",
+        ("POST", "/v1/drt/pools/{pool_pda}/grant-scope") => "grant_scope_changed",
         ("POST", "/v1/drt/pools/{pool_pda}/analyses/{analysis_id}/query") => "analysis_queried",
         ("POST", "/v1/drt/pools/{pool_pda}/analyses/{analysis_id}/options") => {
             "analysis_options_read"
@@ -45,13 +46,6 @@ fn event_for(method: &Method, route: &str) -> Option<&'static str> {
         ("POST", "/v1/wallets/{wallet_id}/send") => "transaction_sent",
         ("POST", "/v1/admin/wallets/{wallet_id}/suspend") => "wallet_suspended",
         ("POST", "/v1/admin/wallets/{wallet_id}/activate") => "wallet_activated",
-        ("PUT", "/v1/admin/employer-scopes") => "employer_scopes_replaced",
-        ("GET", "/v1/admin/employer-scopes") => "admin_employer_scopes_read",
-        ("POST", "/v1/admin/employer-scopes/check") => "admin_employer_scopes_checked",
-        ("GET", "/v1/admin/employer-scopes/versions") => "admin_employer_scope_versions_listed",
-        ("GET", "/v1/admin/employer-scopes/versions/{version}") => {
-            "admin_employer_scope_version_read"
-        }
         ("GET", "/v1/admin/analysis-log") => "admin_analysis_log_read",
         ("GET", "/v1/admin/wallet-stats") => "admin_wallet_stats_read",
         ("GET", "/v1/admin/wallets") => "admin_wallets_listed",

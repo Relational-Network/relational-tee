@@ -11,6 +11,8 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
 use rusqlite::{Connection, ToSql};
+use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 use super::dates;
 use super::definition::{Column, ColumnType, Definition, RECORD_ID};
@@ -20,6 +22,60 @@ use super::runner::DEADLINE;
 /// Scope keys, such as `employer_group`, each with the value a row's column
 /// for that key must hold exactly. A row matches when it meets them all.
 pub type Conditions = BTreeMap<String, String>;
+
+/// What a grant lets its analyst see: the rows whose column for scope key
+/// `key` holds `value` exactly, such as employer group "Group A". A grant
+/// sees the rows of any of its targets.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Target {
+    /// A scope key the pool's definition declares, such as `employer`.
+    pub key: String,
+    /// The value, as the data holds it.
+    pub value: String,
+}
+
+/// The most targets a grant holds.
+pub const MAX_TARGETS: usize = 100;
+
+/// The longest target value, in bytes.
+const MAX_VALUE: usize = 256;
+
+/// `targets` as a grant's scope under `def`, or why they can't be one. A
+/// value is compared exactly, as the data holds it, so it must not carry
+/// stray spaces; the same name under two keys is two targets.
+pub fn check_targets(def: &Definition, targets: &[Target]) -> Result<BTreeSet<Target>, String> {
+    if targets.is_empty() || targets.len() > MAX_TARGETS {
+        return Err(format!(
+            "a grant sees 1 to {MAX_TARGETS} targets, such as {{ \"key\": \"employer_group\", \"value\": \"Group A\" }}"
+        ));
+    }
+    let mut set = BTreeSet::new();
+    for (i, target) in targets.iter().enumerate() {
+        if !def.scope.contains_key(&target.key) {
+            let keys: Vec<&str> = def.scope.keys().map(String::as_str).collect();
+            return Err(format!(
+                "scope[{i}].key {:?} isn't a scope key of this analysis: one of {}",
+                target.key,
+                keys.join(", ")
+            ));
+        }
+        let value = &target.value;
+        if value.is_empty()
+            || value.len() > MAX_VALUE
+            || value.trim() != value
+            || value.chars().any(char::is_control)
+        {
+            return Err(format!(
+                "scope[{i}].value must be 1 to {MAX_VALUE} bytes, with no surrounding spaces or control characters"
+            ));
+        }
+        if !set.insert(target.clone()) {
+            return Err(format!("scope[{i}] repeats an earlier target"));
+        }
+    }
+    Ok(set)
+}
 
 /// The rows a caller may see.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -33,21 +89,14 @@ pub enum Scope {
 }
 
 impl Scope {
-    /// The part of this scope `def` can apply, or `None` if nothing is left.
-    /// Conditions on a key `def` doesn't declare can't be met by its rows,
-    /// so they go, whole.
-    pub fn for_definition(&self, def: &Definition) -> Option<Self> {
-        match self {
-            Self::All => Some(Self::All),
-            Self::Only(entries) => {
-                let kept: BTreeSet<Conditions> = entries
-                    .iter()
-                    .filter(|c| !c.is_empty() && c.keys().all(|k| def.scope.contains_key(k)))
-                    .cloned()
-                    .collect();
-                (!kept.is_empty()).then_some(Self::Only(kept))
-            }
-        }
+    /// The rows of any of `targets`.
+    pub fn of(targets: &BTreeSet<Target>) -> Self {
+        Self::Only(
+            targets
+                .iter()
+                .map(|t| Conditions::from([(t.key.clone(), t.value.clone())]))
+                .collect(),
+        )
     }
 
     /// Whether a row is in scope. `positions` gives each scope key's
@@ -355,6 +404,76 @@ pub(crate) mod tests {
         );
         assert_eq!(kept_out, [&combination("Bank B", None, 1)]);
         assert!(counts.split(&Scope::All).1.is_empty());
+    }
+
+    fn target(key: &str, value: &str) -> Target {
+        Target {
+            key: key.into(),
+            value: value.into(),
+        }
+    }
+
+    #[test]
+    fn targets_name_one_declared_key_and_an_exact_value_each() {
+        let def = awards_report();
+        let group_a = target("employer_group", "Group A");
+        let refused = |targets: &[Target]| check_targets(&def, targets).unwrap_err();
+        assert!(refused(&[]).contains("1 to 100"));
+        let many: Vec<Target> = (0..=MAX_TARGETS)
+            .map(|i| target("employer", &format!("Bank {i}")))
+            .collect();
+        assert!(refused(&many).contains("1 to 100"));
+        assert!(refused(&[group_a.clone(), group_a.clone()]).contains("repeats"));
+        assert!(refused(&[target("region", "Region E")]).contains("isn't a scope key"));
+        for value in ["", " Group A", "Group A ", "Group\tA", &"x".repeat(257)] {
+            let e = refused(&[target("employer_group", value)]);
+            assert!(e.contains("1 to 256 bytes"), "{value:?}: {e}");
+        }
+        // A target holds one key and one value; anything more is refused.
+        let compound = serde_json::json!({ "key": "employer", "value": "Bank A",
+            "employer_group": "Group A" });
+        assert!(serde_json::from_value::<Target>(compound).is_err());
+
+        // The same name under two keys is two targets.
+        let both = [
+            target("employer", "Lender D"),
+            target("employer_group", "Lender D"),
+        ];
+        assert_eq!(check_targets(&def, &both).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_grant_sees_the_rows_of_any_of_its_targets_each_once() {
+        let def = awards_report();
+        let csv = format!(
+            "{AWARDS_HEADER}\n\
+             1,M1,Mx,Sam,Alpha,01/01/1990,Bank A,Group A,Certificate,Pass,01/01/2026\n\
+             2,M2,Mx,Sam,Bravo,01/01/1990,Bank A Network,Group A,Certificate,Pass,02/01/2026\n\
+             3,M3,Mx,Sam,Charlie,01/01/1990,Bank B,Group B,Certificate,Pass,03/01/2026\n\
+             4,M4,Mx,Sam,Delta,01/01/1990,Lender D,None,Certificate,Pass,04/01/2026\n\
+             5,M5,Mx,Sam,Echo,01/01/1990,Bank E,Lender D,Certificate,Pass,05/01/2026\n"
+        );
+        let rows = |targets: &[Target]| {
+            let scope = Scope::of(&check_targets(&def, targets).unwrap());
+            Table::build(&def, &[csv.as_bytes()], &scope).unwrap().rows
+        };
+        let group_a = target("employer_group", "Group A");
+        let network = target("employer", "Bank A Network");
+        let bank_b = target("employer", "Bank B");
+        // Several employers, several groups, a mix, and an employer inside
+        // a group it's granted with: each row counts once.
+        assert_eq!(rows(&[network.clone(), bank_b.clone()]), 2);
+        assert_eq!(
+            rows(&[group_a.clone(), target("employer_group", "Group B")]),
+            3
+        );
+        assert_eq!(rows(&[group_a.clone(), bank_b]), 3);
+        assert_eq!(rows(&[group_a, network]), 2, "the employer is in the group");
+        // An employer and a group of the same name are different rows.
+        assert_eq!(rows(&[target("employer", "Lender D")]), 1);
+        assert_eq!(rows(&[target("employer_group", "Lender D")]), 1);
+        // "None" is a value like any other, never a wildcard.
+        assert_eq!(rows(&[target("employer_group", "None")]), 1);
     }
 
     #[test]

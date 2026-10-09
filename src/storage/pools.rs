@@ -13,13 +13,14 @@
 //! Totals aren't stored: they're computed from the document's own entries,
 //! so they can't drift.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 use super::{id, Change, Storage, StoreError};
+use crate::analysis::table::Target;
 use crate::data_validation::FieldSchema;
 use crate::store::Created;
 
@@ -141,12 +142,40 @@ pub struct Grant {
     pub signature: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revoked: Option<GrantRevocation>,
+    /// The rows the grant lets its analyst see, oldest first: the last is
+    /// current. A grant without one sees no rows.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scopes: Vec<GrantScope>,
 }
 
 impl Grant {
     pub fn commitment_bytes(&self) -> Option<[u8; 32]> {
         hex::decode(&self.commitment).ok()?.try_into().ok()
     }
+
+    /// The targets the grant sees now, if it has any.
+    pub fn targets(&self) -> Option<&BTreeSet<Target>> {
+        self.scopes.last().map(|s| &s.targets)
+    }
+
+    /// How many times its scope was set: an edit names the revision it
+    /// started from.
+    pub fn scope_revision(&self) -> usize {
+        self.scopes.len()
+    }
+}
+
+/// A grant's targets, as one owner set them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrantScope {
+    /// The grant sees the rows of any of these.
+    pub targets: BTreeSet<Target>,
+    /// The `user_id` who set them.
+    pub set_by: String,
+    pub set_at: DateTime<Utc>,
+    /// Names the request that set them: the grant's ID, or a change's
+    /// Idempotency-Key.
+    pub change_id: String,
 }
 
 /// A grant's revocation. Access ends when it is recorded; closing the Grant
@@ -426,6 +455,15 @@ pub(crate) mod tests {
             granted_at: Utc::now() - chrono::Duration::minutes(minutes_ago),
             signature: Some(format!("sig-{grant_id}")),
             revoked: None,
+            scopes: vec![GrantScope {
+                targets: BTreeSet::from([Target {
+                    key: "employer_group".into(),
+                    value: "Group A".into(),
+                }]),
+                set_by: "alice".into(),
+                set_at: Utc::now() - chrono::Duration::minutes(minutes_ago),
+                change_id: grant_id.into(),
+            }],
         }
     }
 

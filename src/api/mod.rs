@@ -23,9 +23,9 @@ pub mod admin;
 pub mod analyses;
 pub mod balance;
 pub mod credentials;
-pub mod employer_scopes;
 pub mod grants;
 pub mod pools;
+pub mod scope_check;
 pub mod transactions;
 pub mod users;
 pub mod wallets;
@@ -211,22 +211,6 @@ pub fn wallet_router() -> Router<AppState> {
             "/v1/admin/wallets/{wallet_id}/activate",
             post(admin::activate_wallet),
         )
-        .route(
-            "/v1/admin/employer-scopes",
-            get(employer_scopes::get_employer_scopes).put(employer_scopes::replace_employer_scopes),
-        )
-        .route(
-            "/v1/admin/employer-scopes/check",
-            post(employer_scopes::check_employer_scopes),
-        )
-        .route(
-            "/v1/admin/employer-scopes/versions",
-            get(employer_scopes::list_scope_versions),
-        )
-        .route(
-            "/v1/admin/employer-scopes/versions/{version}",
-            get(employer_scopes::get_scope_version),
-        )
         .route("/v1/admin/analysis-log", get(admin::get_analysis_log))
 }
 
@@ -265,6 +249,14 @@ pub fn drt_router() -> Router<AppState> {
         .route(
             "/v1/drt/pools/{pool_pda}/revoke-grant",
             post(grants::revoke_grant),
+        )
+        .route(
+            "/v1/drt/pools/{pool_pda}/grant-scope",
+            post(grants::set_grant_scope),
+        )
+        .route(
+            "/v1/drt/pools/{pool_pda}/analyses/{analysis_id}/scope-check",
+            post(scope_check::check_scope),
         )
         .route("/v1/drt/pools/{pool_pda}/grants", get(grants::list_grants))
         .route("/v1/drt/me/analyses", get(grants::my_analyses))

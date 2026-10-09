@@ -35,7 +35,7 @@ use crate::analysis::query::{
     DEFAULT_SEARCH_LIMIT,
 };
 use crate::analysis::runner::DEADLINE;
-use crate::analysis::table::Scope;
+use crate::analysis::table::{check_targets, Scope, Target};
 use crate::api::pools::load_pool;
 use crate::audit;
 use crate::auth::{Caller, Permission};
@@ -174,9 +174,9 @@ struct Through {
 }
 
 /// The grant the caller runs the analysis through (none for an admin), and
-/// the rows they see, as `def` can apply them. Fails closed: no active
-/// grant, no scope this analysis applies, or a grant the chain doesn't
-/// show, is 403.
+/// the rows they see: those of any of the grant's targets. Fails closed: no
+/// active grant, a grant with no targets or with targets the analysis can't
+/// apply, or a grant the chain doesn't show, is 403.
 async fn authorize(
     state: &AppState,
     caller: &Caller,
@@ -192,16 +192,19 @@ async fn authorize(
         .ok_or_else(|| {
             ApiError::forbidden("you have no active grant to this analysis").with_code("no_grant")
         })?;
-    let mapping = state.storage.employer_scopes().get().await?;
-    let scope = caller
-        .row_scope(&mapping)?
-        .for_definition(def)
-        .ok_or_else(|| {
-            ApiError::forbidden(
-                "none of your groups has a scope this analysis applies; ask an admin",
-            )
+    let targets = grant.targets().ok_or_else(|| {
+        ApiError::forbidden("your grant gives you no rows yet; ask the pool's owner")
             .with_code("no_employer_scope")
-        })?;
+    })?;
+    let targets: Vec<Target> = targets.iter().cloned().collect();
+    let targets = check_targets(def, &targets).map_err(|e| {
+        warn!(grant_id = %grant.grant_id, error = %e, "A grant's targets don't fit its analysis");
+        ApiError::forbidden(
+            "your grant's targets don't fit this analysis; ask the pool's owner to set them again",
+        )
+        .with_code("invalid_grant_scope")
+    })?;
+    let scope = Scope::of(&targets);
     let seen = state
         .grant_checks
         .verify(&state.storage, &state.solana_client, doc, grant)
@@ -730,9 +733,15 @@ pub(crate) mod tests {
     use crate::auth::entra::tests::{config, entra_key};
     use crate::blockchain::drt::pda::derive_grant_pda;
     use crate::data_validation::tests::{awards_schema, AWARDS_HEADER};
+    use crate::storage::pools::GrantScope;
     use crate::storage::pools::{Grant, GrantRevocation, Upload, INITIAL};
-    use crate::storage::scopes::tests::{entry, fixture, GROUP_A_ANALYSTS, NETWORK_ANALYSTS};
     use crate::storage::Change;
+    use std::collections::BTreeSet;
+
+    /// Employer group Group A's rows.
+    pub(crate) const GROUP_A: &[(&str, &str)] = &[("employer_group", "Group A")];
+    /// Employer Bank A Network's rows, which are in Group A.
+    const NETWORK: &[(&str, &str)] = &[("employer", "Bank A Network")];
 
     /// Staff number, employer, employer group, award, exam board date.
     const ROWS: [(&str, &str, &str, &str, &str); 5] = [
@@ -792,8 +801,20 @@ pub(crate) mod tests {
     }
 
     /// `analyst` holds an active grant to the pool's analysis, which the
-    /// chain shows.
-    pub(crate) async fn grant(worker: &Worker, pool_pda: &Pubkey, analyst: &str) {
+    /// chain shows, seeing the rows of `targets` (key, value).
+    pub(crate) async fn grant(
+        worker: &Worker,
+        pool_pda: &Pubkey,
+        analyst: &str,
+        targets: &[(&str, &str)],
+    ) {
+        let targets: BTreeSet<Target> = targets
+            .iter()
+            .map(|(key, value)| Target {
+                key: key.to_string(),
+                value: value.to_string(),
+            })
+            .collect();
         let commitment: [u8; 32] = Sha256::digest(analyst).into();
         worker.chain.grant(
             derive_grant_pda(&commitment).0,
@@ -812,6 +833,16 @@ pub(crate) mod tests {
                     granted_at: Utc::now(),
                     signature: Some("sig-grant".into()),
                     revoked: None,
+                    scopes: if targets.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![GrantScope {
+                            targets: targets.clone(),
+                            set_by: "admin".into(),
+                            set_at: Utc::now(),
+                            change_id: format!("g-{analyst}"),
+                        }]
+                    },
                 });
                 Ok(Change::Changed)
             })
@@ -848,12 +879,10 @@ pub(crate) mod tests {
         let worker = worker();
         let owner = worker.admin("oid-owner").await;
         let pool_pda = awards_pool(&worker, &owner).await;
-        let scopes = worker.storage.employer_scopes();
-        scopes.replace(0, fixture(), "admin").await.unwrap();
-        let (group_a, group_a_id) = analyst(&worker.app, "oid-group-a", &[GROUP_A_ANALYSTS]).await;
-        let (network, network_id) = analyst(&worker.app, "oid-network", &[NETWORK_ANALYSTS]).await;
-        grant(&worker, &pool_pda, &group_a_id).await;
-        grant(&worker, &pool_pda, &network_id).await;
+        let (group_a, group_a_id) = analyst(&worker.app, "oid-group-a").await;
+        let (network, network_id) = analyst(&worker.app, "oid-network").await;
+        grant(&worker, &pool_pda, &group_a_id, GROUP_A).await;
+        grant(&worker, &pool_pda, &network_id, NETWORK).await;
         let base = format!("/v1/drt/pools/{pool_pda}/analyses/{ANALYSIS}");
         let query = format!("{base}/query");
 
@@ -986,14 +1015,8 @@ pub(crate) mod tests {
         let worker = worker();
         let owner = worker.admin("oid-owner").await;
         let pool_pda = awards_pool(&worker, &owner).await;
-        worker
-            .storage
-            .employer_scopes()
-            .replace(0, fixture(), "admin")
-            .await
-            .unwrap();
-        let (group_a, group_a_id) = analyst(&worker.app, "oid-group-a", &[GROUP_A_ANALYSTS]).await;
-        grant(&worker, &pool_pda, &group_a_id).await;
+        let (group_a, group_a_id) = analyst(&worker.app, "oid-group-a").await;
+        grant(&worker, &pool_pda, &group_a_id, GROUP_A).await;
         let base = format!("/v1/drt/pools/{pool_pda}/analyses/{ANALYSIS}");
         let diploma = json!({ "award": { "mode": "selected", "values": ["Diploma"] } });
 
@@ -1074,50 +1097,34 @@ pub(crate) mod tests {
         let worker = worker();
         let owner = worker.admin("oid-owner").await;
         let pool_pda = awards_pool(&worker, &owner).await;
-        let mut scopes = fixture();
-        scopes.push(entry(
-            "g-group-d",
-            "GROUP_D_ANALYSTS",
-            &[("employer_group", "Group D")],
-        ));
-        scopes.push(entry(
-            "g-region-e",
-            "REGION_E_ANALYSTS",
-            &[("region", "Region E")],
-        ));
-        worker
-            .storage
-            .employer_scopes()
-            .replace(0, scopes, "admin")
-            .await
-            .unwrap();
-        let (granted, granted_id) = analyst(&worker.app, "oid-group-a", &[GROUP_A_ANALYSTS]).await;
-        let (ungranted, _) = analyst(&worker.app, "oid-nogrant", &[GROUP_A_ANALYSTS]).await;
-        let (unmapped, unmapped_id) = analyst(&worker.app, "oid-unmapped", &["g-other"]).await;
-        let (empty, empty_id) = analyst(&worker.app, "oid-group-d", &["g-group-d"]).await;
-        let (elsewhere, elsewhere_id) = analyst(&worker.app, "oid-region-e", &["g-region-e"]).await;
+        let (granted, granted_id) = analyst(&worker.app, "oid-group-a").await;
+        let (ungranted, _) = analyst(&worker.app, "oid-nogrant").await;
+        let (untargeted, untargeted_id) = analyst(&worker.app, "oid-untargeted").await;
+        let (empty, empty_id) = analyst(&worker.app, "oid-group-d").await;
+        let (elsewhere, elsewhere_id) = analyst(&worker.app, "oid-region-e").await;
+        // A groups overage marker means nothing: rows come from the grant.
         let mut spec = Spec::valid(&config());
         spec.roles = vec!["Analyst".into()];
         spec.groups_overage = true;
         let overage = spec.sign(entra_key()).unwrap();
         let overage_id = sign_in(&worker.app, &overage).await;
         let nobody = Spec::valid(&config()).sign(entra_key()).unwrap();
-        for analyst in [
-            &granted_id,
-            &unmapped_id,
-            &empty_id,
-            &elsewhere_id,
-            &overage_id,
-        ] {
-            grant(&worker, &pool_pda, analyst).await;
-        }
+        grant(&worker, &pool_pda, &granted_id, GROUP_A).await;
+        grant(&worker, &pool_pda, &overage_id, GROUP_A).await;
+        grant(&worker, &pool_pda, &untargeted_id, &[]).await;
+        let group_d = &[("employer_group", "Group D")];
+        grant(&worker, &pool_pda, &empty_id, group_d).await;
+        // Stored targets the analysis can't apply, as a hand-edited
+        // document might hold.
+        let region = &[("region", "Region E")];
+        grant(&worker, &pool_pda, &elsewhere_id, region).await;
         let base = format!("/v1/drt/pools/{pool_pda}/analyses/{ANALYSIS}");
         let query = format!("{base}/query");
 
         for (token, body, status, code) in [
             (&ungranted, json!({}), StatusCode::FORBIDDEN, "no_grant"),
             (
-                &unmapped,
+                &untargeted,
                 json!({}),
                 StatusCode::FORBIDDEN,
                 "no_employer_scope",
@@ -1126,9 +1133,8 @@ pub(crate) mod tests {
                 &elsewhere,
                 json!({}),
                 StatusCode::FORBIDDEN,
-                "no_employer_scope",
+                "invalid_grant_scope",
             ),
-            (&overage, json!({}), StatusCode::FORBIDDEN, "groups_overage"),
             (&nobody, json!({}), StatusCode::FORBIDDEN, "forbidden"),
             (
                 &granted,
@@ -1169,7 +1175,13 @@ pub(crate) mod tests {
             );
         }
 
-        // An empty but valid scope gets an empty page.
+        let (status, _, page) = send(&worker.app, post(&query, &overage, &json!({}))).await;
+        assert_eq!(
+            (status, &page["total_matched"]),
+            (StatusCode::OK, &json!(3))
+        );
+
+        // A target no row holds gets an empty page.
         let (status, _, page) = send(&worker.app, post(&query, &empty, &json!({}))).await;
         assert_eq!(status, StatusCode::OK, "{page}");
         assert_eq!(
@@ -1258,7 +1270,8 @@ pub(crate) mod tests {
             counts
         });
         assert_eq!(outcomes["no_grant"], 2);
-        assert_eq!(outcomes["groups_overage"], 1);
+        assert_eq!(outcomes["no_employer_scope"], 1);
+        assert_eq!(outcomes["invalid_grant_scope"], 1);
         assert_eq!(outcomes["invalid_query"], 7);
         let override_attempt = log
             .iter()
@@ -1272,12 +1285,10 @@ pub(crate) mod tests {
         let worker = worker();
         let owner = worker.admin("oid-owner").await;
         let pool_pda = awards_pool(&worker, &owner).await;
-        let scopes = worker.storage.employer_scopes();
-        scopes.replace(0, fixture(), "admin").await.unwrap();
-        let (shown, shown_id) = analyst(&worker.app, "oid-shown", &[GROUP_A_ANALYSTS]).await;
-        let (unseen, unseen_id) = analyst(&worker.app, "oid-unseen", &[GROUP_A_ANALYSTS]).await;
-        grant(&worker, &pool_pda, &shown_id).await;
-        grant(&worker, &pool_pda, &unseen_id).await;
+        let (shown, shown_id) = analyst(&worker.app, "oid-shown").await;
+        let (unseen, unseen_id) = analyst(&worker.app, "oid-unseen").await;
+        grant(&worker, &pool_pda, &shown_id, GROUP_A).await;
+        grant(&worker, &pool_pda, &unseen_id, GROUP_A).await;
         // The document says active, but the chain has no Grant: as after a
         // restore of an older pool document undid a revocation.
         let commitment: [u8; 32] = Sha256::digest(&unseen_id).into();
@@ -1329,5 +1340,142 @@ pub(crate) mod tests {
         };
         assert_eq!(on_chain(&shown_id), "live");
         assert_eq!(on_chain(&unseen_id), "closed");
+    }
+
+    #[tokio::test]
+    async fn a_grants_targets_decide_its_rows_from_the_next_request_on() {
+        let worker = worker();
+        let owner = worker.admin("oid-owner").await;
+        let pool_pda = awards_pool(&worker, &owner).await;
+        let (ana, ana_id) = analyst(&worker.app, "oid-ana").await;
+        let (broken, broken_id) = analyst(&worker.app, "oid-broken").await;
+        grant(&worker, &pool_pda, &ana_id, GROUP_A).await;
+        grant(&worker, &pool_pda, &broken_id, &[("region", "Region E")]).await;
+        let query = format!("/v1/drt/pools/{pool_pda}/analyses/{ANALYSIS}/query");
+        let set_scope = |analyst: &str, revision: usize, scope: Value| {
+            let body = json!({ "analyst_user_id": analyst, "analysis_id": ANALYSIS,
+                "revision": revision, "scope": scope });
+            Request::post(format!("/v1/drt/pools/{pool_pda}/grant-scope"))
+                .header(header::AUTHORIZATION, format!("Bearer {}", owner.token))
+                .header(
+                    &crate::idempotency::KEY_HEADER,
+                    uuid::Uuid::new_v4().to_string(),
+                )
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        let matched = |token: String| {
+            let app = worker.app.clone();
+            let query = query.clone();
+            async move {
+                let (status, _, page) = send(&app, post(&query, &token, &json!({}))).await;
+                (status, page["total_matched"].clone(), page["code"].clone())
+            }
+        };
+
+        assert_eq!(matched(ana.clone()).await.1, 3);
+        let bank_b = json!([{ "key": "employer", "value": "Bank B" }]);
+        let (status, _, changed) = send(&worker.app, set_scope(&ana_id, 1, bank_b)).await;
+        assert_eq!(status, StatusCode::OK, "{changed}");
+        assert_eq!(
+            matched(ana.clone()).await.1,
+            1,
+            "the next query sees Bank B only"
+        );
+
+        // Targets the analysis can't apply see nothing until they're set again.
+        assert_eq!(
+            matched(broken.clone()).await,
+            (
+                StatusCode::FORBIDDEN,
+                Value::Null,
+                json!("invalid_grant_scope")
+            )
+        );
+        let (status, _, repaired) = send(
+            &worker.app,
+            set_scope(
+                &broken_id,
+                1,
+                json!([{ "key": "employer_group", "value": "Group B" }]),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{repaired}");
+        assert_eq!(matched(broken).await.1, 1);
+
+        // The summary lists every target the grant sees.
+        let base = format!("/v1/drt/pools/{pool_pda}/analyses/{ANALYSIS}");
+        let (_, _, summary) = send(&worker.app, get(&base, &ana)).await;
+        assert_eq!(
+            summary["scope"]["any_of"],
+            json!([[{ "key": "employer", "header": "Employer", "value": "Bank B" }]])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_scope_check_counts_what_targets_give_each_row_once() {
+        let worker = worker();
+        let owner = worker.admin("oid-owner").await;
+        let pool_pda = awards_pool(&worker, &owner).await;
+        let (ana, _) = analyst(&worker.app, "oid-ana").await;
+        let path = format!("/v1/drt/pools/{pool_pda}/analyses/{ANALYSIS}/scope-check");
+        let check = |token: &str, scope: Value| post(&path, token, &json!({ "scope": scope }));
+
+        let (status, _, values) = send(&worker.app, check(&owner.token, json!([]))).await;
+        assert_eq!(status, StatusCode::OK, "{values}");
+        assert_eq!(
+            (&values["total_rows"], &values["rows"]),
+            (&json!(5), &json!(0))
+        );
+        assert_eq!(
+            values["keys"],
+            json!([
+                { "key": "employer", "header": "Employer", "values": [
+                    { "value": "Bank A", "rows": 2 }, { "value": "Bank A Network", "rows": 1 },
+                    { "value": "Bank B", "rows": 1 }, { "value": "Bank C", "rows": 1 },
+                ] },
+                { "key": "employer_group", "header": "Employer Group", "values": [
+                    { "value": "Group A", "rows": 3 }, { "value": "Group B", "rows": 1 },
+                    { "value": "Group C", "rows": 1 },
+                ] },
+            ])
+        );
+
+        let overlapping = json!([
+            { "key": "employer_group", "value": "Group A" },
+            { "key": "employer", "value": "Bank A Network" },
+            { "key": "employer", "value": "Bank B" },
+        ]);
+        let (_, _, counted) = send(&worker.app, check(&owner.token, overlapping)).await;
+        assert_eq!(counted["rows"], 4, "Bank A Network is in Group A");
+        assert_eq!(counted["target_rows"], json!([3, 1, 1]));
+        assert_eq!(counted["warnings"], json!([]));
+
+        let misspelt = json!([{ "key": "employer_group", "value": "group a" }]);
+        let (_, _, flagged) = send(&worker.app, check(&owner.token, misspelt)).await;
+        assert_eq!(flagged["rows"], 0);
+        assert_eq!(
+            flagged["warnings"],
+            json!([{ "code": "no_rows", "key": "employer_group", "value": "group a",
+                "near": ["Group A"] }])
+        );
+
+        let (status, _, err) = send(
+            &worker.app,
+            check(&owner.token, json!([{ "key": "region", "value": "E" }])),
+        )
+        .await;
+        assert_eq!(
+            (status, err["code"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("invalid_scope"))
+        );
+        let (status, _, _) = send(&worker.app, check(&ana, json!([]))).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "analysts don't see other employers' values"
+        );
     }
 }

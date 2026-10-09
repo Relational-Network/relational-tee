@@ -10,8 +10,6 @@
 //! - `POST /v1/admin/wallets/{id}/suspend`      — suspend a wallet
 //! - `POST /v1/admin/wallets/{id}/activate`     — reactivate a wallet
 //! - `GET  /v1/admin/analysis-log`              — a pool's analysis requests on a day
-//!
-//! The employer-scope mapping's endpoints are in [`super::employer_scopes`].
 
 use axum::{
     extract::{Path, Query, State},
