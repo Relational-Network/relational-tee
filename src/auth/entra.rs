@@ -93,6 +93,11 @@ pub struct Verifier {
 }
 
 impl Verifier {
+    /// The pinned tenant's ID.
+    pub fn tenant_id(&self) -> &str {
+        &self.config.tenant_id
+    }
+
     /// Trust the tenant's keys from Entra ID's JWKS endpoint.
     pub fn for_entra(config: EntraConfig) -> Self {
         let source = Arc::new(HttpKeySource::new(config.jwks_url()));

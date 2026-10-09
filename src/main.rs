@@ -107,6 +107,7 @@ An analysis shows admins every row. An analyst sees only the rows of their grant
         // Wallet API
         api::users::get_me,
         api::users::list_users,
+        api::users::register_user,
         api::wallets::create_wallet,
         api::wallets::list_wallets,
         api::wallets::get_wallet,
@@ -161,6 +162,7 @@ An analysis shows admins every row. An analyst sees only the rows of their grant
         api::users::UsersResponse,
         api::users::UserEntry,
         api::users::UserLookupResponse,
+        api::users::RegisterUserRequest,
         auth::Permission,
         api::wallets::CreateWalletRequest,
         api::wallets::CreateWalletResponse,

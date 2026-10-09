@@ -1772,4 +1772,61 @@ pub(crate) mod tests {
             (StatusCode::CONFLICT, Some("grant_not_active"))
         );
     }
+
+    #[tokio::test]
+    async fn someone_registered_from_entra_can_be_granted_before_signing_in() {
+        let worker = worker();
+        let owner = worker.admin("oid-owner").await;
+        let pool_pda = analysis_pool(&worker, &owner, 2).await;
+        worker.chain.lands.store(true, SeqCst);
+        let oid = "5d9a1f40-1b2c-4d3e-8f90-123456789abc";
+        let register = |token: &str, body: Value| post("/v1/users", token, &new_key(), &body);
+        let blair = json!({ "entra_object_id": oid.to_uppercase(), "email": "blair@example.com",
+            "display_name": "Blair Bravo" });
+
+        let (analyst_token, _) = analyst(&worker.app, "oid-ana").await;
+        let (status, _, _) = send(&worker.app, register(&analyst_token, blair.clone())).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let mut bad = blair.clone();
+        bad["entra_object_id"] = json!("not-a-uuid");
+        let (status, _, _) = send(&worker.app, register(&owner.token, bad)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let (status, _, registered) =
+            send(&worker.app, register(&owner.token, blair.clone())).await;
+        assert_eq!(status, StatusCode::OK, "{registered}");
+        assert_eq!(registered["pending"], true);
+        let user_id = registered["user_id"].as_str().unwrap().to_string();
+        let (status, _, again) = send(&worker.app, register(&owner.token, blair)).await;
+        assert_eq!(
+            (status, &again["user_id"]),
+            (StatusCode::OK, &json!(user_id))
+        );
+        let other = json!({ "entra_object_id": "6d9a1f40-1b2c-4d3e-8f90-123456789abc",
+            "email": "Blair@Example.com", "display_name": "Someone Else" });
+        let (status, _, err) = send(&worker.app, register(&owner.token, other)).await;
+        assert_eq!(
+            (status, err["code"].as_str()),
+            (StatusCode::CONFLICT, Some("email_taken"))
+        );
+
+        let path = format!("/v1/drt/pools/{pool_pda}/grant");
+        let (status, _, granted) = send(
+            &worker.app,
+            post(&path, &owner.token, &new_key(), &granting(&user_id)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{granted}");
+        assert_eq!(granted["analyst_email"], "blair@example.com");
+
+        // Their first sign-in finds the grant waiting.
+        let mut spec = Spec::valid(&config());
+        spec.oid = oid.into();
+        spec.roles = vec!["Analyst".into()];
+        spec.email = Some("blair@example.com".into());
+        let token = spec.sign(entra_key()).unwrap();
+        assert_eq!(sign_in(&worker.app, &token).await, user_id);
+        let (_, _, mine) = send(&worker.app, get("/v1/drt/me/analyses", &token)).await;
+        assert_eq!(mine["analyses"].as_array().map(Vec::len), Some(1), "{mine}");
+    }
 }

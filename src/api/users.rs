@@ -6,11 +6,16 @@
 //! - `GET /v1/users/me`: who the caller is and what they may do.
 //! - `GET /v1/users`: every user who has signed in, paged by cursor.
 //! - `GET /v1/users?email=`: the one user with that email, or 404.
+//! - `POST /v1/users`: register someone an admin found in Entra, before
+//!   their first sign-in, so they can be granted at once.
 //!
-//! Users become known at their first sign-in; nothing queries Microsoft
-//! Graph.
+//! Users become known at their first sign-in, or when an admin registers
+//! them; the worker never queries Microsoft Graph: the dashboard finds
+//! people there, and the first sign-in with that Entra object ID is theirs.
 
 use axum::extract::{Query, State};
+use axum::http::StatusCode;
+use axum::response::Response;
 use axum::Json;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -18,8 +23,9 @@ use utoipa::{IntoParams, ToSchema};
 
 use crate::auth::{Caller, Permission};
 use crate::error::ApiError;
+use crate::idempotency::{Idempotent, JsonBody};
 use crate::state::AppState;
-use crate::storage::identities::Identity;
+use crate::storage::identities::{Identity, Registered, Registration};
 
 use super::page;
 
@@ -84,6 +90,8 @@ pub struct UserEntry {
     pub roles: Vec<String>,
     pub first_seen: DateTime<Utc>,
     pub last_seen: DateTime<Utc>,
+    /// Registered by an admin and not signed in yet.
+    pub pending: bool,
 }
 
 impl From<Identity> for UserEntry {
@@ -95,9 +103,26 @@ impl From<Identity> for UserEntry {
             roles: i.roles,
             first_seen: i.first_seen,
             last_seen: i.last_seen,
+            pending: i.pending,
         }
     }
 }
+
+/// Someone an admin found in Entra, to register before they sign in.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RegisterUserRequest {
+    /// Their Entra object ID in the worker's tenant, as Microsoft Graph
+    /// lists it: the `oid` their tokens will carry.
+    #[schema(format = "uuid")]
+    pub entra_object_id: String,
+    /// Their email, if Entra has one; empty otherwise.
+    #[serde(default)]
+    pub email: String,
+    pub display_name: String,
+}
+
+const MAX_TEXT: usize = 256;
 
 /// One page of known users, by email.
 #[derive(Debug, Serialize, ToSchema)]
@@ -116,6 +141,74 @@ pub struct UserLookupResponse {
     pub display_name: String,
 }
 
+/// Register someone before their first sign-in.
+#[utoipa::path(
+    post,
+    path = "/v1/users",
+    tag = "Users",
+    summary = "Register a user",
+    description = "Make someone an admin found in Entra known before their first sign-in, under the internal `user_id` their first sign-in with that Entra object ID will then have, so they can be granted at once. Registering someone already known, registered or signed in, returns them unchanged. The worker trusts the object ID it's given: it doesn't call Microsoft Graph. Needs the `Admin` role and an Idempotency-Key.",
+    security(("bearer_auth" = [])),
+    params(
+        ("Idempotency-Key" = String, Header, format = "uuid", description = "A UUID naming this user action; reuse it on every retry"),
+    ),
+    request_body = RegisterUserRequest,
+    responses(
+        (status = 200, description = "The user, `pending` until their first sign-in", body = UserEntry),
+        (status = 400, description = "An object ID that isn't a UUID, text too long, or no Idempotency-Key"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Admin role required"),
+        (status = 409, description = "Another user holds the email (`email_taken`)"),
+        (status = 422, description = "The Idempotency-Key was used for a different request"),
+    )
+)]
+pub async fn register_user(
+    caller: Caller,
+    request: Idempotent,
+    State(state): State<AppState>,
+    JsonBody {
+        value: payload,
+        bytes,
+    }: JsonBody<RegisterUserRequest>,
+) -> Result<Response, ApiError> {
+    caller.require_admin()?;
+    let mut op = open_or_replay!(state, &caller.user_id, request, &bytes);
+    let oid = uuid::Uuid::parse_str(&payload.entra_object_id)
+        .map_err(|_| ApiError::bad_request("entra_object_id must be a UUID"))?
+        .to_string();
+    let email = payload.email.trim();
+    let display_name = payload.display_name.trim();
+    if email.len() > MAX_TEXT || display_name.len() > MAX_TEXT {
+        return Err(ApiError::bad_request(format!(
+            "email and display_name hold at most {MAX_TEXT} bytes"
+        )));
+    }
+    op.begin().await?;
+    let registered = state
+        .storage
+        .identities()
+        .register(&Registration {
+            tid: state.auth.tenant_id(),
+            oid: &oid,
+            email,
+            display_name,
+            registered_by: &caller.user_id,
+        })
+        .await?;
+    let identity = match registered {
+        Registered::New(identity) => {
+            tracing::info!(user_id = %identity.user_id, "User registered before signing in");
+            identity
+        }
+        Registered::Known(identity) => identity,
+        Registered::EmailTaken => {
+            return Err(ApiError::conflict("another user already holds that email")
+                .with_code("email_taken"))
+        }
+    };
+    op.finish(StatusCode::OK, &UserEntry::from(identity)).await
+}
+
 /// A page of users, or with `email` the user found.
 #[derive(Debug, Serialize, ToSchema)]
 #[serde(untagged)]
@@ -130,7 +223,7 @@ pub enum UsersBody {
     path = "/v1/users",
     tag = "Users",
     summary = "Users",
-    description = "Without `email`: every user who has signed in, with their roles as of their last sign-in, sorted by email and paged by cursor, with no totals. With `email`: an exact, case-insensitive match, or 404 if nobody with that email has signed in. Needs `users:read`.",
+    description = "Without `email`: every known user, signed in or registered by an admin (`pending`), with their roles as of their last sign-in, sorted by email and paged by cursor, with no totals. With `email`: an exact, case-insensitive match, or 404 if nobody with that email is known. Needs `users:read`.",
     security(("bearer_auth" = [])),
     params(UsersQuery),
     responses(
@@ -153,7 +246,7 @@ pub async fn list_users(
         let found = identities
             .by_email(email)
             .await?
-            .ok_or_else(|| ApiError::not_found("no user with that email has signed in"))?;
+            .ok_or_else(|| ApiError::not_found("no user with that email is known"))?;
         return Ok(Json(UsersBody::Lookup(UserLookupResponse {
             user_id: found.user_id,
             email: found.email,
