@@ -14,9 +14,18 @@
 //! `h(x)` keeps Entra object IDs and emails out of object names. The
 //! mapping never changes, so workers cache it without revalidating. A
 //! token without an `email` claim gets no email index entry.
+//!
+//! The first identity to claim an email holds it, and every write is
+//! idempotent, so a request that died between the two writes is completed
+//! by the next one. A sign-in claims its email after its identity exists,
+//! and every sign-in completes a missing entry; one whose email another
+//! identity holds still signs in, by its Entra IDs, but isn't what a
+//! lookup by that email finds. A registration claims the email first, and
+//! creates nothing if another identity holds it.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use super::{Change, Storage, StoreError};
 use crate::store::Created;
@@ -47,6 +56,14 @@ struct EmailEntry {
     user_id: String,
     /// The identity object's `h(tid ‖ oid)`.
     identity: String,
+}
+
+/// Who holds an email once a claim is done.
+enum Claim {
+    /// The identity that claimed it, under this `user_id`.
+    Ours { user_id: String },
+    /// Another identity.
+    Theirs,
 }
 
 /// What a validated token says about its caller.
@@ -104,6 +121,63 @@ impl<'a> Identities<'a> {
         )
     }
 
+    /// Claim `email` for the identity `key`, as `user_id` unless it's
+    /// claimed for `key` already. Idempotent, and decided by the store's
+    /// create-only write when two identities claim it at once.
+    async fn claim_email(
+        &self,
+        email: &str,
+        key: &str,
+        user_id: &str,
+    ) -> Result<Claim, StoreError> {
+        let path = self.email_path(email);
+        let state = self.s.state();
+        let held = |entry: EmailEntry| {
+            if entry.identity == key {
+                Claim::Ours {
+                    user_id: entry.user_id,
+                }
+            } else {
+                Claim::Theirs
+            }
+        };
+        if let Some(entry) = state.get_immutable_json::<EmailEntry>(&path).await? {
+            return Ok(held(entry));
+        }
+        let entry = EmailEntry {
+            user_id: user_id.to_string(),
+            identity: key.to_string(),
+        };
+        match state.create_json(&path, &entry).await? {
+            Created::New(_) => Ok(Claim::Ours {
+                user_id: entry.user_id,
+            }),
+            Created::AlreadyExists => state
+                .get_immutable_json::<EmailEntry>(&path)
+                .await?
+                .map(held)
+                .ok_or_else(|| StoreError::Invalid("an email entry vanished".into())),
+        }
+    }
+
+    /// Complete `identity`'s email entry, if it has an email: a sign-in's
+    /// last step, which a request that died before it leaves undone.
+    async fn complete(&self, key: &str, identity: &Identity) -> Result<(), StoreError> {
+        if identity.email.is_empty() {
+            return Ok(());
+        }
+        if let Claim::Theirs = self
+            .claim_email(&identity.email, key, &identity.user_id)
+            .await?
+        {
+            warn!(
+                user_id = %identity.user_id,
+                "Another identity holds this user's email: looking them up by email finds that one"
+            );
+        }
+        Ok(())
+    }
+
     /// The caller's identity, created on their first sign-in. A concurrent
     /// first sign-in loses the create-only race and reads the winner's.
     pub async fn sign_in(&self, who: &SignIn<'_>) -> Result<Identity, StoreError> {
@@ -113,6 +187,7 @@ impl<'a> Identities<'a> {
         let now = Utc::now();
         if let Some(known) = state.get_immutable_json::<Identity>(&path).await? {
             if !known.pending && known.roles == who.roles && now - known.last_seen < REFRESH_AFTER {
+                self.complete(&key, &known).await?;
                 return Ok(known);
             }
             let refreshed = state
@@ -136,15 +211,7 @@ impl<'a> Identities<'a> {
                 .await?
                 .unwrap_or_else(|| known.clone());
             // A registered person's email may only now be known.
-            if known.pending && !refreshed.email.is_empty() {
-                let entry = EmailEntry {
-                    user_id: refreshed.user_id.clone(),
-                    identity: key,
-                };
-                state
-                    .create_json(&self.email_path(&refreshed.email), &entry)
-                    .await?;
-            }
+            self.complete(&key, &refreshed).await?;
             return Ok(refreshed);
         }
 
@@ -166,39 +233,34 @@ impl<'a> Identities<'a> {
                 .map(|(i, _)| i)
                 .ok_or_else(|| StoreError::Invalid("an identity vanished".into()))?,
         };
-        if !identity.email.is_empty() {
-            let entry = EmailEntry {
-                user_id: identity.user_id.clone(),
-                identity: key,
-            };
-            state
-                .create_json(&self.email_path(&identity.email), &entry)
-                .await?;
-        }
+        self.complete(&key, &identity).await?;
         Ok(identity)
     }
 
     /// Make `who` known before their first sign-in, under the internal
     /// `user_id` their first sign-in will then have. Create-only, so
-    /// registering again, or after they signed in, changes nothing.
+    /// registering again, or after they signed in, changes nothing. The
+    /// email is claimed first: if another identity holds it, nothing is
+    /// created.
     pub async fn register(&self, who: &Registration<'_>) -> Result<Registered, StoreError> {
         let key = self.key(who.tid, who.oid);
         let path = identity_path(&key);
         let state = self.s.state();
-        if !who.email.is_empty() {
-            let held = state
-                .get_immutable_json::<EmailEntry>(&self.email_path(who.email))
-                .await?;
-            if held.is_some_and(|entry| entry.identity != key) {
-                return Ok(Registered::EmailTaken);
-            }
+        if let Some((known, _)) = state.get_json::<Identity>(&path).await? {
+            self.complete(&key, &known).await?;
+            return Ok(Registered::Known(known));
         }
-        if let Some(known) = state.get_json::<Identity>(&path).await? {
-            return Ok(Registered::Known(known.0));
+        // A registration that died after its claim left the user_id to use.
+        let mut user_id = uuid::Uuid::new_v4().to_string();
+        if !who.email.is_empty() {
+            match self.claim_email(who.email, &key, &user_id).await? {
+                Claim::Ours { user_id: claimed } => user_id = claimed,
+                Claim::Theirs => return Ok(Registered::EmailTaken),
+            }
         }
         let now = Utc::now();
         let new = Identity {
-            user_id: uuid::Uuid::new_v4().to_string(),
+            user_id,
             email: who.email.to_string(),
             display_name: who.display_name.to_string(),
             roles: Vec::new(),
@@ -207,26 +269,17 @@ impl<'a> Identities<'a> {
             pending: true,
             registered_by: Some(who.registered_by.to_string()),
         };
-        let identity = match state.create_json(&path, &new).await? {
-            Created::New(_) => new,
+        match state.create_json(&path, &new).await? {
+            Created::New(_) => Ok(Registered::New(new)),
+            // Their first sign-in, or another registration, came first.
             Created::AlreadyExists => {
                 let (known, _) = state
                     .get_json::<Identity>(&path)
                     .await?
                     .ok_or_else(|| StoreError::Invalid("an identity vanished".into()))?;
-                return Ok(Registered::Known(known));
+                Ok(Registered::Known(known))
             }
-        };
-        if !identity.email.is_empty() {
-            let entry = EmailEntry {
-                user_id: identity.user_id.clone(),
-                identity: key,
-            };
-            state
-                .create_json(&self.email_path(&identity.email), &entry)
-                .await?;
         }
-        Ok(Registered::New(identity))
     }
 
     /// The identity with this email, once its owner has signed in or been
@@ -459,6 +512,154 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(known, Registered::Known(i) if !i.pending));
+    }
+
+    #[tokio::test]
+    async fn the_next_sign_in_completes_one_that_died_before_its_email_entry() {
+        let (a, b, _files) = two_workers();
+        let roles = Vec::new();
+        let who = sign_in("oid-cut", "cut@example.com", &roles);
+        // The first sign-in wrote its identity, and died.
+        let now = Utc::now();
+        let written = Identity {
+            user_id: "u-cut".into(),
+            email: "cut@example.com".into(),
+            display_name: "Ada".into(),
+            roles: Vec::new(),
+            first_seen: now,
+            last_seen: now,
+            pending: false,
+            registered_by: None,
+        };
+        let key = a.identities().key("tenant-1", "oid-cut");
+        a.state()
+            .create_json(&identity_path(&key), &written)
+            .await
+            .unwrap();
+        assert!(b
+            .identities()
+            .by_email("cut@example.com")
+            .await
+            .unwrap()
+            .is_none());
+
+        let retried = b.identities().sign_in(&who).await.unwrap();
+        assert_eq!(retried.user_id, "u-cut");
+        let found = a.identities().by_email("CUT@example.com").await.unwrap();
+        assert_eq!(found.map(|i| i.user_id).as_deref(), Some("u-cut"));
+    }
+
+    #[tokio::test]
+    async fn a_retried_registration_completes_one_that_died_after_its_claim() {
+        let (a, b, _files) = two_workers();
+        // The registration claimed the email, and died.
+        let ids = a.identities();
+        let key = ids.key("tenant-1", "oid-half");
+        assert!(matches!(
+            ids.claim_email("half@example.com", &key, "u-half")
+                .await
+                .unwrap(),
+            Claim::Ours { .. }
+        ));
+        assert!(b
+            .identities()
+            .by_email("half@example.com")
+            .await
+            .unwrap()
+            .is_none());
+
+        let Registered::New(registered) = b
+            .identities()
+            .register(&registration("oid-half", "half@example.com"))
+            .await
+            .unwrap()
+        else {
+            panic!("the retry creates the identity");
+        };
+        assert_eq!(registered.user_id, "u-half", "under the claimed user_id");
+        let found = a.identities().by_email("half@example.com").await.unwrap();
+        assert_eq!(found.map(|i| i.user_id).as_deref(), Some("u-half"));
+
+        // A registration of someone whose entry is missing completes it too.
+        let key = ids.key("tenant-1", "oid-bare");
+        let bare = Identity {
+            email: "bare@example.com".into(),
+            user_id: "u-bare".into(),
+            pending: true,
+            ..registered
+        };
+        a.state()
+            .create_json(&identity_path(&key), &bare)
+            .await
+            .unwrap();
+        let again = b
+            .identities()
+            .register(&registration("oid-bare", "bare@example.com"))
+            .await
+            .unwrap();
+        assert!(matches!(again, Registered::Known(i) if i.user_id == "u-bare"));
+        let found = a.identities().by_email("bare@example.com").await.unwrap();
+        assert_eq!(found.map(|i| i.user_id).as_deref(), Some("u-bare"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn of_two_registrations_of_one_email_at_once_exactly_one_succeeds() {
+        let (a, b, _files) = two_workers();
+        let (a, b) = (std::sync::Arc::new(a), std::sync::Arc::new(b));
+        for round in 0..10 {
+            let email = format!("both-{round}@example.com");
+            let register = |storage: std::sync::Arc<Storage>, oid: String| {
+                let email = email.clone();
+                tokio::spawn(async move {
+                    storage
+                        .identities()
+                        .register(&registration(&oid, &email))
+                        .await
+                        .unwrap()
+                })
+            };
+            let first = register(a.clone(), format!("oid-x{round}"));
+            let second = register(b.clone(), format!("oid-y{round}"));
+            let outcomes = [first.await.unwrap(), second.await.unwrap()];
+            let created: Vec<&Identity> = outcomes
+                .iter()
+                .filter_map(|o| match o {
+                    Registered::New(i) => Some(i),
+                    _ => None,
+                })
+                .collect();
+            let taken = outcomes
+                .iter()
+                .filter(|o| matches!(o, Registered::EmailTaken))
+                .count();
+            assert_eq!((created.len(), taken), (1, 1), "round {round}");
+            let found = a.identities().by_email(&email).await.unwrap().unwrap();
+            assert_eq!(found.user_id, created[0].user_id, "round {round}");
+        }
+        assert_eq!(b.identities().all().await.unwrap().len(), 10, "no orphans");
+    }
+
+    #[tokio::test]
+    async fn a_sign_in_whose_email_another_identity_holds_still_signs_in() {
+        let (a, _, _files) = two_workers();
+        let roles = Vec::new();
+        let first = a
+            .identities()
+            .sign_in(&sign_in("oid-one", "shared@example.com", &roles))
+            .await
+            .unwrap();
+        let second = a
+            .identities()
+            .sign_in(&sign_in("oid-two", "shared@example.com", &roles))
+            .await
+            .unwrap();
+        assert_ne!(first.user_id, second.user_id);
+        let found = a.identities().by_email("shared@example.com").await.unwrap();
+        assert_eq!(
+            found.map(|i| i.user_id),
+            Some(first.user_id),
+            "the first holds it"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
