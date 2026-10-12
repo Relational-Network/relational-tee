@@ -208,6 +208,8 @@ pub(crate) mod tests {
             self.storage
                 .pools()
                 .create(&PoolDoc {
+                    generation: 0,
+                    anchor: None,
                     pool_pda: pool_pda.to_string(),
                     pool_name: "Sealed".into(),
                     kind: PoolKind::Malta,
@@ -544,6 +546,10 @@ pub(crate) mod tests {
         }
 
         // The pool's owner gets past the same check.
+        worker
+            .chain
+            .lands
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         let revoke = json!({ "wallet_id": owner.wallet_id, "credential_ids": [INITIAL] });
         let request = json_post(format!("{base}/revoke"), &owner.token, &revoke);
         let (status, _, revoked) = send(&worker.app, request).await;
@@ -591,6 +597,10 @@ pub(crate) mod tests {
         }
 
         // At the limits it goes through, and a repeated ID counts once.
+        worker
+            .chain
+            .lands
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         let (status, _, revoked) = send(
             &worker.app,
             revoke(
@@ -610,6 +620,10 @@ pub(crate) mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(doc.revocations.len(), 1);
+        assert_eq!(
+            doc.generation, 1,
+            "the revocation is a change of the pool's"
+        );
         let (status, _, err) = send(
             &worker.app,
             revoke(&pool_pda, json!(["x".repeat(64)]), Value::Null),

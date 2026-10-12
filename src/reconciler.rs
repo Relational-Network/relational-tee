@@ -94,6 +94,11 @@ pub fn spawn(storage: Arc<Storage>, solana: Arc<SolanaClient>, timing: Timing) {
                     Ok(swept) => info!(swept, "Swept transfer receipts"),
                     Err(e) => warn!(error = %e, "Sweeping transfer receipts failed"),
                 }
+                match settle_pools(&storage, &solana).await {
+                    Ok(0) => {}
+                    Ok(settled) => info!(settled, "Anchored pools' settling generations"),
+                    Err(e) => warn!(error = %e, "Anchoring pools' generations failed"),
+                }
             }
         }
     });
@@ -304,20 +309,36 @@ async fn finish(
             let mut entry = grant.clone();
             entry.signature = Some(signature);
             let mut added = false;
-            storage
-                .pools()
-                .update::<ApiError>(pool_pda, |doc| {
-                    added = doc.recording(&entry) == Recording::Add;
-                    if !added {
-                        return Ok(Change::Unchanged);
-                    }
-                    doc.grants.push(entry.clone());
-                    Ok(Change::Changed)
-                })
-                .await?;
+            crate::generation::update(storage, solana, pool_pda, |doc| {
+                added = doc.recording(&entry) == Recording::Add;
+                if !added {
+                    return Ok(Change::Unchanged);
+                }
+                doc.grants.push(entry.clone());
+                Ok(Change::Changed)
+            })
+            .await?;
             Ok(added)
         }
     }
+}
+
+/// Finish the anchors of pools whose last change is still settling. Returns
+/// how many it finished.
+pub async fn settle_pools(storage: &Storage, solana: &SolanaClient) -> Result<usize, ApiError> {
+    let mut settled = 0;
+    for doc in storage.pools().all().await? {
+        if doc.anchor.is_none() {
+            continue;
+        }
+        match crate::generation::settle(storage, solana, &doc).await {
+            Ok(()) => settled += 1,
+            Err(e) => {
+                warn!(pool = %doc.pool_pda, error = %e, "Couldn't anchor a pool's generation")
+            }
+        }
+    }
+    Ok(settled)
 }
 
 /// The burn of one of `doc`'s `drt_name` DRTs under `commitment`.
@@ -546,7 +567,13 @@ mod tests {
     #[tokio::test]
     async fn an_abandoned_grant_is_recorded_unless_a_revocation_came_after() {
         let storage = files_storage();
-        storage.pools().create(&drt_pool()).await.unwrap();
+        // Recording a grant is a change of the pool's, which its owner's
+        // wallet anchors.
+        let (wallet_id, owner) = crate::storage::wallets::tests::wallet(&storage).await;
+        let mut pool = drt_pool();
+        pool.owner_wallet_id = wallet_id;
+        pool.owner_pubkey = owner.to_string();
+        storage.pools().create(&pool).await.unwrap();
         let request = Idempotent::post(
             "0f8fad5b-d9cb-469f-a165-70867728950e",
             "/v1/drt/pools/{pool_pda}/grant",
@@ -595,6 +622,7 @@ mod tests {
                     revoked_by: "alice".into(),
                     revoked_at: Utc::now() - TimeDelta::minutes(5),
                     signature: Some("sig-close".into()),
+                    generation: None,
                 });
                 doc.grants.push(earlier);
                 Ok(Change::Changed)
@@ -606,6 +634,7 @@ mod tests {
             chain.grant(pda, drt_config("awards-report-v1"));
         }
         chain.land("sig-grant", true);
+        chain.lands.store(true, std::sync::atomic::Ordering::SeqCst);
         let solana = fake::start(chain);
 
         assert_eq!(
@@ -615,6 +644,7 @@ mod tests {
             1
         );
         let doc = storage.pools().get(&P1.to_string()).await.unwrap().unwrap();
+        assert_eq!(doc.generation, 1, "anchored like a request's");
         let ana = doc.active_grant("ana", "awards-report-v1").unwrap();
         assert_eq!(
             (ana.grant_id.as_str(), ana.signature.as_deref()),

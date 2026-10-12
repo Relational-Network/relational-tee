@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Relational Network
 
-//! What the chain last showed of each pool's analysis grants, sealed at
-//! `chain/grants/{pool_pda}.json`, so a worker that starts while the RPC is
-//! down still knows which grants it verified. It's derived data: deleting
-//! it costs only RPC calls.
+//! What the chain last showed of each pool's analysis grants, and of its
+//! generation counter, sealed at `chain/grants/{pool_pda}.json`, so a
+//! worker that starts while the RPC is down still knows which grants it
+//! verified. It's derived data: deleting it costs only RPC calls.
 
 use std::collections::BTreeMap;
 
@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use super::{id, Storage, StoreError};
 use crate::store::{Created, Replaced};
 
-/// What the chain showed at one Grant PDA.
+/// What the chain showed at one Grant PDA, or at the pool's counter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Seen {
     /// Whether the program's Grant for the pool's DRT config was there.
@@ -23,9 +23,13 @@ pub struct Seen {
     pub slot: u64,
     /// When the worker read it.
     pub at: DateTime<Utc>,
+    /// For the counter: the generation it showed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
 }
 
-/// Each Grant PDA of a pool, base58, and what the chain showed there.
+/// Each Grant PDA of a pool, and its counter, base58, and what the chain
+/// showed there.
 pub type Views = BTreeMap<String, Seen>;
 
 /// Merge `newer` into `views`, keeping the reading of the higher slot for
@@ -107,6 +111,7 @@ mod tests {
             live,
             slot,
             at: Utc::now(),
+            generation: None,
         }
     }
 

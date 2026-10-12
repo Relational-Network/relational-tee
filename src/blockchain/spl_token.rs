@@ -21,7 +21,7 @@ const SPL_TOKEN_PROGRAM_ID_STR: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ
 const ATA_PROGRAM_ID_STR: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
 const SYSTEM_PROGRAM_ID_STR: &str = "11111111111111111111111111111111";
 
-fn spl_token_program_id() -> &'static Pubkey {
+pub(crate) fn spl_token_program_id() -> &'static Pubkey {
     static ID: OnceLock<Pubkey> = OnceLock::new();
     ID.get_or_init(|| Pubkey::from_str(SPL_TOKEN_PROGRAM_ID_STR).expect("valid SPL Token ID"))
 }
@@ -42,7 +42,7 @@ fn system_program_id() -> &'static Pubkey {
 /// under the standard SPL Token program.
 ///
 /// Seeds: `[wallet, TOKEN_PROGRAM, mint]` under ATA program.
-fn get_associated_token_address(wallet: &Pubkey, mint: &Pubkey) -> Pubkey {
+pub(crate) fn get_associated_token_address(wallet: &Pubkey, mint: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(
         &[
             wallet.as_ref(),
@@ -60,7 +60,11 @@ fn get_associated_token_address(wallet: &Pubkey, mint: &Pubkey) -> Pubkey {
 /// ATA program instruction `1` = CreateIdempotent. A send's transaction is
 /// stored and resent until it lands, so it can't depend on whether the
 /// account existed when it was built.
-fn create_ata_instruction(funder: &Pubkey, wallet: &Pubkey, mint: &Pubkey) -> Instruction {
+pub(crate) fn create_ata_instruction(
+    funder: &Pubkey,
+    wallet: &Pubkey,
+    mint: &Pubkey,
+) -> Instruction {
     let ata = get_associated_token_address(wallet, mint);
     Instruction {
         program_id: *ata_program_id(),
