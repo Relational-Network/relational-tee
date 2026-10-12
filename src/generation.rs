@@ -452,6 +452,50 @@ pub(crate) mod tests {
         assert_eq!(s.chain.supply(&s.counter), Some(1));
     }
 
+    /// On the real programs: lamports someone sent to the counter's address
+    /// first don't stop the first change, each change is exactly one token,
+    /// and a restored older document is refused.
+    #[tokio::test]
+    #[ignore = "needs a surfnet: run `just chain-test`"]
+    async fn surfnet_anchors_each_generation_once() {
+        use crate::blockchain::surfnet;
+        let storage = files_storage();
+        let solana = surfnet::client();
+        let (wallet_id, owner) = crate::storage::wallets::tests::wallet(&storage).await;
+        surfnet::fund(&owner, 10_000_000_000).await;
+        let pool_pda = Pubkey::new_unique().to_string();
+        let mut doc = pool(&pool_pda, &wallet_id);
+        doc.owner_pubkey = owner.to_string();
+        storage.pools().create(&doc).await.unwrap();
+        let counter = counter_address(&owner, &pool_pda).unwrap();
+        surfnet::fund(&counter, 890_880).await;
+        assert_eq!(on_chain(&solana, &doc, "confirmed").await.unwrap(), 0);
+
+        for n in 1..=3 {
+            let changed = update(&storage, &solana, &pool_pda, |doc| {
+                doc.pool_name = format!("v{n}");
+                Ok(Change::Changed)
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(changed.generation, n);
+            assert_eq!(on_chain(&solana, &changed, "confirmed").await.unwrap(), n);
+        }
+        let doc = storage.pools().get(&pool_pda).await.unwrap().unwrap();
+        assert!(doc.anchor.is_none(), "every anchor landed");
+        settle(&storage, &solana, &doc).await.unwrap();
+        assert_eq!(on_chain(&solana, &doc, "confirmed").await.unwrap(), 3);
+
+        let mut restored = doc;
+        restored.generation = 2;
+        let chain = on_chain(&solana, &restored, "confirmed").await.unwrap();
+        assert_eq!(
+            check(&restored, chain).unwrap_err().code,
+            "pool_records_stale"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_changes_take_one_generation_each() {
         let s = Arc::new(setup().await);

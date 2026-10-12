@@ -188,6 +188,7 @@
             azurite
             mkcert
             actionlint
+            surfpool
           ];
           RUSTC_WRAPPER = "sccache";
         };

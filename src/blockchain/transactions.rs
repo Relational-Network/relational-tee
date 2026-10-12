@@ -216,4 +216,62 @@ mod tests {
         );
         eprintln!("devnet: a receipt under {wallet} is created once and refused the second time");
     }
+
+    /// On the real System program, with its transfer: a receipt is made
+    /// once, a second copy of the transfer is refused before it runs with
+    /// "already in use" at the receipt, and a sweep returns the deposit and
+    /// leaves nothing there.
+    #[tokio::test]
+    #[ignore = "needs a surfnet: run `just chain-test`"]
+    async fn surfnet_makes_a_receipt_once_and_sweeps_it() {
+        use crate::blockchain::surfnet;
+        use solana_keypair::Keypair;
+        use solana_signer::Signer;
+
+        let solana = surfnet::client();
+        let keypair = Keypair::new();
+        let wallet = keypair.pubkey();
+        surfnet::fund(&wallet, 2_000_000_000).await;
+        let rpc = solana.rpc();
+        let deposit = rpc.get_minimum_balance_for_rent_exemption(0).await.unwrap();
+        let seed = uuid::Uuid::new_v4().simple().to_string();
+        let receipt = receipt_address(&wallet, &seed).unwrap();
+        let send = |instructions: Vec<Instruction>| {
+            let (keypair, solana) = (&keypair, &solana);
+            async move {
+                let (blockhash, _) = solana.rpc().get_latest_blockhash().await.unwrap();
+                let tx = crate::api::pools::signed(keypair, &instructions)(blockhash);
+                let encoded = BASE64.encode(bincode::serialize(&tx).unwrap());
+                solana.rpc().send_encoded_transaction(&encoded).await?;
+                let signature = tx.signatures[0].to_string();
+                solana
+                    .await_confirmation(&signature, "confirmed")
+                    .await
+                    .unwrap();
+                Ok::<_, crate::blockchain::rpc::RpcError>(signature)
+            }
+        };
+
+        let mut transfer = vec![create_receipt(&wallet, &receipt, &seed, deposit)];
+        transfer.extend(native_transfer(&wallet, &Pubkey::new_unique(), 1_000_000));
+        send(transfer.clone()).await.unwrap();
+        let made = rpc.get_account(&receipt, "confirmed").await.unwrap();
+        assert!(is_receipt(made.as_ref()), "{made:?}");
+
+        let refused = send(transfer).await.unwrap_err();
+        assert_eq!(
+            refused.rejection(),
+            Some(&json!({ "InstructionError": [0, { "Custom": 0 }] })),
+            "{refused}"
+        );
+
+        send(vec![sweep_receipt(&wallet, &receipt, &seed, deposit)])
+            .await
+            .unwrap();
+        assert!(rpc
+            .get_account(&receipt, "confirmed")
+            .await
+            .unwrap()
+            .is_none());
+    }
 }
