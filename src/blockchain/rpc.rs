@@ -589,8 +589,8 @@ pub struct TokenBalanceEntry {
     pub mint: String,
     /// The wallet that owns the token account.
     pub owner: Option<String>,
-    /// In the token's smallest units.
-    pub amount: u128,
+    /// In the token's smallest units, which SPL Token keeps as a `u64`.
+    pub amount: u64,
     pub decimals: u8,
 }
 
@@ -627,12 +627,14 @@ pub fn parse_transaction(result: &Value) -> TransactionDetail {
     }
 }
 
+/// Every entry, or none if any of them doesn't parse: a list missing one
+/// entry would misstate the balance changes.
 fn parse_token_balances(v: &Value) -> Vec<TokenBalanceEntry> {
     v.as_array()
-        .map(|entries| {
+        .and_then(|entries| {
             entries
                 .iter()
-                .filter_map(|e| {
+                .map(|e| {
                     Some(TokenBalanceEntry {
                         account_index: e["accountIndex"].as_u64()?,
                         mint: e["mint"].as_str()?.to_string(),

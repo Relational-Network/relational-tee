@@ -344,22 +344,26 @@ fn sol_side(detail: &TransactionDetail, address: &str) -> Side {
 /// other way.
 fn token_side(detail: &TransactionDetail, address: &str) -> Option<Side> {
     let meta = detail.meta.as_ref()?;
-    let change = |owner: &str, mint: &str| -> i128 {
-        let sum = |entries: &[crate::blockchain::rpc::TokenBalanceEntry]| -> i128 {
+    // `None` if the amounts don't add up in an i128, which no real
+    // transaction's can fail to.
+    let change = |owner: &str, mint: &str| -> Option<i128> {
+        let sum = |entries: &[crate::blockchain::rpc::TokenBalanceEntry]| -> Option<i128> {
             entries
                 .iter()
                 .filter(|b| b.owner.as_deref() == Some(owner) && b.mint == mint)
-                .map(|b| i128::try_from(b.amount).unwrap_or(i128::MAX))
-                .sum()
+                .try_fold(0i128, |total, b| total.checked_add(i128::from(b.amount)))
         };
-        sum(&meta.post_token_balances) - sum(&meta.pre_token_balances)
+        sum(&meta.post_token_balances)?.checked_sub(sum(&meta.pre_token_balances)?)
     };
     let entry = meta
         .pre_token_balances
         .iter()
         .chain(&meta.post_token_balances)
-        .find(|b| b.owner.as_deref() == Some(address) && change(address, &b.mint) != 0)?;
-    let delta = change(address, &entry.mint);
+        .find(|b| {
+            b.owner.as_deref() == Some(address)
+                && change(address, &b.mint).is_some_and(|delta| delta != 0)
+        })?;
+    let delta = change(address, &entry.mint)?;
     let counterparty = meta
         .pre_token_balances
         .iter()
@@ -369,7 +373,7 @@ fn token_side(detail: &TransactionDetail, address: &str) -> Option<Side> {
                 .as_deref()
                 .filter(|o| *o != address && b.mint == entry.mint)
         })
-        .find(|o| change(o, &entry.mint).signum() == -delta.signum())
+        .find(|o| change(o, &entry.mint).is_some_and(|d| d.signum() == -delta.signum()))
         .unwrap_or_default()
         .to_string();
     let (from, to, direction) = if delta < 0 {
@@ -387,18 +391,20 @@ fn token_side(detail: &TransactionDetail, address: &str) -> Option<Side> {
     })
 }
 
-/// `raw` smallest units as a decimal with `decimals` places.
+/// `raw` smallest units as a decimal with `decimals` places, by placing the
+/// point in its digits: a token may claim up to 255 places, far past what
+/// `10^decimals` fits in.
 fn decimal(raw: u128, decimals: u8) -> String {
-    if decimals == 0 {
-        return raw.to_string();
+    let digits = raw.to_string();
+    let places = usize::from(decimals);
+    if places == 0 {
+        digits
+    } else if digits.len() > places {
+        let (whole, fraction) = digits.split_at(digits.len() - places);
+        format!("{whole}.{fraction}")
+    } else {
+        format!("0.{}{digits}", "0".repeat(places - digits.len()))
     }
-    let scale = 10u128.pow(u32::from(decimals));
-    format!(
-        "{}.{:0width$}",
-        raw / scale,
-        raw % scale,
-        width = usize::from(decimals)
-    )
 }
 
 #[cfg(test)]
@@ -518,7 +524,103 @@ mod tests {
     fn decimals_are_exact() {
         assert_eq!(decimal(1, 9), "0.000000001");
         assert_eq!(decimal(12_345, 0), "12345");
+        assert_eq!(decimal(0, 0), "0");
+        assert_eq!(decimal(0, 2), "0.00");
+        assert_eq!(decimal(1_500_000_000, 9), "1.500000000");
         assert_eq!(decimal(u128::from(u64::MAX), 9), "18446744073.709551615");
+        // Past what 10^decimals fits in a u128, and at the u8 limit.
+        let max = u128::MAX.to_string();
+        assert_eq!(
+            decimal(u128::MAX, 38),
+            format!("{}.{}", &max[..1], &max[1..])
+        );
+        assert_eq!(decimal(u128::MAX, 39), format!("0.{max}"));
+        for places in [127u8, 128, 255] {
+            let text = decimal(1, places);
+            assert_eq!(text.len(), 2 + usize::from(places), "{places}");
+            assert!(text.starts_with("0.0") && text.ends_with('1'), "{places}");
+            assert_eq!(decimal(u128::MAX, places).len(), 2 + usize::from(places));
+        }
+    }
+
+    /// One SPL balance entry for `owner` of `amount` with `decimals` places.
+    fn balance(index: u64, owner: &str, amount: &str, decimals: u64) -> serde_json::Value {
+        serde_json::json!({
+            "accountIndex": index, "mint": MINT, "owner": owner,
+            "uiTokenAmount": { "amount": amount, "decimals": decimals }
+        })
+    }
+
+    /// A transaction with these SPL balances before and after.
+    fn spl(pre: serde_json::Value, post: serde_json::Value) -> TransactionDetail {
+        parse_transaction(&serde_json::json!({
+            "slot": 9,
+            "meta": {
+                "err": null, "fee": 5000,
+                "preBalances": [10_000, 1, 1], "postBalances": [5_000, 1, 1],
+                "preTokenBalances": pre, "postTokenBalances": post,
+            },
+            "transaction": { "message": { "accountKeys": [ALICE, "AliceAta", "BobAta"] } },
+        }))
+    }
+
+    #[test]
+    fn token_amounts_at_the_extremes_neither_panic_nor_overflow() {
+        let solana = solana();
+        let max = u64::MAX.to_string();
+        // The largest amount a token account holds, with the most places a
+        // token can claim.
+        let detail = spl(
+            serde_json::json!([balance(1, ALICE, &max, 255), balance(2, BOB, "0", 255)]),
+            serde_json::json!([balance(1, ALICE, "0", 255), balance(2, BOB, &max, 255)]),
+        );
+        let sent = view(&solana, &alice(), "sig", &detail);
+        assert_eq!((sent.direction.as_str(), sent.to.as_str()), ("sent", BOB));
+        assert_eq!(
+            sent.amount,
+            format!("0.{}{max}", "0".repeat(255 - max.len()))
+        );
+
+        // Several accounts of one owner add up past a u64.
+        let detail = spl(
+            serde_json::json!([
+                balance(1, ALICE, "0", 0),
+                balance(2, BOB, &max, 0),
+                balance(3, BOB, &max, 0)
+            ]),
+            serde_json::json!([
+                balance(1, ALICE, &max, 0),
+                balance(2, BOB, &max, 0),
+                balance(3, BOB, "1", 0)
+            ]),
+        );
+        let received = view(&solana, &alice(), "sig", &detail);
+        assert_eq!(
+            (received.direction.as_str(), received.from.as_str()),
+            ("received", BOB)
+        );
+        assert_eq!(received.amount, max);
+    }
+
+    #[test]
+    fn malformed_token_balances_fall_back_to_the_sol_change() {
+        let solana = solana();
+        // An amount past what SPL Token holds, or one that isn't a number,
+        // spoils the whole list rather than skewing its sums.
+        for bad in ["18446744073709551616", "-1", "1.5", ""] {
+            let detail = spl(
+                serde_json::json!([balance(1, ALICE, "5", 0), balance(2, BOB, bad, 0)]),
+                serde_json::json!([balance(1, ALICE, "0", 0), balance(2, BOB, "5", 0)]),
+            );
+            let side = view(&solana, &alice(), "sig", &detail);
+            assert_eq!(side.token, TokenType::Native, "{bad:?}");
+        }
+        // No token balances at all: the SOL change.
+        let detail = spl(serde_json::json!([]), serde_json::json!([]));
+        assert_eq!(
+            view(&solana, &alice(), "sig", &detail).token,
+            TokenType::Native
+        );
     }
 
     #[tokio::test]
