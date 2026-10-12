@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Relational Network
+
+# Advisories `just osv` ignores. Keep each one in .cargo/audit.toml too, with
+# the same reason. An ignore stops applying on its review date, so the gate
+# fails until someone looks again.
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2025-0141"
+ignoreUntil = 2027-01-12
+reason = "bincode 1 is unmaintained and has no fixed release. The worker serializes Solana transactions with it, to send them and to store them for retries, and Solana's crates depend on it; a replacement must keep that wire format."

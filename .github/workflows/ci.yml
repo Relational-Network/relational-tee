@@ -23,14 +23,14 @@ env:
 
 jobs:
   gates:
-    name: Gates (fmt, clippy, tests, banned crates, audit)
+    name: Gates (fmt, clippy, tests, banned crates, advisories)
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
-      # cargo audit needs the advisory database, so it runs outside the Nix
-      # sandbox, in the dev shell. deny-crates fails if rsa or openssl-sys
-      # appears in the dependency graph.
+      # cargo audit and osv-scanner need their advisory databases, so they run
+      # outside the Nix sandbox, in the dev shell. deny-crates fails if rsa or
+      # openssl-sys appears in the dependency graph.
       - name: just check
         run: nix develop --command just check
       # Release builds don't serve the OpenAPI document, so CI publishes it.

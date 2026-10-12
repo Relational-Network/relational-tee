@@ -181,6 +181,7 @@
           packages = with pkgs; [
             cargo-nextest
             cargo-audit
+            osv-scanner
             bacon
             just
             sccache

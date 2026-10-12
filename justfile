@@ -113,7 +113,7 @@ grant-guard:
     cargo nextest run --run-ignored only --no-capture -E 'test(devnet_refuses)'
 
 # Run every local gate.
-check: fmt-check clippy test deny-crates audit
+check: fmt-check clippy test deny-crates audit osv
 
 # Fail if the code isn't formatted.
 fmt-check:
@@ -141,6 +141,10 @@ deny-crates:
 # Check dependencies against the RustSec advisory database.
 audit:
     cargo audit
+
+# Check Cargo.lock against OSV, which has GitHub's advisories as well as RustSec's.
+osv:
+    osv-scanner scan source --config osv-scanner.toml --lockfile Cargo.lock
 
 # Print the OpenAPI document, which CI publishes; only builds with the
 # swagger-ui feature (`just dev`) serve it, at /api-doc/openapi.json.
