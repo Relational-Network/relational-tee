@@ -77,7 +77,7 @@ pub struct GrantRequest {
     pub scope: Vec<Target>,
 }
 
-/// An analyst and one of the pool's analyses.
+/// An analyst and one of the pool's analyses, and the grant to revoke.
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RevokeGrantRequest {
@@ -85,12 +85,20 @@ pub struct RevokeGrantRequest {
     pub analyst_user_id: String,
     /// The pool's analysis: its `analysis_id`.
     pub analysis_id: String,
+    /// The grant to revoke, as `GET …/grants` lists it: only that grant is
+    /// ever revoked or closed. Without it, the analyst's active grant, or
+    /// else their last one, or a burn of theirs that no request recorded.
+    #[serde(default)]
+    pub grant_id: Option<String>,
 }
 
 /// New targets for an analyst's active grant.
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GrantScopeRequest {
+    /// The grant to change, as `GET …/grants` lists it. A revision belongs
+    /// to one grant: a later grant to the same analyst starts again at 1.
+    pub grant_id: String,
     /// The analyst's `user_id`.
     pub analyst_user_id: String,
     /// The pool's analysis: its `analysis_id`.
@@ -263,6 +271,16 @@ fn address_taken() -> ApiError {
 fn superseded() -> ApiError {
     ApiError::conflict("the analyst's grant was revoked after this request began; grant again")
         .with_code("grant_superseded")
+}
+
+fn no_grant() -> ApiError {
+    ApiError::not_found("the analyst has no such grant to this analysis").with_code("no_grant")
+}
+
+/// `grant_id` named a grant of another analyst or analysis.
+fn grant_mismatch() -> ApiError {
+    ApiError::bad_request("grant_id names a grant of another analyst or analysis")
+        .with_code("grant_mismatch")
 }
 
 /// What the chain showed of a grant: its PDA, and the reading, if any.
@@ -650,7 +668,7 @@ pub async fn grant_analysis(
     path = "/v1/drt/pools/{pool_pda}/revoke-grant",
     tag = "Grants",
     summary = "Revoke an analyst's grant",
-    description = "End an analyst's access to the pool's analysis: record the revocation in the pool's document, which ends access at once, then close the Grant PDA on-chain (its rent returns to the pool's owner). If the analyst's last grant is already revoked, this finishes closing it, or returns it if it's closed. Needs `pools:write` and pool ownership. Idempotent.",
+    description = "End an analyst's access to the pool's analysis: record the revocation in the pool's document, which ends access at once, then close the Grant PDA on-chain (its rent returns to the pool's owner). With `grant_id`, only that grant is revoked: if it's already revoked, this finishes closing it, or returns it if it's closed, and a later grant to the analyst is never touched. Without it, the analyst's active grant, or else their last one. Needs `pools:write` and pool ownership. Idempotent.",
     security(("bearer_auth" = [])),
     params(
         ("pool_pda" = String, Path, description = "Pool PDA address (base58)"),
@@ -659,10 +677,10 @@ pub async fn grant_analysis(
     request_body = RevokeGrantRequest,
     responses(
         (status = 200, description = "The revoked grant", body = GrantEntry),
-        (status = 400, description = "No Idempotency-Key, or Solana refused the close (`transaction_rejected`)"),
+        (status = 400, description = "No Idempotency-Key, `grant_id` names another analyst's or analysis's grant (`grant_mismatch`), or Solana refused the close (`transaction_rejected`)"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Not the pool's owner"),
-        (status = 404, description = "Pool or analysis not found, or the analyst has no grant (`no_grant`)"),
+        (status = 404, description = "Pool or analysis not found, or the analyst has no such grant (`no_grant`)"),
         (status = 409, description = "The pool changed concurrently; retry"),
         (status = 422, description = "The Idempotency-Key was used for a different request"),
         (status = 503, description = "Solana RPC unavailable"),
@@ -705,8 +723,10 @@ pub async fn revoke_grant(
     let is_pending = |g: &Grant| g.revoked.as_ref().is_some_and(|r| r.signature.is_none());
 
     // A burn that no request recorded, such as one whose request died, is
-    // revoked too, so the reconciler can't record it afterwards.
-    let unrecorded = if doc.grants.iter().any(is_mine)
+    // revoked too, so the reconciler can't record it afterwards. A request
+    // that names its grant revokes only that one.
+    let unrecorded = if payload.grant_id.is_some()
+        || doc.grants.iter().any(is_mine)
         || doc.active_grant(analyst_id, analysis_id).is_some()
         || doc
             .latest_grant(analyst_id, analysis_id)
@@ -752,6 +772,22 @@ pub async fn revoke_grant(
                 target = grant.grant_id.clone();
                 return Ok(Change::Unchanged);
             }
+            if let Some(wanted) = &payload.grant_id {
+                let grant = doc
+                    .grants
+                    .iter_mut()
+                    .find(|g| &g.grant_id == wanted)
+                    .ok_or_else(no_grant)?;
+                if &grant.analyst != analyst_id || &grant.drt_name != analysis_id {
+                    return Err(grant_mismatch());
+                }
+                target = grant.grant_id.clone();
+                if grant.revoked.is_some() {
+                    return Ok(Change::Unchanged);
+                }
+                grant.revoked = Some(revocation.clone());
+                return Ok(Change::Changed);
+            }
             let active = doc.grants.iter_mut().find(|g| {
                 &g.analyst == analyst_id && &g.drt_name == analysis_id && g.revoked.is_none()
             });
@@ -781,10 +817,7 @@ pub async fn revoke_grant(
                     });
                     Ok(Change::Changed)
                 }
-                _ => Err(
-                    ApiError::not_found("the analyst has no grant to this analysis")
-                        .with_code("no_grant"),
-                ),
+                _ => Err(no_grant()),
             }
         })
         .await?
@@ -888,7 +921,7 @@ pub async fn revoke_grant(
     path = "/v1/drt/pools/{pool_pda}/grant-scope",
     tag = "Grants",
     summary = "Change a grant's targets",
-    description = "Set the targets of an analyst's active grant: from the next request on, the analyst sees the rows of any of them. Nothing is burned or sent on-chain. The edit names the grant's `scope_revision` it started from: a stale one gets `409 version_conflict`, and one that sets the targets the grant already has changes nothing. Every setting is kept in the grant's `scope_history`. Needs `pools:write` and pool ownership. Idempotent.",
+    description = "Set the targets of an analyst's active grant: from the next request on, the analyst sees the rows of any of them. Nothing is burned or sent on-chain. The edit names the grant (`grant_id`) and its `scope_revision` it started from: an edit of a grant since revoked gets `409 grant_not_active`, even if the analyst was granted again; a stale revision gets `409 version_conflict`; and one that sets the targets the grant already has changes nothing. Every setting is kept in the grant's `scope_history`. Needs `pools:write` and pool ownership. Idempotent.",
     security(("bearer_auth" = [])),
     params(
         ("pool_pda" = String, Path, description = "Pool PDA address (base58)"),
@@ -897,10 +930,10 @@ pub async fn revoke_grant(
     request_body = GrantScopeRequest,
     responses(
         (status = 200, description = "The grant", body = GrantEntry),
-        (status = 400, description = "Targets the analysis can't apply (`invalid_scope`), or no Idempotency-Key"),
+        (status = 400, description = "Targets the analysis can't apply (`invalid_scope`), `grant_id` names another analyst's or analysis's grant (`grant_mismatch`), or no Idempotency-Key"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Not the pool's owner"),
-        (status = 404, description = "Pool or analysis not found, or the analyst has no grant (`no_grant`)"),
+        (status = 404, description = "Pool or analysis not found, or no such grant (`no_grant`)"),
         (status = 409, description = "The grant is revoked (`grant_not_active`), or its targets changed since `revision` (`version_conflict`)"),
         (status = 422, description = "The Idempotency-Key was used for a different request"),
     )
@@ -942,17 +975,14 @@ pub async fn set_grant_scope(
         .storage
         .pools()
         .update::<ApiError>(&pool_pda_str, |doc| {
-            let latest = doc
+            let grant = doc
                 .grants
                 .iter_mut()
-                .rev()
-                .find(|g| &g.analyst == analyst_id && &g.drt_name == analysis_id);
-            let Some(grant) = latest else {
-                return Err(
-                    ApiError::not_found("the analyst has no grant to this analysis")
-                        .with_code("no_grant"),
-                );
-            };
+                .find(|g| g.grant_id == payload.grant_id)
+                .ok_or_else(no_grant)?;
+            if &grant.analyst != analyst_id || &grant.drt_name != analysis_id {
+                return Err(grant_mismatch());
+            }
             target = grant.grant_id.clone();
             if grant.scopes.iter().any(|s| s.change_id == change.change_id) {
                 return Ok(Change::Unchanged);
@@ -1660,8 +1690,9 @@ pub(crate) mod tests {
             (StatusCode::CONFLICT, Some("grant_active"))
         );
 
+        let grant_id = granted["grant_id"].clone();
         let change = |revision: usize, scope: Value| {
-            json!({ "analyst_user_id": analyst_id, "analysis_id": ANALYSIS,
+            json!({ "grant_id": grant_id, "analyst_user_id": analyst_id, "analysis_id": ANALYSIS,
                 "revision": revision, "scope": scope })
         };
         let wider = json!([
@@ -1753,6 +1784,17 @@ pub(crate) mod tests {
         .await;
         assert_eq!(
             (status, err["code"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("grant_mismatch"))
+        );
+        let mut unknown = change(1, narrower.clone());
+        unknown["grant_id"] = json!("not-a-grant");
+        let (status, _, err) = send(
+            &worker.app,
+            post(&scope_path, &owner.token, &new_key(), &unknown),
+        )
+        .await;
+        assert_eq!(
+            (status, err["code"].as_str()),
             (StatusCode::NOT_FOUND, Some("no_grant"))
         );
 
@@ -1769,6 +1811,84 @@ pub(crate) mod tests {
         assert_eq!(
             (status, err["code"].as_str()),
             (StatusCode::CONFLICT, Some("grant_not_active"))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stale_edit_or_revocation_never_touches_a_later_grant() {
+        let worker = worker();
+        let owner = worker.admin("oid-owner").await;
+        let pool_pda = analysis_pool(&worker, &owner, 3).await;
+        let (_, analyst_id) = analyst(&worker.app, "oid-ana").await;
+        worker.chain.lands.store(true, SeqCst);
+        let path = |route: &str| format!("/v1/drt/pools/{pool_pda}/{route}");
+        let call = |route: &str, body: &Value| {
+            let request = post(&path(route), &owner.token, &new_key(), body);
+            let app = worker.app.clone();
+            async move { send(&app, request).await }
+        };
+        let (status, _, first) = call("grant", &granting(&analyst_id)).await;
+        assert_eq!(status, StatusCode::OK, "{first}");
+
+        // An edit and a revocation made against the first grant.
+        let stale_edit = json!({ "grant_id": first["grant_id"], "analyst_user_id": analyst_id,
+            "analysis_id": ANALYSIS, "revision": 1, "scope": [
+                { "key": "employer_group", "value": "Group A" },
+                { "key": "employer", "value": "Bank B" },
+            ] });
+        let revoke_first = json!({ "grant_id": first["grant_id"],
+            "analyst_user_id": analyst_id, "analysis_id": ANALYSIS });
+        let (status, _, revoked) = call("revoke-grant", &revoke_first).await;
+        assert_eq!(status, StatusCode::OK, "{revoked}");
+        assert_eq!(revoked["status"], "revoked");
+
+        // The analyst is granted again, narrower: a new grant at revision 1.
+        let mut narrower = granting(&analyst_id);
+        narrower["scope"] = json!([{ "key": "employer", "value": "Bank B" }]);
+        let (status, _, second) = call("grant", &narrower).await;
+        assert_eq!(status, StatusCode::OK, "{second}");
+        assert_ne!(second["grant_id"], first["grant_id"]);
+        assert_eq!(second["scope_revision"], 1);
+
+        // The stale edit names the revoked grant, and changes nothing.
+        let (status, _, err) = call("grant-scope", &stale_edit).await;
+        assert_eq!(
+            (status, err["code"].as_str()),
+            (StatusCode::CONFLICT, Some("grant_not_active")),
+            "{err}"
+        );
+        // Revoking the first grant again returns it, closed as it was.
+        let (status, _, again) = call("revoke-grant", &revoke_first).await;
+        assert_eq!(status, StatusCode::OK, "{again}");
+        assert_eq!(again["grant_id"], first["grant_id"]);
+        let (_, _, listed) = send(&worker.app, get(&path("grants"), &owner.token)).await;
+        let current = listed["grants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|g| g["grant_id"] == second["grant_id"])
+            .unwrap();
+        assert_eq!(current["status"], "active");
+        assert_eq!(current["scope"], second["scope"]);
+        assert_eq!(current["on_chain"], "live");
+
+        // A grant_id of one analyst's grant with another analyst is refused.
+        let (_, other_id) = analyst(&worker.app, "oid-bo").await;
+        let mut mismatched = stale_edit.clone();
+        mismatched["grant_id"] = second["grant_id"].clone();
+        mismatched["analyst_user_id"] = json!(other_id);
+        let (status, _, err) = call("grant-scope", &mismatched).await;
+        assert_eq!(
+            (status, err["code"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("grant_mismatch"))
+        );
+        let mut revoke_mismatched = revoke_first.clone();
+        revoke_mismatched["grant_id"] = second["grant_id"].clone();
+        revoke_mismatched["analyst_user_id"] = json!(other_id);
+        let (status, _, err) = call("revoke-grant", &revoke_mismatched).await;
+        assert_eq!(
+            (status, err["code"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("grant_mismatch"))
         );
     }
 
