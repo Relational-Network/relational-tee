@@ -258,10 +258,15 @@ pub struct PoolDoc {
     /// counter mint must show (see [`crate::generation`]).
     #[serde(default)]
     pub generation: u64,
-    /// The signed transaction that takes the counter to `generation`, until
-    /// it's known to have landed.
+    /// The signed transaction that takes the counter to `generation`. It's
+    /// kept after it lands, until the next change, so a worker that comes
+    /// late resends it rather than signing a second.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor: Option<StoredTx>,
+    /// The latest generation the counter was seen to show. While it's
+    /// behind `generation`, the last change may still be settling.
+    #[serde(default)]
+    pub anchored: u64,
 }
 
 /// Totals computed from a pool document.
@@ -459,6 +464,7 @@ pub(crate) mod tests {
         PoolDoc {
             generation: 0,
             anchor: None,
+            anchored: 0,
             pool_pda: pda.into(),
             pool_name: format!("Pool {pda}"),
             kind: PoolKind::Malta,
