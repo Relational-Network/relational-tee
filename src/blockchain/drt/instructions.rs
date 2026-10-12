@@ -23,20 +23,15 @@ use crate::config::drt_program_id;
 // ============================================================================
 
 fn system_program_id() -> Pubkey {
-    static ID: OnceLock<Pubkey> = OnceLock::new();
-    *ID.get_or_init(|| Pubkey::from_str(SYSTEM_PROGRAM_ID_STR).expect("valid system program ID"))
+    *crate::blockchain::spl_token::system_program_id()
 }
 
 fn token_program_id() -> Pubkey {
-    static ID: OnceLock<Pubkey> = OnceLock::new();
-    *ID.get_or_init(|| Pubkey::from_str(TOKEN_PROGRAM_ID_STR).expect("valid SPL Token program ID"))
+    *crate::blockchain::spl_token::spl_token_program_id()
 }
 
 fn associated_token_program_id() -> Pubkey {
-    static ID: OnceLock<Pubkey> = OnceLock::new();
-    *ID.get_or_init(|| {
-        Pubkey::from_str(ASSOCIATED_TOKEN_PROGRAM_ID_STR).expect("valid ATA program ID")
-    })
+    *crate::blockchain::spl_token::ata_program_id()
 }
 
 fn rent_sysvar_id() -> Pubkey {
