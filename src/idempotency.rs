@@ -227,11 +227,13 @@ impl<'a> Operation<'a> {
         let op = Operation {
             storage,
             path: format!("idempotency/{user}/{scope}.json"),
-            fingerprint: sha256_hex(&[
-                request.method.as_str().as_bytes(),
-                request.path.as_bytes(),
-                body,
-            ]),
+            fingerprint: crate::work::cpu_for(body.len(), || {
+                sha256_hex(&[
+                    request.method.as_str().as_bytes(),
+                    request.path.as_bytes(),
+                    body,
+                ])
+            }),
             record: None,
         };
         let record = storage.state().get_json::<Record>(&op.path).await?;

@@ -243,13 +243,16 @@ impl Certificates {
     /// Look for chains in the background, for the process lifetime.
     pub fn spawn(self: &Arc<Self>) {
         let certificates = Arc::clone(self);
-        tokio::spawn(async move {
-            loop {
-                if let Err(e) = certificates.refresh().await {
-                    warn!(error = %e, "Certificate chain check failed");
+        crate::work::supervise("certificates", move || {
+            let certificates = certificates.clone();
+            async move {
+                loop {
+                    if let Err(e) = certificates.refresh().await {
+                        warn!(error = %e, "Certificate chain check failed");
+                    }
+                    let loaded = certificates.served.read().is_ok_and(|s| s.is_some());
+                    tokio::time::sleep(if loaded { CHAIN_POLL } else { FIRST_CHAIN_POLL }).await;
                 }
-                let loaded = certificates.served.read().is_ok_and(|s| s.is_some());
-                tokio::time::sleep(if loaded { CHAIN_POLL } else { FIRST_CHAIN_POLL }).await;
             }
         });
     }

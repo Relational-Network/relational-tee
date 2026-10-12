@@ -16,7 +16,6 @@
 //! record can't be stored returns nothing.
 
 use std::collections::BTreeMap;
-use std::time::Instant;
 
 use axum::body::Bytes;
 use axum::extract::{Path, State};
@@ -34,7 +33,6 @@ use crate::analysis::query::{
     self, FilterOptions, FilterRequest, Page, QueryError, QueryRequest, SortRequest,
     DEFAULT_SEARCH_LIMIT,
 };
-use crate::analysis::runner::DEADLINE;
 use crate::analysis::table::{check_targets, Scope, Target};
 use crate::api::pools::load_pool;
 use crate::audit;
@@ -526,10 +524,8 @@ async fn options_for(
         }
         let options = state
             .analyses
-            .blocking(move || {
-                table
-                    .facets(&def, &query, Instant::now() + DEADLINE)
-                    .map_err(query_error)
+            .on_table(table, move |table, stop| {
+                table.facets(&def, &query, stop).map_err(query_error)
             })
             .await?;
         Ok(OptionsResponse { options })
@@ -621,16 +617,9 @@ async fn search_for(
         let prefix = request.search;
         let values = state
             .analyses
-            .blocking(move || {
+            .on_table(table, move |table, stop| {
                 table
-                    .search(
-                        &def,
-                        &filter,
-                        &prefix,
-                        limit,
-                        &query,
-                        Instant::now() + DEADLINE,
-                    )
+                    .search(&def, &filter, &prefix, limit, &query, stop)
                     .map_err(query_error)
             })
             .await?;
@@ -702,10 +691,8 @@ pub async fn run_query(
             .await?;
         state
             .analyses
-            .blocking(move || {
-                table
-                    .page(&def, &query, Instant::now() + DEADLINE)
-                    .map_err(query_error)
+            .on_table(table, move |table, stop| {
+                table.page(&def, &query, stop).map_err(query_error)
             })
             .await
     }

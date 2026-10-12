@@ -1,0 +1,336 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Relational Network
+
+//! Keeping synchronous work from holding the worker hostage.
+//!
+//! - [`Threads`] runs analysis work on blocking threads, about one per CPU
+//!   at a time. Each job gets a [`Stop`] that fires at its deadline or once
+//!   the request that asked for it is gone, and checks it as it goes, so a
+//!   timed-out or abandoned job gives its thread back.
+//! - [`cpu`] runs a request's CPU-heavy step, such as opening a sealed
+//!   upload, off the async threads, so other requests and health checks
+//!   keep being served. What can reach it is bounded by the memory budget.
+//! - [`supervise`] restarts a long-lived background task that stops, and
+//!   says so in the log.
+
+use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use tokio::runtime::{Handle, RuntimeFlavor};
+use tokio::sync::Semaphore;
+use tracing::{error, warn};
+
+use crate::error::ApiError;
+
+/// How long a job waits for a free thread before it gets 503.
+pub const QUEUE_WAIT: Duration = Duration::from_secs(1);
+
+/// When work should stop: at a deadline, or once it's abandoned.
+#[derive(Clone, Debug)]
+pub struct Stop {
+    deadline: Instant,
+    abandoned: Arc<AtomicBool>,
+}
+
+/// Work stopped before it finished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stopped;
+
+impl std::fmt::Display for Stopped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the work ran out of time")
+    }
+}
+
+impl std::error::Error for Stopped {}
+
+impl Stop {
+    pub fn at(deadline: Instant) -> Self {
+        Self {
+            deadline,
+            abandoned: Arc::default(),
+        }
+    }
+
+    pub fn after(time: Duration) -> Self {
+        Self::at(Instant::now() + time)
+    }
+
+    pub fn stopped(&self) -> bool {
+        self.abandoned.load(Ordering::Relaxed) || Instant::now() >= self.deadline
+    }
+
+    pub fn check(&self) -> Result<(), Stopped> {
+        if self.stopped() {
+            Err(Stopped)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn abandon(&self) {
+        self.abandoned.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Abandons its stop when dropped: when the future waiting for the work is.
+struct AbandonOnDrop(Stop);
+
+impl Drop for AbandonOnDrop {
+    fn drop(&mut self) {
+        self.0.abandon();
+    }
+}
+
+fn busy() -> ApiError {
+    let mut e =
+        ApiError::service_unavailable("the worker is busy with other analyses; retry shortly")
+            .with_code("analysis_busy");
+    e.retry_after = Some(1);
+    e
+}
+
+/// Blocking threads for analysis work, a few at a time.
+pub struct Threads {
+    permits: Arc<Semaphore>,
+}
+
+impl Default for Threads {
+    /// One per CPU.
+    fn default() -> Self {
+        Self::new(std::thread::available_parallelism().map_or(2, |n| n.get()))
+    }
+}
+
+impl Threads {
+    pub fn new(count: usize) -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(count)),
+        }
+    }
+
+    /// Run `work` on a blocking thread once one is free, or 503 if none
+    /// frees up within [`QUEUE_WAIT`]. `work` should stop when its [`Stop`]
+    /// fires: at `stop`'s deadline, or once this future is dropped.
+    pub async fn run<T: Send + 'static>(
+        &self,
+        stop: Stop,
+        work: impl FnOnce(&Stop) -> Result<T, ApiError> + Send + 'static,
+    ) -> Result<T, ApiError> {
+        let abandon = AbandonOnDrop(stop);
+        let permit = tokio::time::timeout(QUEUE_WAIT, self.permits.clone().acquire_owned())
+            .await
+            .map_err(|_| busy())?
+            .map_err(|_| ApiError::internal("the analysis threads are closed"))?;
+        let stop = abandon.0.clone();
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            work(&stop)
+        })
+        .await
+        .map_err(|e| ApiError::internal(format!("an analysis task failed: {e}")))?
+    }
+
+    /// The threads no job holds now.
+    #[cfg(test)]
+    pub fn available(&self) -> usize {
+        self.permits.available_permits()
+    }
+}
+
+/// Run `work`, a request's CPU-heavy step, without holding up the async
+/// threads' other tasks. In-process tests' single-threaded runtimes run it
+/// in place.
+pub fn cpu<T>(work: impl FnOnce() -> T) -> T {
+    match Handle::try_current().map(|h| h.runtime_flavor()) {
+        Ok(RuntimeFlavor::MultiThread) => tokio::task::block_in_place(work),
+        _ => work(),
+    }
+}
+
+/// Inputs smaller than this are worked on in place: moving off the async
+/// thread would cost more than it saves.
+const CPU_HEAVY_BYTES: usize = 256 << 10;
+
+/// [`cpu`], for work proportional to `bytes` of input.
+pub fn cpu_for<T>(bytes: usize, work: impl FnOnce() -> T) -> T {
+    if bytes < CPU_HEAVY_BYTES {
+        work()
+    } else {
+        cpu(work)
+    }
+}
+
+/// How long a restarted background task waits first, at least and at most.
+const RESTART_WAIT: (Duration, Duration) = (Duration::from_secs(1), Duration::from_secs(60));
+
+/// Run the background task `start` makes, and start it again whenever it
+/// returns or panics, waiting longer each time it fails quickly. A task's
+/// end is logged as an error, with `alert = "background_task_stopped"`.
+pub fn supervise<F, Fut>(name: &'static str, mut start: F)
+where
+    F: FnMut() -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut wait = RESTART_WAIT.0;
+        loop {
+            let started = tokio::time::Instant::now();
+            match tokio::spawn(start()).await {
+                Ok(()) => error!(
+                    task = name,
+                    alert = "background_task_stopped",
+                    "A background task returned; restarting it"
+                ),
+                Err(e) if e.is_panic() => error!(
+                    task = name,
+                    alert = "background_task_stopped",
+                    "A background task panicked; restarting it"
+                ),
+                // The runtime is shutting down.
+                Err(_) => return,
+            }
+            if started.elapsed() > RESTART_WAIT.1 {
+                wait = RESTART_WAIT.0;
+            }
+            warn!(
+                task = name,
+                wait_secs = wait.as_secs(),
+                "Restarting a background task"
+            );
+            tokio::time::sleep(wait).await;
+            wait = (wait * 2).min(RESTART_WAIT.1);
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicUsize;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn an_abandoned_job_stops_and_gives_its_thread_back() {
+        let threads = Arc::new(Threads::new(1));
+        let (started, ended) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let (s, e) = (started.clone(), ended.clone());
+        let job = threads.run(Stop::after(Duration::from_secs(60)), move |stop| {
+            s.store(true, Ordering::SeqCst);
+            while !stop.stopped() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            e.store(true, Ordering::SeqCst);
+            Ok(())
+        });
+        // The request gives up while the job runs.
+        let gave_up = tokio::time::timeout(Duration::from_millis(50), job).await;
+        assert!(gave_up.is_err());
+        assert!(started.load(Ordering::SeqCst));
+        for _ in 0..500 {
+            if threads.available() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert!(ended.load(Ordering::SeqCst), "the job saw its stop");
+        assert_eq!(threads.available(), 1, "and gave its thread back");
+        assert_eq!(
+            threads
+                .run(Stop::after(Duration::from_secs(1)), |_| Ok(3))
+                .await
+                .unwrap(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn a_job_waits_for_a_free_thread_and_then_gives_up() {
+        let threads = Threads::new(1);
+        let (started, release) = (
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(std::sync::Barrier::new(2)),
+        );
+        let (notify, wait) = (started.clone(), release.clone());
+        let soon = || Stop::after(Duration::from_secs(5));
+        let busy = threads.run(soon(), move |_| {
+            notify.notify_one();
+            wait.wait();
+            Ok(1)
+        });
+        let refused = async {
+            started.notified().await;
+            let refused = threads.run(soon(), |_| Ok(2)).await;
+            release.wait();
+            refused
+        };
+        let (busy, refused) = tokio::join!(busy, refused);
+        assert_eq!(busy.unwrap(), 1);
+        let refused = refused.unwrap_err();
+        assert_eq!(
+            (refused.code, refused.retry_after),
+            ("analysis_busy", Some(1))
+        );
+        assert_eq!(threads.run(soon(), |_| Ok(3)).await.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_job_stops_at_its_deadline() {
+        let threads = Threads::new(1);
+        let result: Result<(), _> = threads
+            .run(Stop::after(Duration::from_millis(20)), |stop| {
+                while stop.check().is_ok() {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(ApiError::unprocessable("stopped"))
+            })
+            .await;
+        assert_eq!(result.unwrap_err().message, "stopped");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_background_task_that_stops_is_started_again() {
+        let starts = Arc::new(AtomicUsize::new(0));
+        let counted = starts.clone();
+        supervise("test", move || {
+            let n = counted.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if n == 0 {
+                    panic!("the first run fails");
+                }
+                if n == 1 {
+                    return;
+                }
+                std::future::pending::<()>().await;
+            }
+        });
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert_eq!(
+            starts.load(Ordering::SeqCst),
+            3,
+            "after a panic and a return"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cpu_work_leaves_the_async_threads_free() {
+        let blocked = tokio::spawn(async {
+            cpu(|| std::thread::sleep(Duration::from_millis(300)));
+        });
+        // Another task still runs promptly on the runtime meanwhile.
+        let started = Instant::now();
+        let others: Vec<_> = (0..4)
+            .map(|_| tokio::spawn(async { tokio::time::sleep(Duration::from_millis(5)).await }))
+            .collect();
+        for other in others {
+            other.await.unwrap();
+        }
+        assert!(started.elapsed() < Duration::from_millis(200));
+        blocked.await.unwrap();
+    }
+}

@@ -7,18 +7,21 @@
 //! statement can reach them.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::{Mutex, MutexGuard, PoisonError};
-use std::time::Instant;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use rusqlite::{Connection, ToSql};
 use serde::{Deserialize, Serialize};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use utoipa::ToSchema;
 
 use super::dates;
 use super::definition::{Column, ColumnType, Definition, RECORD_ID};
 use super::query::{filter_options, FilterOptions, DEADLINE_STEPS};
-use super::runner::DEADLINE;
 use crate::budget::Reservation;
+use crate::work::{Stop, Stopped};
+
+/// How many CSV records a build reads between checks of its stop.
+const RECORDS_PER_CHECK: i64 = 1024;
 
 /// Scope keys, such as `employer_group`, each with the value a row's column
 /// for that key must hold exactly. A row matches when it meets them all.
@@ -125,6 +128,8 @@ pub enum TableError {
     MissingHeader(String),
     Csv(csv::Error),
     Sql(rusqlite::Error),
+    /// The build ran out of time, or no one waits for it any more.
+    Stopped,
 }
 
 impl std::fmt::Display for TableError {
@@ -133,6 +138,7 @@ impl std::fmt::Display for TableError {
             Self::MissingHeader(header) => write!(f, "an upload has no {header:?} column"),
             Self::Csv(e) => write!(f, "an upload isn't valid CSV: {e}"),
             Self::Sql(e) => write!(f, "SQLite failed: {e}"),
+            Self::Stopped => f.write_str("building the table ran out of time"),
         }
     }
 }
@@ -147,7 +153,16 @@ impl From<csv::Error> for TableError {
 
 impl From<rusqlite::Error> for TableError {
     fn from(e: rusqlite::Error) -> Self {
-        Self::Sql(e)
+        match e.sqlite_error_code() {
+            Some(rusqlite::ErrorCode::OperationInterrupted) => Self::Stopped,
+            _ => Self::Sql(e),
+        }
+    }
+}
+
+impl From<Stopped> for TableError {
+    fn from(_: Stopped) -> Self {
+        Self::Stopped
     }
 }
 
@@ -162,6 +177,8 @@ pub struct Table {
     options: BTreeMap<String, FilterOptions>,
     /// Its share of the worker's memory budget, held while it lives.
     held: Option<Reservation>,
+    /// One request's work at a time, taken before a thread is.
+    turn: Arc<Semaphore>,
 }
 
 impl Table {
@@ -169,7 +186,13 @@ impl Table {
     /// and filter, with each filter's options computed once. Every row, in
     /// or out of scope, numbers `_record_id` in the order the uploads and
     /// their rows come, so a row has the same key in every scope's table.
-    pub fn build(def: &Definition, datasets: &[&[u8]], scope: &Scope) -> Result<Self, TableError> {
+    /// It stops, between records and inside SQLite, once `stop` fires.
+    pub fn build(
+        def: &Definition,
+        datasets: &[&[u8]],
+        scope: &Scope,
+        stop: &Stop,
+    ) -> Result<Self, TableError> {
         let position = |name: &str| {
             def.columns
                 .iter()
@@ -216,6 +239,9 @@ impl Table {
                 for record in reader.records() {
                     let record = record?;
                     record_id += 1;
+                    if record_id % RECORDS_PER_CHECK == 0 {
+                        stop.check()?;
+                    }
                     values.clear();
                     for (column, &i) in def.columns.iter().zip(&index) {
                         let raw = cell(&record, i);
@@ -236,13 +262,13 @@ impl Table {
             }
         }
         tx.commit()?;
+        stop.check()?;
+        let stopping = stop.clone();
+        conn.progress_handler(DEADLINE_STEPS, Some(move || stopping.stopped()))?;
         conn.execute_batch(&def.create_index_sql())?;
         let page_count: i64 = conn.pragma_query_value(None, "page_count", |row| row.get(0))?;
         let page_size: i64 = conn.pragma_query_value(None, "page_size", |row| row.get(0))?;
         conn.pragma_update(None, "query_only", true)?;
-
-        let deadline = Instant::now() + DEADLINE;
-        conn.progress_handler(DEADLINE_STEPS, Some(move || Instant::now() >= deadline))?;
         let options = filter_options(&conn, def)?;
         conn.progress_handler(0, None::<fn() -> bool>)?;
         let pages = usize::try_from(page_count.saturating_mul(page_size)).unwrap_or(usize::MAX);
@@ -252,7 +278,13 @@ impl Table {
             bytes: pages.saturating_add(options.values().map(FilterOptions::bytes).sum()),
             options,
             held: None,
+            turn: Arc::new(Semaphore::new(1)),
         })
+    }
+
+    /// This table's turn: once earlier requests' work on it is done.
+    pub async fn turn(&self) -> Option<OwnedSemaphorePermit> {
+        self.turn.clone().acquire_owned().await.ok()
     }
 
     /// Hold `reservation` for as long as the table lives.
@@ -311,7 +343,9 @@ pub struct ScopeCounts {
 }
 
 impl ScopeCounts {
-    pub fn count(def: &Definition, datasets: &[&[u8]]) -> Result<Self, TableError> {
+    /// Count `datasets`' rows by their scope values, stopping between
+    /// records once `stop` fires.
+    pub fn count(def: &Definition, datasets: &[&[u8]], stop: &Stop) -> Result<Self, TableError> {
         let columns = def
             .scope
             .values()
@@ -321,6 +355,7 @@ impl ScopeCounts {
             })
             .collect::<Result<Vec<&Column>, _>>()?;
         let mut counts: HashMap<Vec<Option<String>>, u64> = HashMap::new();
+        let mut read = 0i64;
         for data in datasets {
             let mut reader = csv::ReaderBuilder::new()
                 .has_headers(true)
@@ -329,6 +364,10 @@ impl ScopeCounts {
             let index = header_positions(&headers, columns.iter().copied())?;
             for record in reader.records() {
                 let record = record?;
+                read += 1;
+                if read % RECORDS_PER_CHECK == 0 {
+                    stop.check()?;
+                }
                 let values = index
                     .iter()
                     .map(|&i| cell(&record, i).map(String::from))
@@ -386,7 +425,7 @@ pub(crate) mod tests {
                       Date of Birth,Employer,Award,Award Grade,Exam Board Date\n\
                       Group B,5,M5,Mx,Sam,Echo,01/01/1990,Bank B,Certificate,Pass,05/01/2026\n";
         let datasets = [first.as_bytes(), second.as_bytes()];
-        let counts = ScopeCounts::count(&def, &datasets).unwrap();
+        let counts = ScopeCounts::count(&def, &datasets, &soon()).unwrap();
         assert_eq!(counts.keys, ["employer", "employer_group"]);
         let combination = |employer: &str, group: Option<&str>, rows| Combination {
             values: vec![Some(employer.into()), group.map(String::from)],
@@ -408,7 +447,7 @@ pub(crate) mod tests {
             &[("employer", "Bank B"), ("employer_group", "Group B")],
         ]);
         let (allowed, kept_out) = counts.split(&scope);
-        let table = Table::build(&def, &datasets, &scope).unwrap();
+        let table = Table::build(&def, &datasets, &scope, &soon()).unwrap();
         assert_eq!(
             allowed.iter().map(|c| c.rows).sum::<u64>(),
             table.rows as u64
@@ -466,7 +505,9 @@ pub(crate) mod tests {
         );
         let rows = |targets: &[Target]| {
             let scope = Scope::of(&check_targets(&def, targets).unwrap());
-            Table::build(&def, &[csv.as_bytes()], &scope).unwrap().rows
+            Table::build(&def, &[csv.as_bytes()], &scope, &soon())
+                .unwrap()
+                .rows
         };
         let group_a = target("employer_group", "Group A");
         let network = target("employer", "Bank A Network");
@@ -492,7 +533,8 @@ pub(crate) mod tests {
         let csv = format!(
             "{AWARDS_HEADER}\n1,M1,Mx,Sam,Alpha,01/01/1990,Bank A,Group A,Certificate,Pass,01/01/2026\n"
         );
-        let table = Table::build(&awards_report(), &[csv.as_bytes()], &Scope::All).unwrap();
+        let table =
+            Table::build(&awards_report(), &[csv.as_bytes()], &Scope::All, &soon()).unwrap();
         let temp_store: i64 = table
             .connection()
             .pragma_query_value(None, "temp_store", |row| row.get(0))
@@ -505,7 +547,8 @@ pub(crate) mod tests {
         let csv = format!(
             "{AWARDS_HEADER}\n1,M1,Mx,Sam,Alpha,01/01/1990,Bank A,Group A,Certificate,Pass,01/01/2026\n"
         );
-        let table = Table::build(&awards_report(), &[csv.as_bytes()], &Scope::All).unwrap();
+        let table =
+            Table::build(&awards_report(), &[csv.as_bytes()], &Scope::All, &soon()).unwrap();
         assert_eq!(table.rows, 1);
         // SAFETY: reads a counter; SQLite is initialised by the build above.
         #[allow(unsafe_code)]
@@ -514,6 +557,10 @@ pub(crate) mod tests {
             used, 0,
             "SQLite was built without SQLITE_DEFAULT_MEMSTATUS=0"
         );
+    }
+
+    pub(crate) fn soon() -> Stop {
+        Stop::after(std::time::Duration::from_secs(5))
     }
 
     /// The scope of these entries, each a list of conditions.

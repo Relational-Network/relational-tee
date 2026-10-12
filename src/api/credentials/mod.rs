@@ -24,7 +24,7 @@ use crate::error::ApiError;
 // ============================================================================
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
+    crate::work::cpu_for(bytes.len(), || hex::encode(Sha256::digest(bytes)))
 }
 
 /// Decode a stored 32-char hex string into 16 raw bytes. Used for right_id
@@ -1118,6 +1118,7 @@ pub(crate) mod tests {
             &crate::analysis::definition::tests::awards_report(),
             &[csv.as_bytes(), csv.as_bytes()],
             &crate::analysis::table::Scope::All,
+            &crate::work::Stop::after(std::time::Duration::from_secs(600)),
         )
         .unwrap();
         eprintln!(

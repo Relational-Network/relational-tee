@@ -78,19 +78,22 @@ impl Default for Timing {
 
 /// Reconcile every `timing.interval`.
 pub fn spawn(storage: Arc<Storage>, solana: Arc<SolanaClient>, timing: Timing) {
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(timing.interval).await;
-            match reconcile(&storage, &solana, timing.min_age).await {
-                Ok(0) => {}
-                Ok(finished) => info!(finished, "Finished abandoned sagas"),
-                Err(e) => warn!(error = %e, "Reconciling staged sagas failed"),
-            }
-            let kept = TimeDelta::from_std(RECEIPTS_KEPT).unwrap_or(TimeDelta::MAX);
-            match sweep_receipts(&storage, &solana, Utc::now() - kept).await {
-                Ok(0) => {}
-                Ok(swept) => info!(swept, "Swept transfer receipts"),
-                Err(e) => warn!(error = %e, "Sweeping transfer receipts failed"),
+    crate::work::supervise("reconciler", move || {
+        let (storage, solana) = (storage.clone(), solana.clone());
+        async move {
+            loop {
+                tokio::time::sleep(timing.interval).await;
+                match reconcile(&storage, &solana, timing.min_age).await {
+                    Ok(0) => {}
+                    Ok(finished) => info!(finished, "Finished abandoned sagas"),
+                    Err(e) => warn!(error = %e, "Reconciling staged sagas failed"),
+                }
+                let kept = TimeDelta::from_std(RECEIPTS_KEPT).unwrap_or(TimeDelta::MAX);
+                match sweep_receipts(&storage, &solana, Utc::now() - kept).await {
+                    Ok(0) => {}
+                    Ok(swept) => info!(swept, "Swept transfer receipts"),
+                    Err(e) => warn!(error = %e, "Sweeping transfer receipts failed"),
+                }
             }
         }
     });

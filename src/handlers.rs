@@ -10,6 +10,7 @@ use crate::data_validation::{validate_csv_bytes, FieldSchema, ValidationSummary}
 use crate::error::ApiError;
 use crate::idempotency::Idempotent;
 use crate::seal::{self, SealedUpload, TransportKeys};
+use crate::work;
 
 /// Read and open the sealed CSV of `caller`'s upload `request`.
 pub(crate) async fn open_sealed_csv(
@@ -26,7 +27,9 @@ pub(crate) async fn open_sealed_csv(
         &upload.kid,
         &caller.user_id,
     );
-    Ok(seal::open_upload(transport, &upload, &aad)?)
+    Ok(work::cpu_for(upload.ciphertext_len(), || {
+        seal::open_upload(transport, &upload, &aad)
+    })?)
 }
 
 /// Validate a CSV payload against the pool's schema.
@@ -40,5 +43,7 @@ pub(crate) fn validate_payload(
             "pool {pool_pda} has no schema, so it takes no uploads"
         )));
     }
-    Ok(validate_csv_bytes(csv_bytes, schema))
+    Ok(work::cpu_for(csv_bytes.len(), || {
+        validate_csv_bytes(csv_bytes, schema)
+    }))
 }
