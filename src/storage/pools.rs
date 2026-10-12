@@ -91,6 +91,9 @@ pub struct Upload {
     pub sha256: String,
     /// CSV rows, excluding the header.
     pub rows: u64,
+    /// The CSV's size; uploads recorded before sizes were kept have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<u64>,
     pub uploaded_by: String,
     pub uploaded_at: DateTime<Utc>,
     /// The append-DRT burn, for an issuance: the on-chain anchor.
@@ -274,6 +277,11 @@ impl PoolDoc {
     /// The initial upload, then every issuance, oldest first.
     pub fn uploads(&self) -> impl DoubleEndedIterator<Item = &Upload> {
         self.initial.iter().chain(&self.issuances)
+    }
+
+    /// The CSV bytes of the uploads whose sizes are known.
+    pub fn dataset_bytes(&self) -> u64 {
+        self.uploads().filter_map(|u| u.bytes).sum()
     }
 
     pub fn upload(&self, record_id: &str) -> Option<&Upload> {
@@ -473,6 +481,7 @@ pub(crate) mod tests {
             upload_id: format!("u-{record_id}"),
             sha256: "00".repeat(32),
             rows,
+            bytes: None,
             uploaded_by: "alice".into(),
             uploaded_at: Utc::now(),
             signature: None,

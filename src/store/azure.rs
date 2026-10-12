@@ -30,6 +30,7 @@ use zeroize::Zeroizing;
 use super::{
     check_path, BoxFuture, Created, ETag, Fetched, Listed, ObjectStore, Replaced, StoreError,
 };
+use crate::config::MAX_BODY_SIZE;
 use crate::http_client::{HttpClient, Response};
 
 const API_VERSION: &str = "2021-12-02";
@@ -39,6 +40,8 @@ const IMDS_TOKEN_URL: &str = "http://169.254.169.254/metadata/identity/oauth2/to
 const TOKEN_REFRESH_MARGIN_SECS: i64 = 300;
 /// The most objects one List Blobs page returns.
 const LIST_PAGE_SIZE: &str = "5000";
+/// The most List Blobs pages one listing reads: 200,000 objects.
+const MAX_LIST_PAGES: usize = 40;
 
 /// Azurite's well-known dev account. Dev builds only.
 #[cfg(feature = "dev")]
@@ -186,7 +189,11 @@ impl AzureBlob {
         };
         Ok(Self {
             account: Arc::new(Account {
-                http: HttpClient::new().with_timeout(Duration::from_secs(30)),
+                // A sealed dataset is the largest object: an upload's body
+                // and the seal's few bytes.
+                http: HttpClient::new()
+                    .with_timeout(Duration::from_secs(30))
+                    .with_max_body(MAX_BODY_SIZE + (1 << 20)),
                 endpoint: Endpoint::parse(&config.blob_url)?,
                 credential,
             }),
@@ -566,7 +573,12 @@ impl ObjectStore for AzureBlob {
             check_path(dir)?;
             let mut listed = Vec::new();
             let mut marker: Option<String> = None;
-            loop {
+            for page in 1.. {
+                if page > MAX_LIST_PAGES {
+                    return Err(StoreError::Invalid(format!(
+                        "{dir} holds more objects than a listing reads"
+                    )));
+                }
                 let mut req = Req::new(
                     Method::GET,
                     format!("{}/{}", self.account.endpoint.prefix, self.container),

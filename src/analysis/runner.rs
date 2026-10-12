@@ -5,13 +5,16 @@
 //! datasets by upload, scoped tables by pool version and scope, and the
 //! counts of scope values by pool version, each loaded once and kept within
 //! a memory budget, so a warm query reads no dataset and a new upload loads
-//! only its own. SQLite and counting work runs on blocking threads, about
-//! one per CPU at a time.
+//! only its own. Datasets and tables also reserve their memory from the
+//! worker's budget before they load, and hold it while anything uses them.
+//! SQLite and counting work runs on blocking threads, about one per CPU at a
+//! time.
 
-use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use lru::LruCache;
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 use tracing::info;
@@ -20,6 +23,8 @@ use zeroize::Zeroizing;
 use super::cache::{Cache, Weigh};
 use super::definition::Definition;
 use super::table::{Scope, ScopeCounts, Table};
+use crate::budget::{Budget, Reservation};
+use crate::config::MAX_BODY_SIZE;
 use crate::error::ApiError;
 use crate::storage::pools::{PoolDoc, Upload};
 use crate::storage::{Storage, StoreError};
@@ -30,17 +35,29 @@ const DATASET_BUDGET: usize = 512 << 20;
 const TABLE_BUDGET: usize = 1 << 30;
 /// Memory for counts of scope values.
 const COUNTS_BUDGET: usize = 64 << 20;
+/// The most values each cache keeps, however small.
+const MAX_ENTRIES: usize = 1024;
+/// The most parsed definitions kept.
+const MAX_DEFINITIONS: NonZeroUsize = NonZeroUsize::new(256).expect("not zero");
 /// How long a request waits for a free thread before it gets 503.
 const QUEUE_WAIT: Duration = Duration::from_secs(1);
+/// How long a load waits for memory before it gets 503.
+const MEMORY_WAIT: Duration = Duration::from_secs(5);
+/// What building a table reserves per byte of its datasets' CSV, before it
+/// knows the table's size: SQLite's pages and indexes, and the parsed rows.
+const TABLE_BYTES_PER_CSV_BYTE: usize = 4;
 
 /// How long one statement may run: well inside the request time limit.
 pub const DEADLINE: Duration = Duration::from_secs(10);
 
-struct Dataset(Zeroizing<Vec<u8>>);
+struct Dataset {
+    csv: Zeroizing<Vec<u8>>,
+    _held: Reservation,
+}
 
 impl Weigh for Dataset {
     fn bytes(&self) -> usize {
-        self.0.len()
+        self.csv.len()
     }
 }
 
@@ -96,23 +113,17 @@ fn version<'a>(doc: &'a PoolDoc, definition: &Definition) -> (Version, Vec<&'a U
 }
 
 pub struct Analyses {
-    definitions: Mutex<HashMap<String, Arc<Definition>>>,
+    definitions: Mutex<LruCache<String, Arc<Definition>>>,
     datasets: Cache<(String, String), Dataset>,
     tables: Cache<TableKey, Table>,
     counts: Cache<Version, ScopeCounts>,
     threads: Arc<Semaphore>,
+    memory: Arc<Budget>,
 }
 
 impl Default for Analyses {
     fn default() -> Self {
-        let cpus = std::thread::available_parallelism().map_or(2, |n| n.get());
-        Self {
-            definitions: Mutex::default(),
-            datasets: Cache::new(DATASET_BUDGET),
-            tables: Cache::new(TABLE_BUDGET),
-            counts: Cache::new(COUNTS_BUDGET),
-            threads: Arc::new(Semaphore::new(cpus)),
-        }
+        Self::new(Arc::new(Budget::default()))
     }
 }
 
@@ -125,6 +136,24 @@ fn busy() -> ApiError {
 }
 
 impl Analyses {
+    /// Analyses whose datasets and tables reserve their memory from `memory`.
+    pub fn new(memory: Arc<Budget>) -> Self {
+        let cpus = std::thread::available_parallelism().map_or(2, |n| n.get());
+        Self {
+            definitions: Mutex::new(LruCache::new(MAX_DEFINITIONS)),
+            datasets: Cache::new(DATASET_BUDGET, MAX_ENTRIES),
+            tables: Cache::new(TABLE_BUDGET, MAX_ENTRIES),
+            counts: Cache::new(COUNTS_BUDGET, MAX_ENTRIES),
+            threads: Arc::new(Semaphore::new(cpus)),
+            memory,
+        }
+    }
+
+    /// The worker's memory budget, which uploads reserve from too.
+    pub fn memory(&self) -> &Arc<Budget> {
+        &self.memory
+    }
+
     /// The definition stored as `scripts/{sha256}`, whose bytes are hashed
     /// again when they're read.
     pub async fn definition(
@@ -152,7 +181,7 @@ impl Analyses {
         self.definitions
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(sha256.to_string(), definition.clone());
+            .put(sha256.to_string(), definition.clone());
         Ok(definition)
     }
 
@@ -173,18 +202,30 @@ impl Analyses {
         self.tables
             .get_or_load(key, || async {
                 let datasets = self.datasets(storage, &doc.pool_pda, &uploads).await?;
+                let csv_bytes: usize = datasets.iter().map(|d| d.csv.len()).sum();
+                let mut held = self
+                    .memory
+                    .reserve(
+                        csv_bytes.saturating_mul(TABLE_BYTES_PER_CSV_BYTE),
+                        MEMORY_WAIT,
+                    )
+                    .await?;
                 let (definition, scope) = (definition.clone(), scope.clone());
                 let pool_pda = doc.pool_pda.clone();
-                self.blocking(move || {
-                    let csvs: Vec<&[u8]> = datasets.iter().map(|d| d.0.as_slice()).collect();
-                    let table = Table::build(&definition, &csvs, &scope).map_err(|e| {
-                        ApiError::internal(format!("building the analysis table failed: {e}"))
-                    })?;
-                    info!(pool = %pool_pda, rows = table.rows, bytes = table.bytes,
-                        "Built an analysis table");
-                    Ok(table)
-                })
-                .await
+                let mut table = self
+                    .blocking(move || {
+                        let csvs: Vec<&[u8]> = datasets.iter().map(|d| d.csv.as_slice()).collect();
+                        let table = Table::build(&definition, &csvs, &scope).map_err(|e| {
+                            ApiError::internal(format!("building the analysis table failed: {e}"))
+                        })?;
+                        info!(pool = %pool_pda, rows = table.rows, bytes = table.bytes,
+                            "Built an analysis table");
+                        Ok(table)
+                    })
+                    .await?;
+                held.resize(&self.memory, table.bytes, MEMORY_WAIT).await?;
+                table.hold(held);
+                Ok(table)
             })
             .await
     }
@@ -204,7 +245,7 @@ impl Analyses {
                 let datasets = self.datasets(storage, &doc.pool_pda, &uploads).await?;
                 let definition = definition.clone();
                 self.blocking(move || {
-                    let csvs: Vec<&[u8]> = datasets.iter().map(|d| d.0.as_slice()).collect();
+                    let csvs: Vec<&[u8]> = datasets.iter().map(|d| d.csv.as_slice()).collect();
                     ScopeCounts::count(&definition, &csvs).map_err(|e| {
                         ApiError::internal(format!("counting the pool's scope values failed: {e}"))
                     })
@@ -236,6 +277,15 @@ impl Analyses {
         let key = (pool_pda.to_string(), upload.upload_id.clone());
         self.datasets
             .get_or_load(key, || async {
+                // The sealed copy and the decrypted one, while both live.
+                let size = upload
+                    .bytes
+                    .and_then(|b| usize::try_from(b).ok())
+                    .unwrap_or(MAX_BODY_SIZE);
+                let mut held = self
+                    .memory
+                    .reserve(size.saturating_mul(2), MEMORY_WAIT)
+                    .await?;
                 let csv = storage
                     .pools()
                     .read_dataset(pool_pda, &upload.upload_id)
@@ -250,7 +300,8 @@ impl Analyses {
                     ))
                     .into());
                 }
-                Ok(Dataset(csv))
+                held.resize(&self.memory, csv.len(), MEMORY_WAIT).await?;
+                Ok(Dataset { csv, _held: held })
             })
             .await
     }
@@ -363,6 +414,7 @@ mod tests {
             upload_id,
             sha256: hex::encode(Sha256::digest(csv.as_bytes())),
             rows: rows.len() as u64,
+            bytes: Some(csv.len() as u64),
             uploaded_by: "alice".into(),
             uploaded_at: Utc::now(),
             signature: None,
@@ -479,6 +531,47 @@ mod tests {
             .err()
             .unwrap();
         assert_eq!(refused.code, "integrity_error");
+    }
+
+    #[tokio::test]
+    async fn loads_hold_the_workers_memory_and_what_cant_fit_is_refused() {
+        let storage = Storage::new(
+            Arc::new(LocalFiles::temporary()),
+            StorageKeys::derive(&fixed_key(1)),
+            "worker-a".into(),
+        );
+        let hash = storage
+            .scripts()
+            .put(AWARDS_REPORT.as_bytes())
+            .await
+            .unwrap();
+        let memory = Arc::new(Budget::new(8 << 20));
+        let analyses = Analyses::new(memory.clone());
+        let definition = analyses.definition(&storage, &hash).await.unwrap();
+        let mut doc = pool("P1", "w1");
+        doc.initial = Some(upload(&storage, INITIAL, &[("Bank A", "Group A")]).await);
+
+        let table = analyses
+            .table(&storage, &doc, &definition, &Scope::All)
+            .await
+            .unwrap();
+        let held = memory.bytes() - memory.available();
+        assert!(held > table.bytes, "the dataset and the table: {held}");
+
+        // An upload larger than the whole budget is refused, holding nothing
+        // and leaving nothing cached.
+        let mut big = upload(&storage, "r-2", &[("Bank A", "Group A")]).await;
+        big.bytes = Some(1 << 30);
+        doc.issuances.push(big);
+        let refused = analyses
+            .table(&storage, &doc, &definition, &Scope::All)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(refused.code, "too_large_for_memory");
+        assert_eq!(memory.bytes() - memory.available(), held);
+        let ((_, datasets), (_, tables)) = analyses.usage();
+        assert_eq!((datasets, tables), (1, 1));
     }
 
     #[tokio::test]

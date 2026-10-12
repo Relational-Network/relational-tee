@@ -47,6 +47,8 @@ const TAG_LEN: usize = 16;
 
 /// Objects larger than this aren't cached.
 const MAX_CACHED_BYTES: usize = 1 << 20;
+/// The most the cache holds, across its objects.
+const CACHE_BYTES: usize = 64 << 20;
 /// Objects fetched at once when a list needs several.
 const FETCH_CONCURRENCY: usize = 16;
 /// Compare-and-swap attempts: the first try and three retries.
@@ -179,12 +181,46 @@ fn from_json<T: DeserializeOwned>(path: &str, plain: &[u8]) -> Result<T, StoreEr
         .map_err(|e| StoreError::Integrity(format!("{path} doesn't parse: {e}")))
 }
 
+/// Decrypted objects by path, bounded by count and by bytes; the least
+/// recently used go first.
+struct DocCache {
+    entries: LruCache<String, Doc>,
+    bytes: usize,
+    max_bytes: usize,
+}
+
+fn weight(path: &str, doc: &Doc) -> usize {
+    path.len() + doc.plain.len() + doc.etag.0.len()
+}
+
+impl DocCache {
+    fn put(&mut self, path: String, doc: Doc) {
+        self.bytes += weight(&path, &doc);
+        // The entry this replaced, or the one the count pushed out.
+        if let Some((old_path, old)) = self.entries.push(path, doc) {
+            self.bytes = self.bytes.saturating_sub(weight(&old_path, &old));
+        }
+        while self.bytes > self.max_bytes {
+            let Some((old_path, old)) = self.entries.pop_lru() else {
+                break;
+            };
+            self.bytes = self.bytes.saturating_sub(weight(&old_path, &old));
+        }
+    }
+
+    fn pop(&mut self, path: &str) {
+        if let Some(old) = self.entries.pop(path) {
+            self.bytes = self.bytes.saturating_sub(weight(path, &old));
+        }
+    }
+}
+
 /// A sealed container with a per-worker cache.
 pub struct Sealed {
     store: Arc<dyn ObjectStore>,
     container: &'static str,
     keys: StorageKeys,
-    cache: Mutex<LruCache<String, Doc>>,
+    cache: Mutex<DocCache>,
 }
 
 impl Sealed {
@@ -194,13 +230,27 @@ impl Sealed {
         keys: StorageKeys,
         cache_entries: usize,
     ) -> Self {
+        Self::with_cache(store, container, keys, cache_entries, CACHE_BYTES)
+    }
+
+    fn with_cache(
+        store: Arc<dyn ObjectStore>,
+        container: &'static str,
+        keys: StorageKeys,
+        cache_entries: usize,
+        cache_bytes: usize,
+    ) -> Self {
         Self {
             store,
             container,
             keys,
-            cache: Mutex::new(LruCache::new(
-                NonZeroUsize::new(cache_entries).expect("cache capacity must be > 0"),
-            )),
+            cache: Mutex::new(DocCache {
+                entries: LruCache::new(
+                    NonZeroUsize::new(cache_entries).expect("cache capacity must be > 0"),
+                ),
+                bytes: 0,
+                max_bytes: cache_bytes,
+            }),
         }
     }
 
@@ -209,13 +259,16 @@ impl Sealed {
     }
 
     fn cached(&self, path: &str) -> Option<Doc> {
-        self.cache.lock().ok()?.get(path).cloned()
+        self.cache.lock().ok()?.entries.get(path).cloned()
     }
 
     fn remember(&self, path: &str, doc: &Doc) {
-        if doc.plain.len() <= MAX_CACHED_BYTES {
-            if let Ok(mut cache) = self.cache.lock() {
+        if let Ok(mut cache) = self.cache.lock() {
+            if doc.plain.len() <= MAX_CACHED_BYTES {
                 cache.put(path.to_string(), doc.clone());
+            } else {
+                // A copy cached before it grew is no longer current.
+                cache.pop(path);
             }
         }
     }
@@ -587,5 +640,30 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(docs, ["w1", "w2"]);
         assert!(b.cached("wallets/w2.json").is_some());
+    }
+
+    #[tokio::test]
+    async fn the_cache_holds_its_bytes_not_only_its_count() {
+        let files = Arc::new(LocalFiles::temporary());
+        let a = Sealed::with_cache(files, "state", keys(), 100, 3000);
+        for i in 0..10 {
+            a.create(&format!("docs/{i}"), &[0; 1000]).await.unwrap();
+        }
+        {
+            let cache = a.cache.lock().unwrap();
+            assert_eq!(cache.entries.len(), 2, "two of 1000-odd bytes fit");
+            assert!(cache.bytes <= 3000);
+            assert!(cache.entries.contains("docs/9") && cache.entries.contains("docs/8"));
+        }
+
+        // A document that grows past what's cached drops its old copy.
+        let Created::New(etag) = a.create("docs/big", b"small").await.unwrap() else {
+            panic!("new document");
+        };
+        assert!(a.cached("docs/big").is_some());
+        a.replace("docs/big", &vec![0; MAX_CACHED_BYTES + 1], &etag)
+            .await
+            .unwrap();
+        assert!(a.cached("docs/big").is_none());
     }
 }

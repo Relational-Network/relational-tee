@@ -16,6 +16,22 @@ use crate::analysis::dates;
 /// Maximum number of validation errors returned per request.
 pub const MAX_VALIDATION_ERRORS: usize = 100;
 
+/// The longest value a field holds.
+pub const MAX_FIELD_BYTES: usize = 4096;
+
+/// How much of a column name an error repeats.
+const SHOWN_CHARS: usize = 64;
+
+/// `text`, cut short for an error message.
+fn shown(text: &str) -> String {
+    let mut chars = text.chars();
+    let mut out: String = chars.by_ref().take(SHOWN_CHARS).collect();
+    if chars.next().is_some() {
+        out.push('…');
+    }
+    out
+}
+
 /// A column's type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -116,7 +132,8 @@ pub fn validate_csv_bytes(data: &[u8], schema: &[FieldSchema]) -> ValidationSumm
     let mut index = HashMap::new();
     for (i, header) in headers.iter().enumerate() {
         if index.insert(header.trim(), i).is_some() {
-            errors.push(0, header, format!("Duplicate column: {header}"));
+            let header = shown(header);
+            errors.push(0, &header, format!("Duplicate column: {header}"));
         }
     }
     let names: HashSet<&str> = schema.iter().map(|f| f.name.as_str()).collect();
@@ -131,9 +148,10 @@ pub fn validate_csv_bytes(data: &[u8], schema: &[FieldSchema]) -> ValidationSumm
     }
     for header in headers.iter() {
         if !names.contains(header.trim()) {
+            let header = shown(header);
             errors.push(
                 0,
-                header,
+                &header,
                 format!("Unexpected column not in schema: {header}"),
             );
         }
@@ -164,6 +182,9 @@ pub fn validate_csv_bytes(data: &[u8], schema: &[FieldSchema]) -> ValidationSumm
 fn check_value(value: &str, field: &FieldSchema) -> Option<String> {
     if value.is_empty() {
         return (!field.nullable).then(|| "field is required".to_string());
+    }
+    if value.len() > MAX_FIELD_BYTES {
+        return Some(format!("value is over {MAX_FIELD_BYTES} bytes"));
     }
     match field.field_type {
         FieldType::Text => None,
@@ -274,6 +295,24 @@ pub(crate) mod tests {
             .errors
             .iter()
             .any(|e| e.message == "field is required"));
+    }
+
+    #[test]
+    fn values_and_the_column_names_errors_repeat_are_bounded() {
+        let long = "a".repeat(MAX_FIELD_BYTES + 1);
+        let result = check(&[AWARDS_HEADER, &ROW.replace("Merit", &long)]);
+        assert!(result
+            .errors
+            .iter()
+            .any(|e| e.field == "Award Grade" && e.message == "value is over 4096 bytes"));
+        let fits = check(&[AWARDS_HEADER, &ROW.replace("Merit", &long[1..])]);
+        assert!(fits.valid, "{:?}", fits.errors);
+
+        let header = format!("{AWARDS_HEADER},{long}");
+        let result = check(&[&header, &format!("{ROW},x")]);
+        let unexpected = &result.errors[0];
+        assert_eq!(unexpected.field.chars().count(), 65);
+        assert!(unexpected.message.len() < 200);
     }
 
     /// A quoted newline, CRLF endings, a quoted empty value and a blank

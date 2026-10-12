@@ -58,7 +58,7 @@ pub struct SkrSidecar {
 impl SkrSidecar {
     pub fn new(config: SkrConfig) -> Self {
         Self {
-            http: HttpClient::new(),
+            http: HttpClient::new().with_max_body(1 << 20),
             config,
         }
     }

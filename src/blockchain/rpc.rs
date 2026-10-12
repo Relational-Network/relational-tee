@@ -154,7 +154,7 @@ impl JsonRpcClient {
     /// Create a new client for the given RPC URL.
     pub fn new(url: &str, commitment: &str) -> Self {
         Self {
-            client: HttpClient::new(),
+            client: HttpClient::new().with_max_body(16 << 20),
             url: url.to_string(),
             commitment: commitment.to_string(),
             next_id: AtomicU64::new(1),

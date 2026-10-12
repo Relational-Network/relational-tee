@@ -31,6 +31,9 @@ pub const MAX_SEARCH_LIMIT: u32 = 100;
 pub const DEFAULT_SEARCH_LIMIT: u32 = 20;
 /// How many SQLite steps run between deadline checks.
 pub(super) const DEADLINE_STEPS: i32 = 1000;
+/// The most options a multi-select lists, in its option query's order: a
+/// column with more distinct values suits a search.
+pub const MAX_OPTIONS: usize = 1000;
 
 /// A query, as the browser sends it.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, ToSchema)]
@@ -347,6 +350,17 @@ pub struct OptionValue {
     pub count: u64,
 }
 
+impl FilterOptions {
+    /// About what these options hold in memory.
+    pub fn bytes(&self) -> usize {
+        let text = |s: &Option<String>| 24 + s.as_ref().map_or(0, String::len);
+        match self {
+            Self::DateRange { min, max } => text(min) + text(max),
+            Self::Values(values) => values.iter().map(|v| 32 + v.value.len()).sum(),
+        }
+    }
+}
+
 fn bind(statement: &mut Statement<'_>, name: &str, value: &dyn ToSql) -> rusqlite::Result<()> {
     match statement.parameter_index(name)? {
         Some(index) => statement.raw_bind_parameter(index, value),
@@ -424,6 +438,13 @@ fn read_options(
     }
     let mut values = Vec::new();
     while let Some(row) = cursor.next()? {
+        if values.len() == MAX_OPTIONS {
+            tracing::warn!(
+                limit = MAX_OPTIONS,
+                "A multi-select has more options than it lists"
+            );
+            break;
+        }
         values.push(OptionValue {
             value: row.get(0)?,
             count: u64::try_from(row.get::<_, i64>(1)?).unwrap_or(0),
@@ -724,6 +745,21 @@ mod tests {
             .iter()
             .map(|r| r[name].as_str().unwrap_or_default().to_string())
             .collect()
+    }
+
+    #[test]
+    fn a_multi_select_lists_at_most_its_limit_of_options() {
+        let awards: Vec<String> = (0..=MAX_OPTIONS).map(|i| format!("Award {i:04}")).collect();
+        let rows: Vec<[&str; 6]> = awards
+            .iter()
+            .map(|award| ["000123", "Bravo", "Bank A", "Group A", award, "01/01/2026"])
+            .collect();
+        let csv = upload(&rows);
+        let table = Table::build(&awards_report(), &[&csv], &Scope::All).unwrap();
+        let FilterOptions::Values(values) = &table.options()["award"] else {
+            panic!("award is a multi-select");
+        };
+        assert_eq!(values.len(), MAX_OPTIONS);
     }
 
     #[test]

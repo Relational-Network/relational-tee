@@ -11,8 +11,10 @@
 //! `rate_limited` with `Retry-After`.
 //!
 //! Each request also has a body size and a time limit, larger on the upload
-//! routes ([`REQUESTS`], [`UPLOADS`]); request headers are bounded in size
-//! and must arrive in time ([`http_settings`]); and a worker serves at most
+//! routes ([`REQUESTS`], [`UPLOADS`]), and an upload waits for the memory it
+//! needs before its body is read ([`admit_upload`]); request headers are
+//! bounded in size and must arrive in time, and HTTP/2 connections in their
+//! open requests ([`http_settings`]); and a worker serves at most
 //! [`MAX_CONNECTIONS`] connections at once ([`ConnectionLimit`]).
 
 use std::future::Future;
@@ -39,6 +41,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::warn;
 
+use crate::budget::Budget;
 use crate::config::{RateLimits, MAX_BODY_SIZE};
 use crate::error::ApiError;
 
@@ -213,6 +216,10 @@ pub const HEADER_READ_TIME: Duration = Duration::from_secs(10);
 /// client that vanished gives its place back.
 pub const H2_KEEP_ALIVE: Duration = Duration::from_secs(20);
 
+/// The most requests one HTTP/2 connection has open at once. A browser
+/// needs a few; hyper's default is 200.
+pub const H2_MAX_STREAMS: u32 = 64;
+
 /// hyper's settings for client connections. hyper already refuses more than
 /// 100 HTTP/1.1 header fields with `431`, and setting that limit explicitly
 /// would cost a heap allocation per request. TLS handshakes get the TLS
@@ -228,7 +235,37 @@ pub fn http_settings(builder: &mut auto::Builder<TokioExecutor>) {
         .timer(TokioTimer::new())
         .keep_alive_interval(H2_KEEP_ALIVE)
         .keep_alive_timeout(H2_KEEP_ALIVE)
-        .max_header_list_size(MAX_HEADER_BYTES as u32);
+        .max_header_list_size(MAX_HEADER_BYTES as u32)
+        .max_concurrent_streams(H2_MAX_STREAMS);
+}
+
+/// What an upload holds at most, per byte of its body: the sealed body, the
+/// CSV it opens to, and the CSV sealed for storage.
+const UPLOAD_COPIES: usize = 3;
+
+/// How long an upload waits for memory before it gets `503`.
+const UPLOAD_MEMORY_WAIT: Duration = Duration::from_secs(10);
+
+/// Middleware for the upload routes: reserve the memory an upload holds
+/// before its body is read, and hold it until the response. A body without
+/// a `Content-Length` reserves for the largest an upload may send.
+pub async fn admit_upload(
+    State(memory): State<Arc<Budget>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let length = request
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok()?.parse::<usize>().ok())
+        .map_or(UPLOADS.body, |n| n.min(UPLOADS.body));
+    match memory
+        .reserve(length.saturating_mul(UPLOAD_COPIES), UPLOAD_MEMORY_WAIT)
+        .await
+    {
+        Ok(_held) => next.run(request).await,
+        Err(e) => e.into_response(),
+    }
 }
 
 /// How many connections one worker serves at once.
@@ -539,6 +576,51 @@ mod tests {
         assert_eq!(upload.status(), StatusCode::OK);
         let over = send("/upload", UPLOADS.body + 1).await.unwrap();
         assert_eq!(over.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn uploads_wait_for_the_memory_they_hold() {
+        let memory = Arc::new(Budget::new(3 << 20));
+        let app = Router::new()
+            .route(
+                "/upload",
+                post(|body: Bytes| async move { body.len().to_string() }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                memory.clone(),
+                admit_upload,
+            ))
+            .layer(axum::middleware::from_fn(
+                crate::request_id::request_context,
+            ));
+        let send = |length: Option<usize>| {
+            let mut request = Request::post("/upload");
+            if let Some(length) = length {
+                request = request.header(header::CONTENT_LENGTH, length);
+            }
+            app.clone().oneshot(
+                request
+                    .body(Body::from(vec![0; length.unwrap_or(1)]))
+                    .unwrap(),
+            )
+        };
+
+        let fits = send(Some(1 << 20)).await.unwrap();
+        assert_eq!(fits.status(), StatusCode::OK);
+        assert_eq!(memory.available(), memory.bytes(), "given back");
+
+        // While the memory is taken, an upload waits, then gets 503.
+        let taken = memory.reserve(1 << 20, Duration::ZERO).await.unwrap();
+        let busy = send(Some(1 << 20)).await.unwrap();
+        assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(busy.headers()[header::RETRY_AFTER], "1");
+        assert_eq!(error_body(busy).await["code"], "worker_busy");
+        drop(taken);
+
+        // A body without a length reserves for the largest upload.
+        let unknown = send(None).await.unwrap();
+        assert_eq!(unknown.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(error_body(unknown).await["code"], "too_large_for_memory");
     }
 
     #[tokio::test(start_paused = true)]

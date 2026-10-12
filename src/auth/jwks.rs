@@ -83,7 +83,9 @@ impl HttpKeySource {
     pub fn new(url: String) -> Self {
         Self {
             url,
-            client: HttpClient::new().with_timeout(Duration::from_secs(10)),
+            client: HttpClient::new()
+                .with_timeout(Duration::from_secs(10))
+                .with_max_body(1 << 20),
         }
     }
 }

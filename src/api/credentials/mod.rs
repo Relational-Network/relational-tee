@@ -286,6 +286,7 @@ pub(crate) mod tests {
             upload_id: "first".into(),
             sha256: sha256_hex(CSV),
             rows: 2,
+            bytes: Some(CSV.len() as u64),
             uploaded_by: uploaded_by.into(),
             uploaded_at: chrono::Utc::now(),
             signature: None,
@@ -423,6 +424,7 @@ pub(crate) mod tests {
                     upload_id: record_id.clone(),
                     sha256: sha256_hex(CSV),
                     rows: 2,
+                    bytes: Some(CSV.len() as u64),
                     uploaded_by: admin.user_id.clone(),
                     uploaded_at: chrono::Utc::now(),
                     signature: None,
@@ -459,6 +461,48 @@ pub(crate) mod tests {
             .unwrap();
         let entry = doc.upload(&record_id).expect("the issuance is recorded");
         assert_eq!(entry.commitment_bytes(), Some(earlier));
+    }
+
+    #[tokio::test]
+    async fn an_issuance_that_would_overfill_the_pool_burns_nothing() {
+        let worker = worker();
+        let admin = worker.admin("oid-admin").await;
+        let mut initial = initial_upload(&admin.user_id);
+        initial.bytes = Some(crate::config::MAX_POOL_BYTES - CSV.len() as u64 + 1);
+        let pool_pda = worker.pool(&admin, Some(initial)).await;
+        worker.holds_append_drts(&admin, &pool_pda, 1);
+        let path = format!("/v1/drt/pools/{pool_pda}/issue");
+        let key = uuid::Uuid::new_v4().to_string();
+        let sealed = worker.sealed(&admin, &path, &key, CSV);
+        let (status, _, err) = send(&worker.app, upload(&path, &key, &admin.token, sealed)).await;
+        assert_eq!(
+            (status, err["code"].as_str()),
+            (StatusCode::PAYLOAD_TOO_LARGE, Some("pool_full")),
+            "{err}"
+        );
+        assert!(worker.chain.sent().is_empty(), "nothing burned");
+
+        // One byte less fits.
+        worker
+            .storage
+            .pools()
+            .update::<ApiError>(&pool_pda.to_string(), |doc| {
+                if let Some(initial) = doc.initial.as_mut() {
+                    initial.bytes = initial.bytes.map(|b| b - 1);
+                }
+                Ok(Change::Changed)
+            })
+            .await
+            .unwrap();
+        let key = uuid::Uuid::new_v4().to_string();
+        let sealed = worker.sealed(&admin, &path, &key, CSV);
+        worker
+            .chain
+            .lands
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let (status, _, issued) =
+            send(&worker.app, upload(&path, &key, &admin.token, sealed)).await;
+        assert_eq!(status, StatusCode::OK, "{issued}");
     }
 
     #[tokio::test]

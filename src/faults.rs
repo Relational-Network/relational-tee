@@ -793,7 +793,9 @@ async fn randomised(s: &Suite, pool: &str, runs: u32) -> Result<(), String> {
 async fn setup(base: String) -> Result<Suite, String> {
     let lookup = |key: &str| std::env::var(key).ok().filter(|v| !v.is_empty());
     let api = Api {
-        http: HttpClient::new().with_timeout(Duration::from_secs(180)),
+        http: HttpClient::new()
+            .with_timeout(Duration::from_secs(180))
+            .with_max_body(64 << 20),
         base,
     };
     let network = crate::blockchain::types::network_config_from_env();
