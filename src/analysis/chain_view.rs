@@ -752,8 +752,27 @@ mod tests {
     #[tokio::test]
     async fn a_request_that_gives_up_leaves_the_read_running() {
         let s = setup(Timing::default());
-        let impatient = tokio::time::timeout(Duration::from_micros(1), s.verify()).await;
-        assert!(impatient.is_err());
+        let mut request = Box::pin(s.verify());
+        // Give up on the request in the poll that starts the read: the read
+        // runs on a task of its own, which this single-threaded runtime
+        // can't run before the request is dropped.
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut request => panic!("answered before the read ran"),
+                () = std::future::ready(()) => {}
+            }
+            if s.checks
+                .lock()
+                .get(&s.doc.pool_pda)
+                .is_some_and(|p| p.refreshing)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        drop(request);
+        assert_eq!(s.chain.called(READ), 0, "the read hadn't run");
         for _ in 0..100 {
             if s.checks
                 .reading(&s.doc.pool_pda, &s.pda, &s.grant)
