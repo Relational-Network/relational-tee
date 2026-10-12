@@ -26,10 +26,12 @@ const UNIT: usize = 64 << 10;
 /// The budget when `MEMORY_BUDGET_MIB` doesn't set one.
 pub const DEFAULT_MIB: usize = 2048;
 
+/// The units that hold `bytes`, rounded up, and at least one.
 fn units(bytes: usize) -> usize {
     bytes.div_ceil(UNIT).max(1)
 }
 
+/// `503 worker_busy`: the bytes didn't free up in time.
 fn busy() -> ApiError {
     let mut e = ApiError::service_unavailable(
         "the worker's memory is taken by other requests; retry shortly",
@@ -60,6 +62,8 @@ pub struct Reservation {
 }
 
 impl Budget {
+    /// A budget of `bytes`, rounded up to whole units, and at most what a
+    /// semaphore can count.
     pub fn new(bytes: usize) -> Self {
         let units = units(bytes).min(Semaphore::MAX_PERMITS);
         Self {
@@ -68,6 +72,7 @@ impl Budget {
         }
     }
 
+    /// The whole budget, in bytes.
     #[cfg(test)]
     pub fn bytes(&self) -> usize {
         self.bytes

@@ -86,6 +86,8 @@ struct Failure {
 }
 
 impl Failure {
+    /// The failure as a request's error: `503 rpc_unavailable`, with a
+    /// `Retry-After` if the node was rate-limiting.
     fn error(&self) -> ApiError {
         let mut error = ApiError::rpc_unavailable(self.message.clone());
         error.retry_after = self.retry_after;
@@ -180,6 +182,7 @@ fn not_live() -> ApiError {
 }
 
 impl GrantChecks {
+    /// No readings yet, trusted as `timing` says once they're read.
     pub fn new(timing: Timing) -> Self {
         Self {
             timing,
@@ -188,6 +191,8 @@ impl GrantChecks {
         }
     }
 
+    /// The pools' readings, even after a panic while another caller held
+    /// them.
     fn lock(&self) -> MutexGuard<'_, HashMap<String, PoolState>> {
         self.pools.lock().unwrap_or_else(PoisonError::into_inner)
     }

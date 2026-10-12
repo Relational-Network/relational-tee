@@ -34,6 +34,7 @@ pub const MINT_SIZE: u64 = 82;
 
 const MEMO_PROGRAM_ID_STR: &str = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr";
 
+/// The SPL Memo program, whose instruction names each bump's generation.
 fn memo_program_id() -> &'static Pubkey {
     static ID: OnceLock<Pubkey> = OnceLock::new();
     ID.get_or_init(|| Pubkey::from_str(MEMO_PROGRAM_ID_STR).expect("valid Memo program ID"))
@@ -77,6 +78,7 @@ fn mint_to(mint: &Pubkey, account: &Pubkey, authority: &Pubkey, amount: u64) -> 
     }
 }
 
+/// A Memo instruction recording `text`, with no accounts to sign it.
 fn memo(text: &str) -> Instruction {
     Instruction {
         program_id: *memo_program_id(),

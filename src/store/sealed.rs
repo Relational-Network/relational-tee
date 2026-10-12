@@ -189,11 +189,14 @@ struct DocCache {
     max_bytes: usize,
 }
 
+/// The bytes a cached object counts for: its path, plaintext and ETag.
 fn weight(path: &str, doc: &Doc) -> usize {
     path.len() + doc.plain.len() + doc.etag.0.len()
 }
 
 impl DocCache {
+    /// Cache `doc` as `path`'s, then drop the least recently used objects
+    /// until the cache is within its bytes.
     fn put(&mut self, path: String, doc: Doc) {
         self.bytes += weight(&path, &doc);
         // The entry this replaced, or the one the count pushed out.
@@ -208,6 +211,7 @@ impl DocCache {
         }
     }
 
+    /// Drop `path`'s object, if it's cached.
     fn pop(&mut self, path: &str) {
         if let Some(old) = self.entries.pop(path) {
             self.bytes = self.bytes.saturating_sub(weight(path, &old));
@@ -224,6 +228,8 @@ pub struct Sealed {
 }
 
 impl Sealed {
+    /// The sealed `container` of `store`, caching up to `cache_entries`
+    /// decrypted objects and [`CACHE_BYTES`] of them.
     pub fn new(
         store: Arc<dyn ObjectStore>,
         container: &'static str,
@@ -233,6 +239,7 @@ impl Sealed {
         Self::with_cache(store, container, keys, cache_entries, CACHE_BYTES)
     }
 
+    /// [`Self::new`], with a cache of `cache_bytes`.
     fn with_cache(
         store: Arc<dyn ObjectStore>,
         container: &'static str,
@@ -254,14 +261,18 @@ impl Sealed {
         }
     }
 
+    /// The keyed hash that names `value` in an index's path.
     pub fn index_hash(&self, value: &str) -> String {
         self.keys.index_hash(value)
     }
 
+    /// The cached copy of `path`, if there is one.
     fn cached(&self, path: &str) -> Option<Doc> {
         self.cache.lock().ok()?.entries.get(path).cloned()
     }
 
+    /// Cache `doc` as `path`'s current copy, unless it's over
+    /// [`MAX_CACHED_BYTES`]: then drop any earlier copy instead.
     fn remember(&self, path: &str, doc: &Doc) {
         if let Ok(mut cache) = self.cache.lock() {
             if doc.plain.len() <= MAX_CACHED_BYTES {
@@ -273,6 +284,7 @@ impl Sealed {
         }
     }
 
+    /// Drop any cached copy of `path`.
     fn forget(&self, path: &str) {
         if let Ok(mut cache) = self.cache.lock() {
             cache.pop(path);

@@ -156,6 +156,7 @@ impl Analyses {
         Self::with_threads(memory, Threads::default())
     }
 
+    /// [`Self::new`], with CPU-heavy work on `threads`.
     pub fn with_threads(memory: Arc<Budget>, threads: Threads) -> Self {
         Self {
             definitions: Mutex::new(LruCache::new(MAX_DEFINITIONS)),
@@ -286,6 +287,10 @@ impl Analyses {
         Ok(datasets)
     }
 
+    /// The decrypted CSV of `upload`, cached by pool and upload, and checked
+    /// against its digest. Loading it reserves memory for the sealed and the
+    /// decrypted copy, by the upload's recorded size or, without one, the
+    /// largest an upload can be.
     async fn dataset(
         &self,
         storage: &Storage,

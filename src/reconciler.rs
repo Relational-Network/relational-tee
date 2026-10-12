@@ -132,6 +132,9 @@ pub async fn sweep_receipts(
     Ok(swept)
 }
 
+/// Sweep `receipts`, all of one wallet's, a batch to a transaction, and
+/// return how many it marked swept. A wallet that can't pay the fee yet is
+/// left until it can.
 async fn sweep_wallet(
     storage: &Storage,
     solana: &SolanaClient,

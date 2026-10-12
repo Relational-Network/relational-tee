@@ -47,6 +47,7 @@ impl std::fmt::Display for Stopped {
 impl std::error::Error for Stopped {}
 
 impl Stop {
+    /// Stop at `deadline`.
     pub fn at(deadline: Instant) -> Self {
         Self {
             deadline,
@@ -54,14 +55,17 @@ impl Stop {
         }
     }
 
+    /// Stop once `time` has passed.
     pub fn after(time: Duration) -> Self {
         Self::at(Instant::now() + time)
     }
 
+    /// Whether the work should stop now.
     pub fn stopped(&self) -> bool {
         self.abandoned.load(Ordering::Relaxed) || Instant::now() >= self.deadline
     }
 
+    /// [`Self::stopped`] as an error, for `?`.
     pub fn check(&self) -> Result<(), Stopped> {
         if self.stopped() {
             Err(Stopped)
@@ -70,6 +74,7 @@ impl Stop {
         }
     }
 
+    /// Stop the work now, whatever its deadline: nobody waits for it.
     pub fn abandon(&self) {
         self.abandoned.store(true, Ordering::Relaxed);
     }
@@ -84,6 +89,7 @@ impl Drop for AbandonOnDrop {
     }
 }
 
+/// `503 analysis_busy`: no thread freed up within [`QUEUE_WAIT`].
 fn busy() -> ApiError {
     let mut e =
         ApiError::service_unavailable("the worker is busy with other analyses; retry shortly")
@@ -105,6 +111,7 @@ impl Default for Threads {
 }
 
 impl Threads {
+    /// Threads for `count` jobs at a time.
     pub fn new(count: usize) -> Self {
         Self {
             permits: Arc::new(Semaphore::new(count)),

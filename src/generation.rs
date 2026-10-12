@@ -44,6 +44,7 @@ const ATTEMPTS: usize = 4;
 /// Seconds a client waits while a pool settles.
 const SETTLING_RETRY_SECS: u64 = 2;
 
+/// `503 pool_settling`: the pool's last change is still being anchored.
 pub fn settling() -> ApiError {
     let mut e = ApiError::service_unavailable(
         "the pool's last change is still being anchored on-chain; retry shortly",
@@ -53,6 +54,8 @@ pub fn settling() -> ApiError {
     e
 }
 
+/// `503 pool_records_stale`, with an alert: `doc` is behind the counter's
+/// generation `chain`, so it was restored from before a change.
 fn stale(doc: &PoolDoc, chain: u64) -> ApiError {
     error!(
         alert = "pool_records_stale",
@@ -81,6 +84,7 @@ pub fn check(doc: &PoolDoc, chain: u64) -> Result<(), ApiError> {
     }
 }
 
+/// The pool's owner, whose wallet mints its counter.
 fn owner(doc: &PoolDoc) -> Result<Pubkey, ApiError> {
     Pubkey::from_str(&doc.owner_pubkey)
         .map_err(|_| ApiError::internal("a pool document has an invalid owner"))

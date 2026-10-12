@@ -33,6 +33,7 @@ pub struct Receipt {
     pub sweep_signature: Option<String>,
 }
 
+/// Where the receipt of `seed` is kept. A seed that isn't an ID names none.
 fn path(seed: &str) -> Result<String, StoreError> {
     id(seed)
         .map(|seed| format!("receipts/{seed}.json"))
@@ -45,6 +46,7 @@ pub struct Receipts<'a> {
 }
 
 impl<'a> Receipts<'a> {
+    /// The receipts kept in `s`.
     pub(crate) fn new(s: &'a Storage) -> Self {
         Self { s }
     }

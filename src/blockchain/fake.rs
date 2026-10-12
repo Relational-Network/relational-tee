@@ -86,6 +86,7 @@ pub struct FakeChain {
 }
 
 impl FakeChain {
+    /// Finalize the transaction `signature`, as having `succeeded` or not.
     pub fn land(&self, signature: &str, succeeded: bool) {
         self.landed
             .lock()
@@ -241,6 +242,9 @@ impl FakeChain {
         applied
     }
 
+    /// Apply `tx`'s instructions in order, and whether all succeeded. The
+    /// first that fails stops it, leaving the ones before it applied for
+    /// [`Self::apply`] to undo.
     fn apply_all(&self, tx: &Transaction) -> bool {
         let keys = &tx.message.account_keys;
         let system = |program: u8, data: &[u8], op: [u8; 4]| {

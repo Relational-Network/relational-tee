@@ -179,6 +179,8 @@ pub fn validate_csv_bytes(data: &[u8], schema: &[FieldSchema]) -> ValidationSumm
     summary(errors, rows_validated)
 }
 
+/// What's wrong with `value` for `field`, if anything: a required value
+/// missing, one over [`MAX_FIELD_BYTES`], or a date that isn't DD/MM/YYYY.
 fn check_value(value: &str, field: &FieldSchema) -> Option<String> {
     if value.is_empty() {
         return (!field.nullable).then(|| "field is required".to_string());

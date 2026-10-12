@@ -17,6 +17,7 @@ const NS_REVOCATION: Uuid = Uuid::from_u128(0xd37798d5_045e_44d7_9292_e56e6484fc
 const NS_RECEIPT: Uuid = Uuid::from_u128(0x97faf768_8e4b_44d4_afd4_1d62354656da);
 const NS_GENERATION: Uuid = Uuid::from_u128(0x3c1d7a52_9b0e_4f6a_8d21_5e4b7c90a1f3);
 
+/// The UUID in `namespace` of `parts`, joined by newlines.
 fn v5(namespace: &Uuid, parts: &[&str]) -> Uuid {
     Uuid::new_v5(namespace, parts.join("\n").as_bytes())
 }

@@ -95,6 +95,7 @@ fn multipart_error(e: MultipartError) -> ApiError {
 }
 
 impl SealedUpload {
+    /// The ciphertext's length: the plaintext's and the AEAD tag's.
     pub fn ciphertext_len(&self) -> usize {
         self.ct.len()
     }

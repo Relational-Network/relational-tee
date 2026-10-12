@@ -67,6 +67,7 @@ pub struct EstimateFeeResponse {
     pub deposit_sol: String,
 }
 
+/// `lamports` as SOL, to nine decimals, for display.
 fn sol(lamports: u64) -> String {
     format!("{:.9} SOL", lamports as f64 / 1_000_000_000.0)
 }
