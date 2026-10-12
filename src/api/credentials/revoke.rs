@@ -5,6 +5,8 @@
 //!
 //! - `POST /v1/drt/pools/{pool_pda}/revoke` — revoke credential(s)
 
+use std::collections::HashSet;
+
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -26,6 +28,15 @@ use crate::storage::Change;
 
 use super::{parse_pda, pool_not_found};
 
+/// The most credential IDs one request names.
+const MAX_CREDENTIAL_IDS: usize = 1000;
+
+/// The longest credential ID, in bytes: `initial`, or an upload's UUID.
+const MAX_CREDENTIAL_ID_LEN: usize = 64;
+
+/// The longest reason, in characters.
+const MAX_REASON_CHARS: usize = 500;
+
 // ============================================================================
 // Request / Response types
 // ============================================================================
@@ -35,10 +46,13 @@ use super::{parse_pda, pool_not_found};
 pub struct RevokeCredentialsRequest {
     /// Wallet ID of the pool owner.
     pub wallet_id: String,
-    /// Credential record IDs to revoke (`initial`, or UUIDs from `/issue` responses).
+    /// Credential record IDs to revoke (`initial`, or UUIDs from `/issue`
+    /// responses), each 1 to 64 bytes.
+    #[schema(min_items = 1, max_items = 1000)]
     pub credential_ids: Vec<String>,
     /// Optional reason for revocation.
     #[serde(default)]
+    #[schema(max_length = 500)]
     pub reason: Option<String>,
 }
 
@@ -48,6 +62,42 @@ pub struct RevokeCredentialsResponse {
     /// Number of credentials revoked (each distinct ID counts once, whether
     /// or not it was already revoked).
     pub revoked: usize,
+}
+
+/// The distinct credential IDs `payload` names, in the order it first names
+/// them, or why the request is refused.
+fn distinct_ids(payload: &RevokeCredentialsRequest) -> Result<Vec<String>, ApiError> {
+    let count = payload.credential_ids.len();
+    if count == 0 || count > MAX_CREDENTIAL_IDS {
+        return Err(ApiError::bad_request(format!(
+            "credential_ids must name 1 to {MAX_CREDENTIAL_IDS} credentials"
+        )));
+    }
+    if payload
+        .credential_ids
+        .iter()
+        .any(|cid| cid.is_empty() || cid.len() > MAX_CREDENTIAL_ID_LEN)
+    {
+        return Err(ApiError::bad_request(format!(
+            "each credential ID must be 1 to {MAX_CREDENTIAL_ID_LEN} bytes"
+        )));
+    }
+    if payload
+        .reason
+        .as_ref()
+        .is_some_and(|reason| reason.chars().count() > MAX_REASON_CHARS)
+    {
+        return Err(ApiError::bad_request(format!(
+            "reason must be at most {MAX_REASON_CHARS} characters"
+        )));
+    }
+    let mut seen = HashSet::new();
+    Ok(payload
+        .credential_ids
+        .iter()
+        .filter(|cid| seen.insert(cid.as_str()))
+        .cloned()
+        .collect())
 }
 
 // ============================================================================
@@ -63,7 +113,7 @@ pub struct RevokeCredentialsResponse {
     path = "/v1/drt/pools/{pool_pda}/revoke",
     tag = "Credentials",
     summary = "Revoke credentials",
-    description = "Revoke one or more credentials by record ID. Revocations are recorded in the pool's document. Needs `pools:write`, and the caller's wallet must own the pool.",
+    description = "Revoke 1 to 1,000 credentials by record ID, with an optional reason of up to 500 characters. Revocations are recorded in the pool's document. Needs `pools:write`, and the caller's wallet must own the pool.",
     security(("bearer_auth" = [])),
     params(
         ("pool_pda" = String, Path, description = "Pool PDA address (base58)"),
@@ -92,22 +142,13 @@ pub async fn revoke_credentials(
 ) -> Result<Response, ApiError> {
     caller.require(Permission::PoolsWrite)?;
     let mut op = open_or_replay!(state, &caller.user_id, request, &bytes);
-    if payload.credential_ids.is_empty() {
-        return Err(ApiError::bad_request("credential_ids must not be empty"));
-    }
+    let credential_ids = distinct_ids(&payload)?;
     let pool_pda = parse_pda(&pool_pda_str)?;
 
     // Verify ownership.
     let (wallet, _) = load_wallet_keypair(&state, &payload.wallet_id, &caller.user_id).await?;
     let pool = fetch_pool(state.solana_client.rpc(), &pool_pda).await?;
     verify_pool_ownership(&pool, &wallet)?;
-
-    let mut credential_ids: Vec<String> = Vec::with_capacity(payload.credential_ids.len());
-    for cid in &payload.credential_ids {
-        if !credential_ids.contains(cid) {
-            credential_ids.push(cid.clone());
-        }
-    }
 
     let now = Utc::now();
     let mut newly_revoked = 0;

@@ -498,6 +498,74 @@ pub(crate) mod tests {
         assert_eq!(status, StatusCode::OK, "{revoked}");
     }
 
+    #[tokio::test]
+    async fn a_revocation_is_bounded_before_the_chain_is_read_and_counts_each_id_once() {
+        let worker = worker();
+        let owner = worker.admin("oid-owner").await;
+        let pool_pda = worker
+            .pool(&owner, Some(initial_upload(&owner.user_id)))
+            .await;
+        let revoke = |pool: &Pubkey, ids: Value, reason: Value| {
+            let body =
+                json!({ "wallet_id": owner.wallet_id, "credential_ids": ids, "reason": reason });
+            Request::post(format!("/v1/drt/pools/{pool}/revoke"))
+                .header(header::AUTHORIZATION, format!("Bearer {}", owner.token))
+                .header(&KEY_HEADER, uuid::Uuid::new_v4().to_string())
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+
+        // A pool the chain doesn't hold is 404 once the chain is read, so
+        // these are refused before that.
+        let unknown = Pubkey::new_unique();
+        let (status, _, err) =
+            send(&worker.app, revoke(&unknown, json!([INITIAL]), Value::Null)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{err}");
+        let too_many: Vec<String> = (0..=1000).map(|i| i.to_string()).collect();
+        for (ids, reason) in [
+            (json!([]), Value::Null),
+            (json!(too_many), Value::Null),
+            (json!([""]), Value::Null),
+            (json!(["x".repeat(65)]), Value::Null),
+            (json!([INITIAL]), json!("r".repeat(501))),
+        ] {
+            let (status, _, err) = send(&worker.app, revoke(&unknown, ids, reason)).await;
+            assert_eq!(
+                (status, err["code"].as_str()),
+                (StatusCode::BAD_REQUEST, Some("bad_request")),
+                "{err}"
+            );
+        }
+
+        // At the limits it goes through, and a repeated ID counts once.
+        let (status, _, revoked) = send(
+            &worker.app,
+            revoke(
+                &pool_pda,
+                json!(vec![INITIAL; 1000]),
+                json!("r".repeat(500)),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{revoked}");
+        assert_eq!(revoked["revoked"], 1);
+        let doc = worker
+            .storage
+            .pools()
+            .get(&pool_pda.to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(doc.revocations.len(), 1);
+        let (status, _, err) = send(
+            &worker.app,
+            revoke(&pool_pda, json!(["x".repeat(64)]), Value::Null),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{err}");
+    }
+
     /// `admin`'s request to create a pool with `analysis`.
     fn create_pool(admin: &Admin, analysis: Value) -> Request<Body> {
         let body = json!({
