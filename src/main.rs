@@ -14,6 +14,20 @@
 //! just dev    # dev build: plain HTTP on 127.0.0.1:8443
 //! ```
 
+#![deny(unsafe_code)]
+// Production code turns bad input into errors; `expect` only states an
+// invariant. Tests assert as they like.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::panic,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::string_slice
+    )
+)]
+
 mod analysis;
 mod api;
 mod attestation;
