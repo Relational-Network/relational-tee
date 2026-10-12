@@ -790,6 +790,9 @@ async fn randomised(s: &Suite, pool: &str, runs: u32) -> Result<(), String> {
     Ok(())
 }
 
+/// The suite against the stack at `base`: its transport key from the
+/// attestation, the owner signed in with a dev token, and the owner's
+/// wallet, made if there's none.
 async fn setup(base: String) -> Result<Suite, String> {
     let lookup = |key: &str| std::env::var(key).ok().filter(|v| !v.is_empty());
     let api = Api {

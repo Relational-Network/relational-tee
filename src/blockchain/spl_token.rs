@@ -20,11 +20,13 @@ use crate::error::ApiError;
 
 // ── Well-known program IDs, for every module ────────────────────────
 
+/// The SPL Token program.
 pub(crate) fn spl_token_program_id() -> &'static Pubkey {
     static ID: OnceLock<Pubkey> = OnceLock::new();
     ID.get_or_init(|| Pubkey::from_str(TOKEN_PROGRAM_ID_STR).expect("valid SPL Token ID"))
 }
 
+/// The Associated Token Account program.
 pub(crate) fn ata_program_id() -> &'static Pubkey {
     static ID: OnceLock<Pubkey> = OnceLock::new();
     ID.get_or_init(|| {
@@ -32,6 +34,7 @@ pub(crate) fn ata_program_id() -> &'static Pubkey {
     })
 }
 
+/// The System program.
 pub(crate) fn system_program_id() -> &'static Pubkey {
     static ID: OnceLock<Pubkey> = OnceLock::new();
     ID.get_or_init(|| Pubkey::from_str(SYSTEM_PROGRAM_ID_STR).expect("valid system program ID"))

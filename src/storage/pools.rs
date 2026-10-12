@@ -306,10 +306,12 @@ impl PoolDoc {
         self.uploads().filter_map(|u| u.bytes).sum()
     }
 
+    /// The upload recorded as `record_id`, if any.
     pub fn upload(&self, record_id: &str) -> Option<&Upload> {
         self.uploads().find(|u| u.record_id == record_id)
     }
 
+    /// Whether the credential `credential_id` has been revoked.
     pub fn is_revoked(&self, credential_id: &str) -> bool {
         self.revocations
             .iter()
@@ -365,10 +367,12 @@ fn supersedes(revocation: &GrantRevocation, grant: &Grant) -> bool {
     }
 }
 
+/// Where the pool's document is kept.
 fn doc_path(pool_pda: &str) -> String {
     format!("pools/{pool_pda}.json")
 }
 
+/// Where an upload's CSV is kept.
 fn dataset_path(pool_pda: &str, upload_id: &str) -> String {
     format!("pools/{pool_pda}/datasets/{upload_id}")
 }

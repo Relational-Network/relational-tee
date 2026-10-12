@@ -18,6 +18,7 @@ use tokio::sync::OnceCell;
 
 /// How much memory a cached value holds.
 pub trait Weigh {
+    /// Its size in bytes, as the cache's budget counts it.
     fn bytes(&self) -> usize;
 }
 
@@ -60,6 +61,8 @@ impl<K: Hash + Eq + Clone, V: Weigh> Drop for Unfinished<'_, K, V> {
 }
 
 impl<K: Hash + Eq + Clone, V: Weigh> Cache<K, V> {
+    /// An empty cache that keeps at most `budget` bytes and `max_entries`
+    /// values.
     pub fn new(budget: usize, max_entries: usize) -> Self {
         Self {
             budget,
@@ -144,6 +147,9 @@ impl<K: Hash + Eq + Clone, V: Weigh> Cache<K, V> {
         Ok(value)
     }
 
+    /// Drop the least recently used entries, never `keep`, until the cache
+    /// is within its budget and entry count. Entries still loading aren't
+    /// counted yet, so they stay.
     fn evict(&self, inner: &mut Inner<K, V>, keep: &K) {
         while inner.bytes > self.budget || inner.entries.len() > self.max_entries {
             let oldest = inner

@@ -18,6 +18,9 @@ const MAX_GRANT_DATA: usize = 64;
 #[cfg(test)]
 const MAX_DRT_CONFIG_DATA: usize = 4 * 1024;
 
+/// The data after an account's 8-byte discriminator, if the discriminator
+/// is `expected` and the rest is at most `max` bytes. `label` names the
+/// account in the error.
 fn strip_discriminator<'a>(
     data: &'a [u8],
     expected: &[u8; 8],

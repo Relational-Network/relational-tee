@@ -361,6 +361,7 @@ impl FilterOptions {
     }
 }
 
+/// Bind `value` to the parameter `name`, if the statement uses it.
 fn bind(statement: &mut Statement<'_>, name: &str, value: &dyn ToSql) -> rusqlite::Result<()> {
     match statement.parameter_index(name)? {
         Some(index) => statement.raw_bind_parameter(index, value),

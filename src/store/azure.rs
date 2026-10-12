@@ -124,6 +124,7 @@ struct CachedToken {
 }
 
 impl CachedToken {
+    /// The token as an `Authorization` header's value.
     fn header(&self) -> String {
         format!("Bearer {}", self.token.as_str())
     }
@@ -328,6 +329,9 @@ impl Account {
 }
 
 impl Tokens {
+    /// Tokens from the managed identity endpoint at `endpoint`, for the
+    /// identity `client_id` names, or the only one without it. The endpoint
+    /// must answer within 10 seconds and with at most 64 KiB.
     fn new(endpoint: &str, client_id: Option<String>) -> Self {
         Self {
             http: HttpClient::new()
@@ -340,6 +344,7 @@ impl Tokens {
         }
     }
 
+    /// The token request's URL, for a Storage token.
     fn url(&self) -> String {
         let mut url = format!(
             "{}?api-version=2018-02-01&resource={}",
@@ -353,6 +358,7 @@ impl Tokens {
         url
     }
 
+    /// The token state, even after a panic while another caller held it.
     fn lock(&self) -> std::sync::MutexGuard<'_, TokenState> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -452,6 +458,7 @@ impl Tokens {
     }
 }
 
+/// A Storage token from the managed identity endpoint, asked at `url`.
 async fn managed_identity_token(http: &HttpClient, url: &str) -> Result<CachedToken, StoreError> {
     let request = Request::builder()
         .method(Method::GET)
@@ -591,6 +598,8 @@ fn element(xml: &str, tag: &str) -> Option<String> {
     None
 }
 
+/// `text` with XML's five predefined entities decoded, `&amp;` last so it
+/// can't make another.
 fn unescape(text: &str) -> String {
     text.replace("&lt;", "<")
         .replace("&gt;", ">")

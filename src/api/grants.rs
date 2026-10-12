@@ -276,6 +276,7 @@ fn superseded() -> ApiError {
         .with_code("grant_superseded")
 }
 
+/// `404 no_grant`: the analyst has no such grant to revoke or change.
 fn no_grant() -> ApiError {
     ApiError::not_found("the analyst has no such grant to this analysis").with_code("no_grant")
 }

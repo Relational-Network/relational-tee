@@ -41,6 +41,7 @@ use crate::idempotency::{Operation, StoredTx};
 
 /// Where a chain step keeps its signed transaction between attempts.
 pub trait TxSlot {
+    /// The transaction stored so far, if any.
     fn stored(&self) -> Option<&StoredTx>;
 
     /// Store `fresh`, replacing the transaction whose signature is
@@ -156,6 +157,7 @@ impl Effect {
     }
 }
 
+/// An RPC failure as `503 rpc_unavailable`, saying `what` failed.
 fn rpc_error(what: &str) -> impl FnOnce(RpcError) -> ApiError + '_ {
     move |e| ApiError::rpc_unavailable(format!("{what}: {e}"))
 }

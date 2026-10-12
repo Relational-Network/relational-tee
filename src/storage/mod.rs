@@ -100,14 +100,17 @@ impl Storage {
         identities::Identities::new(self)
     }
 
+    /// Transfer receipts, whose deposits the reconciler returns.
     pub fn receipts(&self) -> receipts::Receipts<'_> {
         receipts::Receipts::new(self)
     }
 
+    /// This worker's ID, which names its canary and its health report.
     pub fn worker_id(&self) -> &str {
         &self.worker_id
     }
 
+    /// The sealed container of the worker's state.
     pub(crate) fn state(&self) -> &Sealed {
         &self.state
     }

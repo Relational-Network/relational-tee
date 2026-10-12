@@ -198,10 +198,12 @@ impl Certificates {
         self.trusted.push(root);
     }
 
+    /// The hex SHA-256 of `tls-key`'s public key, which names its objects.
     pub fn spki_sha256(&self) -> &str {
         &self.spki_sha256
     }
 
+    /// Where the chain for `tls-key` is looked for.
     fn chain_path(&self) -> String {
         format!("{}/chain.pem", self.spki_sha256)
     }
@@ -215,6 +217,7 @@ impl Certificates {
         self.valid_at(Utc::now())
     }
 
+    /// Whether a chain is loaded and its leaf is still valid at `now`.
     fn valid_at(&self, now: DateTime<Utc>) -> bool {
         self.served.read().is_ok_and(|served| {
             served
@@ -263,6 +266,7 @@ impl Certificates {
         result
     }
 
+    /// Publish the CSR for `tls-key`, once: one already there stays.
     async fn write_csr(&self) -> Result<(), String> {
         if self.csr_written.load(Ordering::Relaxed) {
             return Ok(());
@@ -285,6 +289,9 @@ impl Certificates {
         Ok(())
     }
 
+    /// Serve the chain in `pem`, whose object has `etag`, if it matches
+    /// `tls-key` and a client would accept it now. Otherwise the served chain
+    /// stays, and an alert says why.
     fn load(&self, pem: &[u8], etag: ETag) -> Result<(), String> {
         let chain = CertificateDer::pem_slice_iter(pem)
             .collect::<Result<Vec<CertificateDer<'static>>, _>>()

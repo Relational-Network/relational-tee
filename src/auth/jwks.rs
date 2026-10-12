@@ -39,6 +39,7 @@ pub const RETRY_WAIT: (Duration, Duration) = (Duration::from_secs(5), Duration::
 
 /// Where signing keys come from.
 pub trait KeySource: Send + Sync {
+    /// The current signing keys, by `kid`.
     fn fetch(&self) -> BoxFuture<'_, Result<HashMap<String, DecodingKey>, String>>;
 }
 
@@ -89,6 +90,8 @@ pub struct HttpKeySource {
 }
 
 impl HttpKeySource {
+    /// Keys from the JWKS document at `url`, which must answer within 10
+    /// seconds and with at most 1 MiB.
     pub fn new(url: String) -> Self {
         Self {
             url,
@@ -127,10 +130,12 @@ struct Cached {
 }
 
 impl Cached {
+    /// How long ago the keys were fetched, if they ever were.
     fn age(&self, now: Instant) -> Option<Duration> {
         self.fetched_at.map(|at| now.duration_since(at))
     }
 
+    /// Whether the keys are recent enough that no refresh is due.
     fn fresh(&self, now: Instant) -> bool {
         self.age(now).is_some_and(|age| age < CACHE_TTL)
     }
@@ -165,6 +170,7 @@ pub struct KeySet {
 }
 
 impl KeySet {
+    /// A key set that fetches its keys from `source` when first asked.
     pub fn new(source: Arc<dyn KeySource>) -> Self {
         Self {
             source,
@@ -173,6 +179,7 @@ impl KeySet {
         }
     }
 
+    /// The cached keys, even after a panic while another caller held them.
     fn lock(&self) -> MutexGuard<'_, Cached> {
         self.cached.lock().unwrap_or_else(PoisonError::into_inner)
     }

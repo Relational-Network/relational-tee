@@ -20,6 +20,7 @@ pub fn url() -> String {
     std::env::var("SURFNET_URL").expect("SURFNET_URL names a surfnet: run `just chain-test`")
 }
 
+/// A client of the surfnet at `SURFNET_URL`, configured as for devnet.
 pub fn client() -> SolanaClient {
     SolanaClient::new(&url(), devnet_config(&url()))
 }
