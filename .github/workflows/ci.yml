@@ -50,6 +50,24 @@ jobs:
       - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
       - run: nix flake check --print-build-logs
 
+  # What the fake chain can't vouch for: that the real System, SPL Token,
+  # token account and Memo programs do what the worker's transactions rely
+  # on. Surfpool runs them offline, from the dev shell.
+  chain:
+    name: Chain tests (Surfpool)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+      - name: just chain-test
+        run: nix develop --command just chain-test
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: surfpool-log
+          path: .surfpool/
+          if-no-files-found: ignore
+
   # Two runners build the image independently, alongside the gates; only
   # publishing waits for both. CI has no binary cache, so each compiles the
   # crate and its dependencies from source.
@@ -125,7 +143,7 @@ jobs:
   publish:
     name: Publish the image and start staging
     runs-on: ubuntu-24.04
-    needs: [gates, flake-check, reproducible]
+    needs: [gates, flake-check, chain, reproducible]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     permissions:
       contents: read

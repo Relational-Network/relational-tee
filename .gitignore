@@ -7,6 +7,9 @@ drt-examples/mean/target
 # Local files of dev builds (STORAGE_BACKEND=files)
 /data/
 
+# Surfpool's logs (just chain-test)
+/.surfpool/
+
 SPRINT*
 
 # Dev keys (just dev-keys); only dev builds read them

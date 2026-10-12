@@ -11,6 +11,8 @@ pub mod fake;
 pub mod rpc;
 pub mod signing;
 pub mod spl_token;
+#[cfg(test)]
+pub mod surfnet;
 pub mod transactions;
 pub mod types;
 

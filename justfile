@@ -116,6 +116,30 @@ scale:
 grant-guard:
     cargo nextest run --run-ignored only --no-capture -E 'test(devnet_refuses)'
 
+# Run the tests named surfnet_ against a local Surfpool network, offline, which
+# runs the real System, SPL Token, token account and Memo programs, then stop
+# it. Its log is .surfpool/chain-test.log. The DRT program isn't there
+# offline: `just grant-guard` checks it on devnet.
+chain-test:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    port=18899
+    mkdir -p .surfpool
+    NO_DNA=1 surfpool start --ci --offline --port "$port" --ws-port 18900 \
+        --no-deploy --log-path .surfpool > .surfpool/chain-test.log 2>&1 &
+    surfnet=$!
+    trap 'kill "$surfnet" 2>/dev/null || true' EXIT
+    health='{"jsonrpc":"2.0","id":1,"method":"getHealth"}'
+    for _ in $(seq 1 100); do
+        if curl -sf -H 'content-type: application/json' -d "$health" \
+            "http://127.0.0.1:$port" >/dev/null; then
+            break
+        fi
+        sleep 0.2
+    done
+    SURFNET_URL="http://127.0.0.1:$port" \
+        cargo nextest run --run-ignored only --no-capture -E 'test(/^.*surfnet_/)'
+
 # Run every local gate.
 check: fmt-check clippy test deny-crates audit osv
 

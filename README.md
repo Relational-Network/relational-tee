@@ -40,6 +40,7 @@ just            # list the recipes
 | `just test-azurite` | Run the store conformance tests against Azurite, starting it first if needed |
 | `just scale` | Upload a pilot-sized dataset (100,000 rows of 30 fields, about 30 MiB) as a pool's initial upload and as an issuance, in an optimised build, and print its size against the 50 MiB upload limit and how long each upload took |
 | `just grant-guard` | Check on devnet that the DRT program refuses a second `grant_right` under one commitment: it simulates a landed grant again, which fails because its Grant PDA exists, and the same grant under a fresh commitment, which passes; and that a transfer's receipt is created once and refused the second time. It needs no keys and spends nothing; `GRANT_GUARD_POOL` picks another pool |
+| `just chain-test` | Run the tests named `surfnet_` against a local Surfpool network, offline, which runs the real System, SPL Token, token account and Memo programs: a pool's counter rising by exactly one per change, with lamports at its address beforehand, and a transfer's receipt made once and swept. The fake chain the other tests use is the fault model (transactions that never land or expire, an RPC that refuses or forgets); these check the programs it stands in for |
 | `just check` | Run every gate: rustfmt, clippy (`-D warnings`, with and without all features), the tests, the banned-crate check and `cargo audit` |
 | `just openapi` | Print the OpenAPI document (`relational-tee openapi`), which CI publishes as each run's `openapi` artifact |
 | `just spa` | Run the dashboard dev server from `../dashboard` (override with `DASHBOARD_DIR`), using the host's Node and pnpm |
@@ -180,7 +181,7 @@ The worker creates the `state`, `tls` and `reference-values` containers at start
 - `packages.aarch64-linux.image-dev`: the same image with the `dev` feature, for local container stacks on Apple Silicon.
 - `checks`: rustfmt, clippy and nextest, run by `nix flake check`.
 
-CI (`.github/workflows/ci.yml`) runs `just check` in the dev shell, `nix flake check`, and the x86_64 image build on every pull request and push to `main`, and publishes the OpenAPI document as the run's `openapi` artifact. It fails if the `rsa` crate (RUSTSEC-2023-0071) or OpenSSL enters the dependency graph. No image is pushed to a registry or deployed yet.
+CI (`.github/workflows/ci.yml`) runs `just check` in the dev shell, `nix flake check`, `just chain-test`, and the x86_64 image build on every pull request and push to `main`, and publishes the OpenAPI document as the run's `openapi` artifact. It fails if the `rsa` crate (RUSTSEC-2023-0071) or OpenSSL enters the dependency graph. No image is pushed to a registry or deployed yet.
 
 ## API conventions
 
