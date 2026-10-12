@@ -15,6 +15,7 @@ const NS_WALLET: Uuid = Uuid::from_u128(0xba3ecd19_e66f_4fe6_9da7_dce668a690d6);
 const NS_GRANT: Uuid = Uuid::from_u128(0xf55912d4_1733_44d5_a63b_0d0bcc74475d);
 const NS_REVOCATION: Uuid = Uuid::from_u128(0xd37798d5_045e_44d7_9292_e56e6484fce2);
 const NS_RECEIPT: Uuid = Uuid::from_u128(0x97faf768_8e4b_44d4_afd4_1d62354656da);
+const NS_GENERATION: Uuid = Uuid::from_u128(0x3c1d7a52_9b0e_4f6a_8d21_5e4b7c90a1f3);
 
 fn v5(namespace: &Uuid, parts: &[&str]) -> Uuid {
     Uuid::new_v5(namespace, parts.join("\n").as_bytes())
@@ -62,6 +63,12 @@ pub fn receipt_seed(user_id: &str, wallet_id: &str, key: &str) -> String {
     v5(&NS_RECEIPT, &[user_id, wallet_id, key])
         .simple()
         .to_string()
+}
+
+/// The seed of a pool's generation counter, under its owner's wallet:
+/// 32 hex characters, the most an address seed takes.
+pub fn generation_seed(pool_pda: &str) -> String {
+    v5(&NS_GENERATION, &[pool_pda]).simple().to_string()
 }
 
 #[cfg(test)]

@@ -39,6 +39,7 @@ use tokio::sync::watch;
 use tracing::warn;
 
 use crate::api::credentials::decode_right_id;
+use crate::blockchain::counter::{self, counter_address};
 use crate::blockchain::drt::accounts::{grant_state, GrantState};
 use crate::blockchain::drt::pda::{derive_drt_config_pda, derive_grant_pda};
 use crate::blockchain::rpc::{RpcError, MAX_MULTIPLE_ACCOUNTS};
@@ -103,6 +104,8 @@ struct PoolState {
     reads: u64,
     failures: u32,
     failed: Option<(DateTime<Utc>, Failure)>,
+    /// Whether the anchor of the pool's last change is being finished.
+    settling: bool,
     /// When an analyst last used the pool.
     used_at: Option<DateTime<Utc>>,
 }
@@ -141,6 +144,13 @@ fn expected(doc: &PoolDoc, grant: &Grant) -> Result<Expected, ApiError> {
         pda: derive_grant_pda(&commitment).0,
         drt_config: derive_drt_config_pda(&pool, &decode_right_id(&drt.right_id_hex)?).0,
     })
+}
+
+/// The pool's owner and its counter.
+fn counter_of(doc: &PoolDoc) -> Result<(Pubkey, Pubkey), ApiError> {
+    let owner = Pubkey::from_str(&doc.owner_pubkey)
+        .map_err(|_| ApiError::internal("a pool document has an invalid owner"))?;
+    Ok((owner, counter_address(&owner, &doc.pool_pda)?))
 }
 
 /// The grants of `doc` whose PDAs a read covers: those not yet closed.
@@ -248,11 +258,71 @@ impl GrantChecks {
                 found.ok_or_else(|| ApiError::internal("the grant wasn't read"))?
             }
         };
-        if seen.live {
-            Ok(seen)
-        } else {
-            Err(not_live())
+        if !seen.live {
+            return Err(not_live());
         }
+        self.check_generation(storage, solana, doc).await?;
+        Ok(seen)
+    }
+
+    /// Check that `doc` is the pool's latest document: that its generation
+    /// is what the pool's counter shows. A reading behind the document is
+    /// read again first, as it may be from before the pool's last change; one
+    /// ahead of it is conclusive, as the counter never goes down. A pool
+    /// still settling is finished in the background.
+    async fn check_generation(
+        self: &Arc<Self>,
+        storage: &Arc<Storage>,
+        solana: &Arc<SolanaClient>,
+        doc: &PoolDoc,
+    ) -> Result<(), ApiError> {
+        let counter = counter_of(doc)?.1.to_string();
+        let shown = || {
+            self.lock()
+                .get(&doc.pool_pda)
+                .and_then(|p| p.views.get(&counter))
+                .and_then(|seen| seen.generation)
+        };
+        let mut chain = shown();
+        if chain.is_none_or(|chain| chain < doc.generation) {
+            self.read_and_wait(storage, solana, doc).await?;
+            chain = shown();
+        }
+        let chain = chain.ok_or_else(|| ApiError::internal("the pool's counter wasn't read"))?;
+        let checked = crate::generation::check(doc, chain);
+        if checked.as_ref().is_err_and(|e| e.code == "pool_settling") {
+            self.settle_in_background(storage, solana, doc);
+        }
+        checked
+    }
+
+    /// Finish the anchor of `doc`'s last change, unless that's under way,
+    /// then read the pool again.
+    fn settle_in_background(
+        self: &Arc<Self>,
+        storage: &Arc<Storage>,
+        solana: &Arc<SolanaClient>,
+        doc: &PoolDoc,
+    ) {
+        {
+            let mut pools = self.lock();
+            let pool = pools.entry(doc.pool_pda.clone()).or_default();
+            if pool.settling {
+                return;
+            }
+            pool.settling = true;
+        }
+        let (checks, storage, solana, doc) =
+            (self.clone(), storage.clone(), solana.clone(), doc.clone());
+        tokio::spawn(async move {
+            if let Err(e) = crate::generation::settle(&storage, &solana, &doc).await {
+                warn!(pool = %doc.pool_pda, error = %e, "Couldn't anchor a settling pool");
+            }
+            if let Some(pool) = checks.lock().get_mut(&doc.pool_pda) {
+                pool.settling = false;
+            }
+            let _ = checks.read(&storage, &solana, &doc);
+        });
     }
 
     /// Start reading `doc`'s pool, unless a read is running or the last one's
@@ -338,29 +408,50 @@ impl GrantChecks {
         }
     }
 
-    /// Read every open grant of `doc` from the chain, remember what it
-    /// showed, store it, and return it.
+    /// Read the pool's counter and every open grant of `doc` from the
+    /// chain, in as few calls as fit, remember what it showed, store it, and
+    /// return it.
     pub async fn refresh(
         &self,
         storage: &Storage,
         solana: &SolanaClient,
         doc: &PoolDoc,
     ) -> Result<Views, ApiError> {
-        let wanted: Vec<Expected> = open_grants(doc)
-            .map(|g| expected(doc, g))
-            .collect::<Result<_, _>>()?;
+        let (owner, counter) = counter_of(doc)?;
+        // The counter, then each grant's PDA with the DRT config it must name.
+        let mut wanted: Vec<(Pubkey, Option<Pubkey>)> = vec![(counter, None)];
+        for grant in open_grants(doc) {
+            let w = expected(doc, grant)?;
+            wanted.push((w.pda, Some(w.drt_config)));
+        }
         let mut read = Views::new();
         for chunk in wanted.chunks(MAX_MULTIPLE_ACCOUNTS) {
-            let pdas: Vec<Pubkey> = chunk.iter().map(|w| w.pda).collect();
+            let addresses: Vec<Pubkey> = chunk.iter().map(|(address, _)| *address).collect();
             let (slot, accounts) = solana
                 .rpc()
-                .get_multiple_accounts(&pdas, "confirmed")
+                .get_multiple_accounts(&addresses, "confirmed")
                 .await
                 .map_err(rpc_error)?;
             let at = Utc::now();
-            for (w, account) in chunk.iter().zip(accounts) {
-                let live = grant_state(account.as_ref(), &w.drt_config) == GrantState::Live;
-                read.insert(w.pda.to_string(), Seen { live, slot, at });
+            for ((address, drt_config), account) in chunk.iter().zip(accounts) {
+                let seen = match drt_config {
+                    Some(drt_config) => Seen {
+                        live: grant_state(account.as_ref(), drt_config) == GrantState::Live,
+                        slot,
+                        at,
+                        generation: None,
+                    },
+                    None => Seen {
+                        live: account.is_some(),
+                        slot,
+                        at,
+                        generation: Some(
+                            counter::generation(account.as_ref(), &owner)
+                                .map_err(ApiError::internal)?,
+                        ),
+                    },
+                };
+                read.insert(address.to_string(), seen);
             }
         }
         {
@@ -450,11 +541,13 @@ mod tests {
         grant: Grant,
         pda: Pubkey,
         drt_config: Pubkey,
+        counter: Pubkey,
     }
 
     fn setup(timing: Timing) -> Setup {
         let (storage, other, _) = two_workers();
         let mut doc = pool(&POOL.to_string(), "w1");
+        doc.owner_pubkey = Pubkey::new_from_array([22; 32]).to_string();
         let drt = DrtMetadata {
             right_id_hex: hex::encode(RIGHT_ID),
             mint: Pubkey::new_unique().to_string(),
@@ -470,6 +563,7 @@ mod tests {
         let drt_config = derive_drt_config_pda(&POOL, &RIGHT_ID).0;
         let chain = Arc::new(FakeChain::default());
         chain.grant(pda, drt_config);
+        let counter = counter_of(&doc).unwrap().1;
         Setup {
             checks: Arc::new(GrantChecks::new(timing)),
             storage: Arc::new(storage),
@@ -480,6 +574,7 @@ mod tests {
             grant,
             pda,
             drt_config,
+            counter,
         }
     }
 
@@ -490,13 +585,34 @@ mod tests {
                 .await
         }
 
+        /// An earlier read, `ago`, of the grant and the pool's counter.
         fn remember(&self, live: bool, ago: TimeDelta) {
+            let at = Utc::now() - ago;
             let seen = Seen {
                 live,
                 slot: 1,
-                at: Utc::now() - ago,
+                at,
+                generation: None,
             };
             self.checks.remember(&self.doc.pool_pda, &self.pda, seen);
+            let counter = Seen {
+                live: false,
+                slot: 1,
+                at,
+                generation: Some(self.doc.generation),
+            };
+            self.checks
+                .remember(&self.doc.pool_pda, &self.counter, counter);
+        }
+
+        /// The pool's counter on the chain at `generation`.
+        fn counter_at(&self, generation: u64) {
+            let owner = counter_of(&self.doc).unwrap().0;
+            self.chain.close(&self.counter);
+            self.chain.tokens.lock().unwrap().push((
+                self.counter,
+                crate::blockchain::counter::tests::mint(&owner, generation),
+            ));
         }
     }
 
@@ -649,6 +765,70 @@ mod tests {
         }
         assert!(s.verify().await.unwrap().live);
         assert_eq!(s.chain.called(READ), 1, "the abandoned read finished");
+    }
+
+    #[tokio::test]
+    async fn a_restored_older_document_is_refused_however_the_grant_looks() {
+        // The pool made three changes since: say a revocation and a
+        // narrower grant made again, under the same Grant PDA, which is live.
+        let s = setup(Timing::default());
+        s.counter_at(3);
+        let mut restored = s.doc.clone();
+        restored.generation = 2;
+        let refused = s
+            .checks
+            .verify(&s.storage, &s.solana, &restored, &s.grant)
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code, "pool_records_stale");
+
+        // A reading from before the pool's last change is read again before
+        // the latest document is answered.
+        let s = setup(Timing::default());
+        s.remember(true, TimeDelta::seconds(5));
+        let mut latest = s.doc.clone();
+        latest.generation = 1;
+        s.counter_at(1);
+        let reads = s.chain.called(READ);
+        let answered = s
+            .checks
+            .verify(&s.storage, &s.solana, &latest, &s.grant)
+            .await;
+        assert!(answered.unwrap().live);
+        assert_eq!(s.chain.called(READ), reads + 1);
+        // Then the document from before that change is refused at once.
+        assert_eq!(s.verify().await.unwrap_err().code, "pool_records_stale");
+        assert_eq!(s.chain.called(READ), reads + 1);
+
+        // A restarted worker, reading the stored readings, refuses it too.
+        let restarted = Arc::new(GrantChecks::default());
+        let refused = restarted
+            .verify(&s.other, &s.solana, &s.doc, &s.grant)
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code, "pool_records_stale");
+    }
+
+    #[tokio::test]
+    async fn the_latest_document_is_answered_and_a_settling_one_waits() {
+        let s = setup(Timing::default());
+        let mut doc = s.doc.clone();
+        doc.generation = 4;
+        s.counter_at(4);
+        let latest = s.checks.verify(&s.storage, &s.solana, &doc, &s.grant).await;
+        assert!(latest.unwrap().live);
+
+        // One change ahead of the counter: its anchor hasn't landed yet.
+        doc.generation = 5;
+        let settling = s
+            .checks
+            .verify(&s.storage, &s.solana, &doc, &s.grant)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (settling.code, settling.retry_after),
+            ("pool_settling", Some(2))
+        );
     }
 
     #[tokio::test]

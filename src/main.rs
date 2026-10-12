@@ -43,6 +43,7 @@ mod error;
 mod fault;
 #[cfg(feature = "dev")]
 mod faults;
+mod generation;
 mod handlers;
 mod health;
 mod history;

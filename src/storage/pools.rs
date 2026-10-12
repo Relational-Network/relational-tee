@@ -22,6 +22,7 @@ use zeroize::Zeroizing;
 use super::{id, Change, Storage, StoreError};
 use crate::analysis::table::Target;
 use crate::data_validation::FieldSchema;
+use crate::idempotency::StoredTx;
 use crate::store::Created;
 
 /// The record ID of a pool's initial upload.
@@ -140,6 +141,10 @@ pub struct Grant {
     pub granted_by: String,
     /// When the grant was staged, before its burn.
     pub granted_at: DateTime<Utc>,
+    /// The pool's generation when the grant was staged. Grants staged
+    /// before generations were counted have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staged_generation: Option<u64>,
     /// The `grant_right` burn; a staged grant has none yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
@@ -192,6 +197,10 @@ pub struct GrantRevocation {
     /// The `revoke_grant` that closed the Grant PDA, once it has.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
+    /// The pool's generation that recorded it. Revocations recorded before
+    /// generations were counted have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
 }
 
 /// What recording a burned grant would do.
@@ -245,6 +254,14 @@ pub struct PoolDoc {
     /// Analyst grants, oldest first.
     #[serde(default)]
     pub grants: Vec<Grant>,
+    /// How many access changes the document has made: what the pool's
+    /// counter mint must show (see [`crate::generation`]).
+    #[serde(default)]
+    pub generation: u64,
+    /// The signed transaction that takes the counter to `generation`, until
+    /// it's known to have landed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<StoredTx>,
 }
 
 /// Totals computed from a pool document.
@@ -321,14 +338,25 @@ impl PoolDoc {
         {
             return Recording::Present(present);
         }
-        match self.grants.iter().filter(same).find(|g| {
-            g.revoked
-                .as_ref()
-                .is_some_and(|r| r.revoked_at >= grant.granted_at)
-        }) {
+        match self
+            .grants
+            .iter()
+            .filter(same)
+            .find(|g| g.revoked.as_ref().is_some_and(|r| supersedes(r, grant)))
+        {
             Some(revoked) => Recording::Superseded(revoked),
             None => Recording::Add,
         }
+    }
+}
+
+/// Whether `revocation` came after `grant` was staged: by the generations
+/// that recorded them where both have one, which no worker's clock moves,
+/// or else by their times.
+fn supersedes(revocation: &GrantRevocation, grant: &Grant) -> bool {
+    match (revocation.generation, grant.staged_generation) {
+        (Some(revoked), Some(staged)) => revoked > staged,
+        _ => revocation.revoked_at >= grant.granted_at,
     }
 }
 
@@ -429,6 +457,8 @@ pub(crate) mod tests {
 
     pub(crate) fn pool(pda: &str, owner: &str) -> PoolDoc {
         PoolDoc {
+            generation: 0,
+            anchor: None,
             pool_pda: pda.into(),
             pool_name: format!("Pool {pda}"),
             kind: PoolKind::Malta,
@@ -461,6 +491,7 @@ pub(crate) mod tests {
             commitment: hex::encode([analyst.len() as u8; 32]),
             granted_by: "alice".into(),
             granted_at: Utc::now() - chrono::Duration::minutes(minutes_ago),
+            staged_generation: None,
             signature: Some(format!("sig-{grant_id}")),
             revoked: None,
             scopes: vec![GrantScope {
@@ -541,6 +572,7 @@ pub(crate) mod tests {
                 revoked_by: "alice".into(),
                 revoked_at: Utc::now() - chrono::Duration::minutes(minutes_ago),
                 signature: None,
+                generation: None,
             });
             g
         };
@@ -569,6 +601,32 @@ pub(crate) mod tests {
         assert_eq!(doc.active_grant("ana", "awards-report-v1"), Some(&after));
         assert_eq!(doc.latest_grant("ana", "awards-report-v1"), Some(&after));
         assert!(doc.active_grant("ana", "other-analysis").is_none());
+    }
+
+    #[test]
+    fn generations_decide_supersession_whatever_the_clocks_say() {
+        let at = |staged: u64, minutes_ago: i64| Grant {
+            staged_generation: Some(staged),
+            ..grant("g", "ana", minutes_ago)
+        };
+        let revocation = |generation: u64, minutes_ago: i64| GrantRevocation {
+            revocation_id: "r".into(),
+            revoked_by: "alice".into(),
+            revoked_at: Utc::now() - chrono::Duration::minutes(minutes_ago),
+            signature: None,
+            generation: Some(generation),
+        };
+        // A worker whose clock runs slow revoked after the grant was staged.
+        assert!(supersedes(&revocation(5, 60), &at(4, 1)));
+        // One whose clock runs fast revoked before it.
+        assert!(!supersedes(&revocation(4, 0), &at(4, 60)));
+        // Without generations, the clocks decide.
+        let legacy = GrantRevocation {
+            generation: None,
+            ..revocation(9, 5)
+        };
+        assert!(supersedes(&legacy, &grant("g", "ana", 10)));
+        assert!(!supersedes(&legacy, &grant("g", "ana", 1)));
     }
 
     #[tokio::test]

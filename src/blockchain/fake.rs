@@ -35,9 +35,17 @@ pub const VALID_FOR: u64 = 150;
 /// The rent-exempt minimum of an account with no data, as on devnet.
 pub const RECEIPT_DEPOSIT: u64 = 890_880;
 
-/// The System program's `CreateAccountWithSeed` and `TransferWithSeed`.
+/// The System program's `CreateAccountWithSeed`, `AllocateWithSeed` and
+/// `TransferWithSeed`.
 const CREATE_ACCOUNT_WITH_SEED: [u8; 4] = 3u32.to_le_bytes();
+const ALLOCATE_WITH_SEED: [u8; 4] = 9u32.to_le_bytes();
 const TRANSFER_WITH_SEED: [u8; 4] = 11u32.to_le_bytes();
+
+const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+const ATA_PROGRAM: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
+/// SPL Token's `MintTo` and `InitializeMint2`.
+const MINT_TO: u8 = 7;
+const INITIALIZE_MINT2: u8 = 20;
 
 #[derive(Default)]
 pub struct FakeChain {
@@ -47,6 +55,8 @@ pub struct FakeChain {
     /// Accounts with data, owned by the DRT program, which `getAccountInfo`
     /// and `getMultipleAccounts` return.
     pub data: Mutex<Vec<(Pubkey, Vec<u8>)>>,
+    /// Mints and token accounts, owned by the SPL Token program.
+    pub tokens: Mutex<Vec<(Pubkey, Vec<u8>)>>,
     /// While set, account reads answer with this HTTP status, as a node
     /// that is down (503) or rate-limiting (429) does.
     pub refuse_reads: Mutex<Option<u16>>,
@@ -113,6 +123,78 @@ impl FakeChain {
     pub fn close(&self, pda: &Pubkey) {
         self.data.lock().unwrap().retain(|(a, _)| a != pda);
         self.accounts.lock().unwrap().retain(|a| a != pda);
+        self.tokens.lock().unwrap().retain(|(a, _)| a != pda);
+    }
+
+    /// The SPL Token account at `address`, if there is one.
+    pub fn token(&self, address: &Pubkey) -> Option<Vec<u8>> {
+        self.tokens
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(a, _)| a == address)
+            .map(|(_, data)| data.clone())
+    }
+
+    /// The supply of the mint at `mint`, if there is one.
+    pub fn supply(&self, mint: &Pubkey) -> Option<u64> {
+        let data = self.token(mint)?;
+        Some(u64::from_le_bytes(data.get(36..44)?.try_into().ok()?))
+    }
+
+    /// Apply one SPL Token or token account instruction; false if it fails.
+    fn apply_token(&self, program: &str, data: &[u8], account: impl Fn(usize) -> Pubkey) -> bool {
+        let mut tokens = self.tokens.lock().unwrap();
+        let find = |tokens: &Vec<(Pubkey, Vec<u8>)>, address: &Pubkey| {
+            tokens.iter().position(|(a, _)| a == address)
+        };
+        if program == ATA_PROGRAM {
+            // CreateIdempotent: a token account for the mint, if missing.
+            let (ata, owner, mint) = (account(1), account(2), account(3));
+            if find(&tokens, &ata).is_none() {
+                let mut state = vec![0u8; 165];
+                state[..32].copy_from_slice(mint.as_ref());
+                state[32..64].copy_from_slice(owner.as_ref());
+                state[108] = 1;
+                tokens.push((ata, state));
+            }
+            return true;
+        }
+        match data.first() {
+            Some(&INITIALIZE_MINT2) => {
+                let Some(i) = find(&tokens, &account(0)) else {
+                    return false;
+                };
+                let mint = &mut tokens[i].1;
+                if mint.len() != 82 || mint[45] == 1 || data.len() < 34 {
+                    return false;
+                }
+                mint[..4].copy_from_slice(&[1, 0, 0, 0]);
+                mint[4..36].copy_from_slice(&data[2..34]);
+                mint[44] = data[1];
+                mint[45] = 1;
+                true
+            }
+            Some(&MINT_TO) => {
+                let amount = u64::from_le_bytes(data[1..9].try_into().unwrap());
+                let (Some(m), Some(t)) = (find(&tokens, &account(0)), find(&tokens, &account(1)))
+                else {
+                    return false;
+                };
+                if tokens[m].1.get(45) != Some(&1) {
+                    return false;
+                }
+                let add = |bytes: &mut [u8]| {
+                    let n = u64::from_le_bytes(bytes[..8].try_into().unwrap()) + amount;
+                    bytes[..8].copy_from_slice(&n.to_le_bytes());
+                };
+                add(&mut tokens[m].1[36..44]);
+                add(&mut tokens[t].1[64..72]);
+                true
+            }
+            // Transfers, and anything else, aren't modelled.
+            _ => true,
+        }
     }
 
     /// How many times `method` was called.
@@ -129,13 +211,33 @@ impl FakeChain {
     pub fn exists(&self, address: &Pubkey) -> bool {
         self.data.lock().unwrap().iter().any(|(a, _)| a == address)
             || self.accounts.lock().unwrap().contains(address)
+            || self.token(address).is_some()
     }
 
     /// What a landed transaction does, as the programs do it, and whether it
     /// succeeded: `grant_right` opens a Grant and `revoke_grant` closes one;
     /// `CreateAccountWithSeed` makes an account, and fails the whole
-    /// transaction where one exists; `TransferWithSeed` empties one.
+    /// transaction where one exists; `TransferWithSeed` empties one;
+    /// `AllocateWithSeed` gives an account with only lamports, or none, to
+    /// SPL Token as a mint; and SPL Token and its account program initialize
+    /// mints, mint, and create token accounts. A transaction that fails
+    /// leaves nothing changed.
     fn apply(&self, tx: &Transaction) -> bool {
+        let before = (
+            self.accounts.lock().unwrap().clone(),
+            self.data.lock().unwrap().clone(),
+            self.tokens.lock().unwrap().clone(),
+        );
+        let applied = self.apply_all(tx);
+        if !applied {
+            *self.accounts.lock().unwrap() = before.0;
+            *self.data.lock().unwrap() = before.1;
+            *self.tokens.lock().unwrap() = before.2;
+        }
+        applied
+    }
+
+    fn apply_all(&self, tx: &Transaction) -> bool {
         let keys = &tx.message.account_keys;
         let system = |program: u8, data: &[u8], op: [u8; 4]| {
             keys[program as usize].to_string() == SYSTEM_PROGRAM && data.starts_with(&op)
@@ -149,8 +251,24 @@ impl FakeChain {
         }
         for ix in &tx.message.instructions {
             let account = |i: usize| keys[ix.accounts[i] as usize];
+            let program = keys[ix.program_id_index as usize].to_string();
+            if program == TOKEN_PROGRAM || program == ATA_PROGRAM {
+                if !self.apply_token(&program, &ix.data, account) {
+                    return false;
+                }
+                continue;
+            }
             if system(ix.program_id_index, &ix.data, CREATE_ACCOUNT_WITH_SEED) {
                 self.accounts.lock().unwrap().push(account(1));
+            } else if system(ix.program_id_index, &ix.data, ALLOCATE_WITH_SEED) {
+                let address = account(0);
+                if self.token(&address).is_some()
+                    || self.data.lock().unwrap().iter().any(|(a, _)| *a == address)
+                {
+                    return false;
+                }
+                self.accounts.lock().unwrap().retain(|a| *a != address);
+                self.tokens.lock().unwrap().push((address, vec![0; 82]));
             } else if system(ix.program_id_index, &ix.data, TRANSFER_WITH_SEED) {
                 self.close(&account(0));
             }
@@ -177,6 +295,17 @@ impl FakeChain {
             .map(|(_, data)| data.clone());
         if let Some(data) = data {
             return json!({ "lamports": 1, "owner": drt_program_id().to_string(),
+                "data": [BASE64.encode(data), "base64"] });
+        }
+        let token = self
+            .tokens
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(a, _)| a.to_string() == address)
+            .map(|(_, data)| data.clone());
+        if let Some(data) = token {
+            return json!({ "lamports": 1, "owner": TOKEN_PROGRAM,
                 "data": [BASE64.encode(data), "base64"] });
         }
         let lamports_only = self

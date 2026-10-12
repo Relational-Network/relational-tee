@@ -153,36 +153,33 @@ pub async fn revoke_credentials(
     let now = Utc::now();
     let mut newly_revoked = 0;
     op.begin().await?;
-    state
-        .storage
-        .pools()
-        .update(&pool_pda_str, |doc| {
-            // Every credential must be an upload of this pool.
-            if let Some(unknown) = credential_ids.iter().find(|c| doc.upload(c).is_none()) {
-                return Err(ApiError::not_found(format!(
-                    "credential record '{unknown}' not found in pool"
-                )));
+    crate::generation::update(&state.storage, &state.solana_client, &pool_pda_str, |doc| {
+        // Every credential must be an upload of this pool.
+        if let Some(unknown) = credential_ids.iter().find(|c| doc.upload(c).is_none()) {
+            return Err(ApiError::not_found(format!(
+                "credential record '{unknown}' not found in pool"
+            )));
+        }
+        newly_revoked = 0;
+        for cid in &credential_ids {
+            if !doc.is_revoked(cid) {
+                doc.revocations.push(Revocation {
+                    credential_id: cid.clone(),
+                    revoked_by: caller.user_id.clone(),
+                    revoked_at: now,
+                    reason: payload.reason.clone(),
+                });
+                newly_revoked += 1;
             }
-            newly_revoked = 0;
-            for cid in &credential_ids {
-                if !doc.is_revoked(cid) {
-                    doc.revocations.push(Revocation {
-                        credential_id: cid.clone(),
-                        revoked_by: caller.user_id.clone(),
-                        revoked_at: now,
-                        reason: payload.reason.clone(),
-                    });
-                    newly_revoked += 1;
-                }
-            }
-            Ok(if newly_revoked == 0 {
-                Change::Unchanged
-            } else {
-                Change::Changed
-            })
+        }
+        Ok(if newly_revoked == 0 {
+            Change::Unchanged
+        } else {
+            Change::Changed
         })
-        .await?
-        .ok_or_else(|| pool_not_found(&pool_pda_str))?;
+    })
+    .await?
+    .ok_or_else(|| pool_not_found(&pool_pda_str))?;
 
     info!(
         pool = %pool_pda_str,

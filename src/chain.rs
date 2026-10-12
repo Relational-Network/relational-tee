@@ -18,7 +18,11 @@
 //! So attempts with the same key, on any workers, produce at most one effect.
 //! A transfer leaves nothing of its own on-chain, so it creates a receipt in
 //! the same transaction ([`run_transfer`]): the chain then refuses a second
-//! copy, and the receipt is the effect a retry checks.
+//! copy, and the receipt is the effect a retry checks. A pool's generation
+//! keeps its transaction in the pool's document instead (see
+//! [`crate::generation`]), so any worker can finish it.
+
+use std::future::Future;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
@@ -27,12 +31,41 @@ use solana_pubkey::Pubkey;
 use solana_transaction::Transaction;
 use tracing::{error, warn};
 
+use crate::blockchain::counter;
 use crate::blockchain::drt::accounts::{fetch_grant_state, is_pool, GrantState};
 use crate::blockchain::rpc::RpcError;
 use crate::blockchain::transactions::{is_receipt, reached};
 use crate::blockchain::SolanaClient;
 use crate::error::ApiError;
 use crate::idempotency::{Operation, StoredTx};
+
+/// Where a chain step keeps its signed transaction between attempts.
+pub trait TxSlot {
+    fn stored(&self) -> Option<&StoredTx>;
+
+    /// Store `fresh`, replacing the transaction whose signature is
+    /// `replaces`. If another attempt stored a different one first, that one
+    /// is returned instead, and must be used.
+    fn store(
+        &mut self,
+        fresh: StoredTx,
+        replaces: Option<&str>,
+    ) -> impl Future<Output = Result<StoredTx, ApiError>> + Send;
+}
+
+impl TxSlot for Operation<'_> {
+    fn stored(&self) -> Option<&StoredTx> {
+        self.stored_tx()
+    }
+
+    async fn store(
+        &mut self,
+        fresh: StoredTx,
+        replaces: Option<&str>,
+    ) -> Result<StoredTx, ApiError> {
+        self.store_tx(fresh, replaces).await
+    }
+}
 
 /// What a chain step's effect is, so a retry can tell whether it happened.
 /// Each is checked by what the program made, not by an account merely
@@ -46,6 +79,13 @@ pub enum Effect {
     /// A Grant PDA the transaction closes: once its `drt_config` Grant is
     /// gone.
     Closed { pda: Pubkey, drt_config: Pubkey },
+    /// A pool's generation: once the `counter` mint `owner` mints shows at
+    /// least `generation`.
+    Generation {
+        counter: Pubkey,
+        owner: Pubkey,
+        generation: u64,
+    },
 }
 
 impl Effect {
@@ -76,6 +116,15 @@ impl Effect {
                     .map_err(lookup)?
                     != GrantState::Live
             }
+            Self::Generation {
+                counter,
+                owner,
+                generation,
+            } => {
+                let account = rpc.get_account(counter, commitment).await.map_err(lookup)?;
+                counter::generation(account.as_ref(), owner).map_err(ApiError::internal)?
+                    >= *generation
+            }
         })
     }
 
@@ -83,6 +132,7 @@ impl Effect {
     fn account(&self) -> &Pubkey {
         match self {
             Self::Pool(pda) | Self::Grant { pda, .. } | Self::Closed { pda, .. } => pda,
+            Self::Generation { counter, .. } => counter,
         }
     }
 
@@ -99,6 +149,8 @@ impl Effect {
         }
         Ok(Some(match self {
             Self::Closed { .. } => closing_signature(solana, stored, account, commitment).await?,
+            // Only one transaction per generation is ever signed and kept.
+            Self::Generation { .. } => stored.unwrap_or_default().to_string(),
             _ => creating_signature(solana, stored, account, commitment).await?,
         }))
     }
@@ -276,21 +328,21 @@ async fn closing_signature(
 /// reached `commitment`.
 pub async fn run(
     solana: &SolanaClient,
-    op: &mut Operation<'_>,
+    op: &mut impl TxSlot,
     effect: &Effect,
     commitment: &str,
     build: impl Fn(Hash) -> Transaction,
 ) -> Result<String, ApiError> {
     let rpc = solana.rpc();
-    let stored = op.stored_tx().map(|s| s.signature.clone());
+    let stored = op.stored().map(|s| s.signature.clone());
     if let Some(signature) = effect.done(solana, stored.as_deref(), commitment).await? {
         return Ok(signature);
     }
 
-    let to_send = match op.stored_tx().cloned() {
+    let to_send = match op.stored().cloned() {
         None => {
             let fresh = sign(solana, &build).await?;
-            op.store_tx(fresh, None).await?
+            op.store(fresh, None).await?
         }
         Some(stored) => {
             // The finalized height is read first: if it's past the stored
@@ -316,7 +368,7 @@ pub async fn run(
                 // A finalized failure can never succeed, so it may be replaced.
                 Some(s) if reached(&s, "finalized") => {
                     let fresh = sign(solana, &build).await?;
-                    op.store_tx(fresh, Some(&stored.signature)).await?
+                    op.store(fresh, Some(&stored.signature)).await?
                 }
                 Some(_) => {
                     return Err(ApiError::rpc_unavailable("transaction failed on-chain"));
@@ -327,7 +379,7 @@ pub async fn run(
                         return Ok(signature);
                     }
                     let fresh = sign(solana, &build).await?;
-                    op.store_tx(fresh, Some(&stored.signature)).await?
+                    op.store(fresh, Some(&stored.signature)).await?
                 }
             }
         }

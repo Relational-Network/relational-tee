@@ -4,6 +4,7 @@
 //! Solana blockchain interaction: RPC client, transaction building, signing.
 
 pub mod client;
+pub mod counter;
 pub mod drt;
 #[cfg(test)]
 pub mod fake;

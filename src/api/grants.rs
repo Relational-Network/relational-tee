@@ -15,7 +15,9 @@
 //! ends access as soon as the pool document records it, then closes the
 //! Grant PDA; the analyst can't be granted again until that close is
 //! recorded, so each Grant PDA belongs to one grant at a time. A grant
-//! staged before a revocation is never recorded after it.
+//! staged before a revocation is never recorded after it. Recording a grant
+//! or a revocation, and changing a grant's targets, each make the pool's
+//! next generation (see [`crate::generation`]).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::str::FromStr;
@@ -50,6 +52,7 @@ use crate::blockchain::signing::keypair_from_bytes_verified;
 use crate::blockchain::spl_token::token_account_amount;
 use crate::chain::{self, Effect};
 use crate::error::ApiError;
+use crate::generation;
 use crate::idempotency::{Idempotent, JsonBody};
 use crate::ids;
 use crate::state::AppState;
@@ -550,6 +553,7 @@ pub async fn grant_analysis(
                         commitment: hex::encode(commitment),
                         granted_by: caller.user_id.clone(),
                         granted_at: Utc::now(),
+                        staged_generation: Some(doc.generation),
                         signature: None,
                         revoked: None,
                         scopes: vec![GrantScope {
@@ -614,22 +618,19 @@ pub async fn grant_analysis(
     // ── RECORD ────────────────────────────────────────────────────
     // If this fails, a retry with the same key, or the reconciler, adds it.
     grant.signature = Some(signature.clone());
-    let doc = state
-        .storage
-        .pools()
-        .update::<ApiError>(&pool_pda_str, |doc| {
-            if doc.recording(&grant) != Recording::Add {
-                return Ok(Change::Unchanged);
-            }
-            doc.grants.push(grant.clone());
-            Ok(Change::Changed)
-        })
-        .await
-        .inspect_err(|e| {
-            warn!(pool = %pool_pda_str, grant_id = %grant_id, signature = %signature, error = %e,
+    let doc = generation::update(&state.storage, &state.solana_client, &pool_pda_str, |doc| {
+        if doc.recording(&grant) != Recording::Add {
+            return Ok(Change::Unchanged);
+        }
+        doc.grants.push(grant.clone());
+        Ok(Change::Changed)
+    })
+    .await
+    .inspect_err(|e| {
+        warn!(pool = %pool_pda_str, grant_id = %grant_id, signature = %signature, error = %e,
                 "Execute DRT burned; the grant waits for a retry");
-        })?
-        .ok_or_else(|| pool_not_found(&pool_pda_str))?;
+    })?
+    .ok_or_else(|| pool_not_found(&pool_pda_str))?;
     crate::fault::point("recorded");
     let recorded = match doc.recording(&grant) {
         Recording::Present(recorded) => recorded,
@@ -761,67 +762,70 @@ pub async fn revoke_grant(
         revoked_by: caller.user_id.clone(),
         revoked_at: Utc::now(),
         signature: None,
+        generation: None,
     };
     let mut target = String::new();
     op.begin().await?;
-    let doc = state
-        .storage
-        .pools()
-        .update::<ApiError>(&pool_pda_str, |doc| {
-            if let Some(grant) = doc.grants.iter().find(|g| is_mine(g)) {
-                target = grant.grant_id.clone();
+    let doc = generation::update(&state.storage, &state.solana_client, &pool_pda_str, |doc| {
+        let revocation = GrantRevocation {
+            generation: Some(doc.generation),
+            ..revocation.clone()
+        };
+        if let Some(grant) = doc.grants.iter().find(|g| is_mine(g)) {
+            target = grant.grant_id.clone();
+            return Ok(Change::Unchanged);
+        }
+        if let Some(wanted) = &payload.grant_id {
+            let grant = doc
+                .grants
+                .iter_mut()
+                .find(|g| &g.grant_id == wanted)
+                .ok_or_else(no_grant)?;
+            if &grant.analyst != analyst_id || &grant.drt_name != analysis_id {
+                return Err(grant_mismatch());
+            }
+            target = grant.grant_id.clone();
+            if grant.revoked.is_some() {
                 return Ok(Change::Unchanged);
             }
-            if let Some(wanted) = &payload.grant_id {
-                let grant = doc
-                    .grants
-                    .iter_mut()
-                    .find(|g| &g.grant_id == wanted)
-                    .ok_or_else(no_grant)?;
-                if &grant.analyst != analyst_id || &grant.drt_name != analysis_id {
-                    return Err(grant_mismatch());
-                }
-                target = grant.grant_id.clone();
-                if grant.revoked.is_some() {
-                    return Ok(Change::Unchanged);
-                }
-                grant.revoked = Some(revocation.clone());
-                return Ok(Change::Changed);
+            grant.revoked = Some(revocation.clone());
+            return Ok(Change::Changed);
+        }
+        let active = doc.grants.iter_mut().find(|g| {
+            &g.analyst == analyst_id && &g.drt_name == analysis_id && g.revoked.is_none()
+        });
+        if let Some(grant) = active {
+            grant.revoked = Some(revocation.clone());
+            target = grant.grant_id.clone();
+            return Ok(Change::Changed);
+        }
+        let last = doc.latest_grant(analyst_id, analysis_id);
+        match last {
+            Some(last) if is_pending(last) || !unrecorded => {
+                target = last.grant_id.clone();
+                Ok(Change::Unchanged)
             }
-            let active = doc.grants.iter_mut().find(|g| {
-                &g.analyst == analyst_id && &g.drt_name == analysis_id && g.revoked.is_none()
-            });
-            if let Some(grant) = active {
-                grant.revoked = Some(revocation.clone());
-                target = grant.grant_id.clone();
-                return Ok(Change::Changed);
+            _ if unrecorded => {
+                target = revocation_id.clone();
+                doc.grants.push(Grant {
+                    grant_id: revocation_id.clone(),
+                    analyst: analyst_id.clone(),
+                    drt_name: analysis_id.clone(),
+                    commitment: hex::encode(commitment),
+                    granted_by: String::new(),
+                    granted_at: revocation.revoked_at,
+                    staged_generation: None,
+                    signature: None,
+                    revoked: Some(revocation.clone()),
+                    scopes: Vec::new(),
+                });
+                Ok(Change::Changed)
             }
-            let last = doc.latest_grant(analyst_id, analysis_id);
-            match last {
-                Some(last) if is_pending(last) || !unrecorded => {
-                    target = last.grant_id.clone();
-                    Ok(Change::Unchanged)
-                }
-                _ if unrecorded => {
-                    target = revocation_id.clone();
-                    doc.grants.push(Grant {
-                        grant_id: revocation_id.clone(),
-                        analyst: analyst_id.clone(),
-                        drt_name: analysis_id.clone(),
-                        commitment: hex::encode(commitment),
-                        granted_by: String::new(),
-                        granted_at: revocation.revoked_at,
-                        signature: None,
-                        revoked: Some(revocation.clone()),
-                        scopes: Vec::new(),
-                    });
-                    Ok(Change::Changed)
-                }
-                _ => Err(no_grant()),
-            }
-        })
-        .await?
-        .ok_or_else(|| pool_not_found(&pool_pda_str))?;
+            _ => Err(no_grant()),
+        }
+    })
+    .await?
+    .ok_or_else(|| pool_not_found(&pool_pda_str))?;
     audit::grant(&target);
     let grant = doc
         .grants
@@ -921,7 +925,7 @@ pub async fn revoke_grant(
     path = "/v1/drt/pools/{pool_pda}/grant-scope",
     tag = "Grants",
     summary = "Change a grant's targets",
-    description = "Set the targets of an analyst's active grant: from the next request on, the analyst sees the rows of any of them. Nothing is burned or sent on-chain. The edit names the grant (`grant_id`) and its `scope_revision` it started from: an edit of a grant since revoked gets `409 grant_not_active`, even if the analyst was granted again; a stale revision gets `409 version_conflict`; and one that sets the targets the grant already has changes nothing. Every setting is kept in the grant's `scope_history`. Needs `pools:write` and pool ownership. Idempotent.",
+    description = "Set the targets of an analyst's active grant: from the next request on, the analyst sees the rows of any of them. Nothing is burned; like every change of who sees what, the edit mints one token of the pool's counter, so a restored older document can't undo it. The edit names the grant (`grant_id`) and its `scope_revision` it started from: an edit of a grant since revoked gets `409 grant_not_active`, even if the analyst was granted again; a stale revision gets `409 version_conflict`; and one that sets the targets the grant already has changes nothing. Every setting is kept in the grant's `scope_history`. Needs `pools:write` and pool ownership. Idempotent.",
     security(("bearer_auth" = [])),
     params(
         ("pool_pda" = String, Path, description = "Pool PDA address (base58)"),
@@ -971,43 +975,40 @@ pub async fn set_grant_scope(
 
     op.begin().await?;
     let mut target = String::new();
-    let doc = state
-        .storage
-        .pools()
-        .update::<ApiError>(&pool_pda_str, |doc| {
-            let grant = doc
-                .grants
-                .iter_mut()
-                .find(|g| g.grant_id == payload.grant_id)
-                .ok_or_else(no_grant)?;
-            if &grant.analyst != analyst_id || &grant.drt_name != analysis_id {
-                return Err(grant_mismatch());
-            }
-            target = grant.grant_id.clone();
-            if grant.scopes.iter().any(|s| s.change_id == change.change_id) {
-                return Ok(Change::Unchanged);
-            }
-            if grant.revoked.is_some() {
-                return Err(ApiError::conflict(
-                    "the analyst's grant is revoked; grant them again to give them rows",
-                )
-                .with_code("grant_not_active"));
-            }
-            if grant.targets() == Some(&change.targets) {
-                return Ok(Change::Unchanged);
-            }
-            if grant.scope_revision() != payload.revision {
-                return Err(ApiError::conflict(format!(
-                    "the grant's targets changed after revision {}; reload them and edit again",
-                    payload.revision
-                ))
-                .with_code("version_conflict"));
-            }
-            grant.scopes.push(change.clone());
-            Ok(Change::Changed)
-        })
-        .await?
-        .ok_or_else(|| pool_not_found(&pool_pda_str))?;
+    let doc = generation::update(&state.storage, &state.solana_client, &pool_pda_str, |doc| {
+        let grant = doc
+            .grants
+            .iter_mut()
+            .find(|g| g.grant_id == payload.grant_id)
+            .ok_or_else(no_grant)?;
+        if &grant.analyst != analyst_id || &grant.drt_name != analysis_id {
+            return Err(grant_mismatch());
+        }
+        target = grant.grant_id.clone();
+        if grant.scopes.iter().any(|s| s.change_id == change.change_id) {
+            return Ok(Change::Unchanged);
+        }
+        if grant.revoked.is_some() {
+            return Err(ApiError::conflict(
+                "the analyst's grant is revoked; grant them again to give them rows",
+            )
+            .with_code("grant_not_active"));
+        }
+        if grant.targets() == Some(&change.targets) {
+            return Ok(Change::Unchanged);
+        }
+        if grant.scope_revision() != payload.revision {
+            return Err(ApiError::conflict(format!(
+                "the grant's targets changed after revision {}; reload them and edit again",
+                payload.revision
+            ))
+            .with_code("version_conflict"));
+        }
+        grant.scopes.push(change.clone());
+        Ok(Change::Changed)
+    })
+    .await?
+    .ok_or_else(|| pool_not_found(&pool_pda_str))?;
     audit::grant(&target);
     let grant = doc
         .grants
@@ -1270,22 +1271,31 @@ pub(crate) mod tests {
         derive_grant_pda(&commitment).0
     }
 
-    /// The DRT program call in the `n`th transaction sent: its discriminator
-    /// and commitment.
-    fn sent_call(worker: &Worker, n: usize) -> ([u8; 8], [u8; 32]) {
-        let bytes = BASE64.decode(&worker.chain.sent()[n]).unwrap();
-        let tx: solana_transaction::Transaction = bincode::deserialize(&bytes).unwrap();
-        let keys = &tx.message.account_keys;
-        let ix = tx
-            .message
-            .instructions
+    /// The DRT program calls sent, in order, each as its discriminator and
+    /// commitment. The pool's generation anchors aren't among them.
+    fn drt_calls(worker: &Worker) -> Vec<([u8; 8], [u8; 32])> {
+        worker
+            .chain
+            .sent()
             .iter()
-            .find(|ix| keys[usize::from(ix.program_id_index)] == crate::config::drt_program_id())
-            .unwrap();
-        (
-            ix.data[..8].try_into().unwrap(),
-            ix.data[8..40].try_into().unwrap(),
-        )
+            .filter_map(|sent| {
+                let bytes = BASE64.decode(sent).unwrap();
+                let tx: solana_transaction::Transaction = bincode::deserialize(&bytes).unwrap();
+                let keys = &tx.message.account_keys;
+                let ix = tx.message.instructions.iter().find(|ix| {
+                    keys[usize::from(ix.program_id_index)] == crate::config::drt_program_id()
+                })?;
+                Some((
+                    ix.data[..8].try_into().unwrap(),
+                    ix.data[8..40].try_into().unwrap(),
+                ))
+            })
+            .collect()
+    }
+
+    /// The `n`th DRT program call sent.
+    fn sent_call(worker: &Worker, n: usize) -> ([u8; 8], [u8; 32]) {
+        drt_calls(worker)[n]
     }
 
     #[tokio::test]
@@ -1318,7 +1328,16 @@ pub(crate) mod tests {
             send(&worker.app, post(&path, &owner.token, &new_key(), &body)).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(second["grant_id"], granted["grant_id"]);
-        assert_eq!(worker.chain.sent().len(), 1, "one burn");
+        assert_eq!(drt_calls(&worker).len(), 1, "one burn");
+        let doc = worker
+            .storage
+            .pools()
+            .get(&pool_pda.to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(doc.generation, 1, "recording the grant was one change");
+        assert_eq!(doc.grants[0].staged_generation, Some(0));
 
         let grants = format!("/v1/drt/pools/{pool_pda}/grants");
         let (_, _, list) = send(&worker.app, get(&grants, &owner.token)).await;
@@ -1412,7 +1431,7 @@ pub(crate) mod tests {
         assert_eq!(revoked["status"], "revoked");
         assert!(revoked["revoke_signature"].is_string());
         let sent = worker.chain.sent();
-        assert_eq!(sent_call(&worker, sent.len() - 1).0, DISC_REVOKE_GRANT);
+        assert_eq!(drt_calls(&worker).last().unwrap().0, DISC_REVOKE_GRANT);
         worker.chain.close(&pda);
 
         // The first revocation's retry finds its grant closed.
@@ -1466,6 +1485,7 @@ pub(crate) mod tests {
             commitment: hex::encode(commitment),
             granted_by: owner.user_id.clone(),
             granted_at: staged_at,
+            staged_generation: None,
             signature: None,
             revoked: None,
             scopes: Vec::new(),
@@ -1614,7 +1634,7 @@ pub(crate) mod tests {
             send(&worker.app, post(&path, &owner.token, &new_key(), &body)).await;
         assert_eq!(status, StatusCode::CONFLICT, "{refused}");
         assert_eq!(refused["code"], "grant_pda_taken");
-        assert_eq!(worker.chain.sent().len(), 1, "nothing more was sent");
+        assert_eq!(drt_calls(&worker).len(), 1, "nothing more was burned");
     }
 
     #[tokio::test]
@@ -1712,11 +1732,15 @@ pub(crate) mod tests {
         assert_eq!(history.len(), 2);
         assert_eq!(history[0]["revision"], 1);
         assert_eq!(history[1]["set_by"], owner.user_id.as_str());
-        assert_eq!(
-            worker.chain.sent().len(),
-            1,
-            "only the grant's burn was sent"
-        );
+        assert_eq!(drt_calls(&worker).len(), 1, "only the grant burned");
+        let doc = worker
+            .storage
+            .pools()
+            .get(&pool_pda.to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(doc.generation, 2, "the grant and the edit, each a change");
 
         // A retry replays; the same targets from a stale copy converge; other
         // targets from a stale copy are refused.

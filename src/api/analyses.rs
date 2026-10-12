@@ -475,7 +475,7 @@ pub async fn get_analysis(
         (status = 404, description = "Pool or analysis not found"),
         (status = 415, description = "The body isn't JSON"),
         (status = 422, description = "The options ran out of time (`analysis_timeout`)"),
-        (status = 503, description = "The worker is busy (`analysis_busy`, with Retry-After), the analysis log is unavailable, or the chain can't be read to check the grant (`rpc_unavailable`)"),
+        (status = 503, description = "The worker is busy (`analysis_busy`, with Retry-After), the analysis log is unavailable, the chain can't be read to check the grant (`rpc_unavailable`), the pool's last change is still being anchored (`pool_settling`, with Retry-After), or the pool's records are older than its on-chain generation (`pool_records_stale`)"),
     )
 )]
 pub async fn filtered_options(
@@ -565,7 +565,7 @@ async fn options_for(
         (status = 404, description = "Pool or analysis not found"),
         (status = 415, description = "The body isn't JSON"),
         (status = 422, description = "The search ran out of time (`analysis_timeout`)"),
-        (status = 503, description = "The worker is busy (`analysis_busy`, with Retry-After), the analysis log is unavailable, or the chain can't be read to check the grant (`rpc_unavailable`)"),
+        (status = 503, description = "The worker is busy (`analysis_busy`, with Retry-After), the analysis log is unavailable, the chain can't be read to check the grant (`rpc_unavailable`), the pool's last change is still being anchored (`pool_settling`, with Retry-After), or the pool's records are older than its on-chain generation (`pool_records_stale`)"),
     )
 )]
 pub async fn filtered_search(
@@ -652,7 +652,7 @@ async fn search_for(
         (status = 404, description = "Pool or analysis not found"),
         (status = 415, description = "The body isn't JSON"),
         (status = 422, description = "The query ran out of time (`analysis_timeout`)"),
-        (status = 503, description = "The worker is busy (`analysis_busy`, with Retry-After), the analysis log is unavailable, or the chain can't be read to check the grant (`rpc_unavailable`)"),
+        (status = 503, description = "The worker is busy (`analysis_busy`, with Retry-After), the analysis log is unavailable, the chain can't be read to check the grant (`rpc_unavailable`), the pool's last change is still being anchored (`pool_settling`, with Retry-After), or the pool's records are older than its on-chain generation (`pool_records_stale`)"),
     )
 )]
 pub async fn run_query(
@@ -820,6 +820,7 @@ pub(crate) mod tests {
                     commitment: hex::encode(commitment),
                     granted_by: "admin".into(),
                     granted_at: Utc::now(),
+                    staged_generation: None,
                     signature: Some("sig-grant".into()),
                     revoked: None,
                     scopes: if targets.is_empty() {
@@ -1234,6 +1235,7 @@ pub(crate) mod tests {
                     revoked_by: "admin".into(),
                     revoked_at: Utc::now(),
                     signature: None,
+                    generation: None,
                 });
                 Ok(Change::Changed)
             })
@@ -1386,6 +1388,11 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_grants_targets_decide_its_rows_from_the_next_request_on() {
         let worker = worker();
+        // Each edit is a change of the pool's, anchored on-chain.
+        worker
+            .chain
+            .lands
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         let owner = worker.admin("oid-owner").await;
         let pool_pda = awards_pool(&worker, &owner).await;
         let (ana, ana_id) = analyst(&worker.app, "oid-ana").await;

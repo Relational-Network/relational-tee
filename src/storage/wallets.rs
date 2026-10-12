@@ -287,9 +287,32 @@ impl<'a> Wallets<'a> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::storage::tests::{files_storage, two_workers};
+
+    /// A wallet with a Solana keypair, for chain tests: its ID and address.
+    pub(crate) async fn wallet(s: &Storage) -> (String, solana_pubkey::Pubkey) {
+        let (bytes, address) = crate::blockchain::signing::generate_solana_keypair().unwrap();
+        let wallet_id = uuid::Uuid::new_v4().to_string();
+        let keypair = NewKeypair {
+            bytes: Zeroizing::new(bytes),
+            address: address.clone(),
+        };
+        let outcome = s
+            .wallets()
+            .create(
+                &format!("owner-{wallet_id}"),
+                &wallet_id,
+                None,
+                keypair,
+                |_| None,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(outcome, CreateOutcome::Created(_)));
+        (wallet_id, address.parse().unwrap())
+    }
 
     fn keypair(seed: u8) -> NewKeypair {
         NewKeypair {
