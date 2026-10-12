@@ -257,6 +257,7 @@ pub async fn create_malta_pool(
     let doc = PoolDoc {
         generation: 0,
         anchor: None,
+        anchored: 0,
         pool_pda: pool_pda_str.clone(),
         pool_name: payload.pool_name.clone(),
         kind: PoolKind::Malta,

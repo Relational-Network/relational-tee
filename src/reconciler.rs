@@ -323,12 +323,12 @@ async fn finish(
     }
 }
 
-/// Finish the anchors of pools whose last change is still settling. Returns
-/// how many it finished.
+/// Finish the anchors of pools whose last change may still be settling.
+/// Returns how many it settled.
 pub async fn settle_pools(storage: &Storage, solana: &SolanaClient) -> Result<usize, ApiError> {
     let mut settled = 0;
     for doc in storage.pools().all().await? {
-        if doc.anchor.is_none() {
+        if doc.anchored >= doc.generation {
             continue;
         }
         match crate::generation::settle(storage, solana, &doc).await {

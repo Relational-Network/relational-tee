@@ -210,6 +210,7 @@ pub(crate) mod tests {
                 .create(&PoolDoc {
                     generation: 0,
                     anchor: None,
+                    anchored: 0,
                     pool_pda: pool_pda.to_string(),
                     pool_name: "Sealed".into(),
                     kind: PoolKind::Malta,

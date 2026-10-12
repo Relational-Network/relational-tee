@@ -18,8 +18,9 @@
 //! it lands the pool is settling: analyst requests get `503 pool_settling`,
 //! and any worker can finish the anchor under the stored-transaction rule,
 //! as the next change, a request that finds the pool settling, and the
-//! reconciler do. One anchor is kept per generation, so the counter rises
-//! by exactly one for each.
+//! reconciler do. One anchor is signed and kept per generation, until the
+//! next change, so a worker that comes late resends it, and the counter
+//! rises by exactly one for each.
 
 use std::str::FromStr;
 
@@ -148,8 +149,25 @@ impl TxSlot for Anchor<'_> {
     }
 }
 
-/// Take the pool's counter to `doc.generation`, by its anchor, then drop the
-/// anchor from the document.
+/// Record that the counter shows `generation`, unless the document has
+/// moved on. The anchor stays.
+async fn mark_anchored(storage: &Storage, pool_pda: &str, generation: u64) -> Result<(), ApiError> {
+    storage
+        .pools()
+        .update::<StoreError>(pool_pda, |doc| {
+            if doc.generation == generation && doc.anchored < generation {
+                doc.anchored = generation;
+                Ok(Change::Changed)
+            } else {
+                Ok(Change::Unchanged)
+            }
+        })
+        .await?;
+    Ok(())
+}
+
+/// Take the pool's counter to `doc.generation`, by its anchor, and record
+/// that it's there.
 async fn anchor(storage: &Storage, solana: &SolanaClient, doc: &PoolDoc) -> Result<(), ApiError> {
     let owner = owner(doc)?;
     let generation = doc.generation;
@@ -185,22 +203,12 @@ async fn anchor(storage: &Storage, solana: &SolanaClient, doc: &PoolDoc) -> Resu
     )
     .await?;
     info!(pool = %doc.pool_pda, generation, "Anchored a pool's generation");
-    storage
-        .pools()
-        .update::<StoreError>(&doc.pool_pda, |doc| {
-            if doc.generation == generation && doc.anchor.is_some() {
-                doc.anchor = None;
-                Ok(Change::Changed)
-            } else {
-                Ok(Change::Unchanged)
-            }
-        })
-        .await?;
-    Ok(())
+    mark_anchored(storage, &doc.pool_pda, generation).await
 }
 
 /// Bring the counter up to `doc`'s generation if the document's last change
-/// is still settling. A document behind the counter is refused.
+/// is still settling, and record when it's there. A document behind the
+/// counter is refused.
 pub async fn settle(
     storage: &Storage,
     solana: &SolanaClient,
@@ -209,6 +217,9 @@ pub async fn settle(
     let chain = on_chain(solana, doc, "confirmed").await?;
     match check(doc, chain) {
         Err(e) if e.code == "pool_settling" => anchor(storage, solana, doc).await,
+        Ok(()) if doc.anchored < doc.generation => {
+            mark_anchored(storage, &doc.pool_pda, doc.generation).await
+        }
         result => result,
     }
 }
@@ -278,6 +289,7 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::blockchain::fake::{self, FakeChain};
+    use crate::reconciler::settle_pools;
     use crate::storage::pools::tests::pool;
     use crate::storage::tests::files_storage;
 
@@ -333,10 +345,9 @@ pub(crate) mod tests {
             let doc = s.change(name).await.unwrap();
             assert_eq!(doc.generation, i as u64 + 1);
             assert_eq!(s.chain.supply(&s.counter), Some(i as u64 + 1));
-            assert!(
-                s.stored().await.anchor.is_none(),
-                "the anchor is dropped once it lands"
-            );
+            let stored = s.stored().await;
+            assert_eq!(stored.anchored, i as u64 + 1, "recorded once it lands");
+            assert!(stored.anchor.is_some(), "kept for a worker that comes late");
         }
         // A change that changes nothing makes no generation.
         let same = update(&s.storage, &s.solana, "P1", |_| Ok(Change::Unchanged))
@@ -361,7 +372,14 @@ pub(crate) mod tests {
         assert!(s.change("two").await.is_err());
         s.chain.preflight.lock().unwrap().take();
         let pending = s.stored().await;
-        assert_eq!((pending.generation, pending.anchor.is_some()), (2, true));
+        assert_eq!(
+            (
+                pending.generation,
+                pending.anchored,
+                pending.anchor.is_some()
+            ),
+            (2, 1, true)
+        );
         assert_eq!(
             check(&pending, 1).unwrap_err().code,
             "pool_settling",
@@ -405,12 +423,78 @@ pub(crate) mod tests {
             Some(2),
             "replaced, and counted once"
         );
-        assert!(s.stored().await.anchor.is_none());
+        let settled = s.stored().await;
+        assert_eq!(settled.anchored, 2);
+        assert_ne!(
+            settled.anchor.unwrap().signature,
+            first.signature,
+            "the replacement is kept"
+        );
         let landed: Vec<_> = s.chain.landed.lock().unwrap().clone();
         assert!(
             !landed.iter().any(|(sig, _)| *sig == first.signature),
             "the expired one never landed"
         );
+    }
+
+    #[tokio::test]
+    async fn a_worker_that_comes_late_gets_the_landed_anchor_back() {
+        let s = setup().await;
+        s.change("one").await.unwrap();
+        let landed = s.stored().await.anchor.unwrap();
+        // A worker that read the counter before the anchor landed stores the
+        // anchor it signed only now.
+        let mut slot = Anchor {
+            storage: &s.storage,
+            pool_pda: "P1",
+            generation: 1,
+            stored: None,
+        };
+        let late = StoredTx {
+            transaction: String::new(),
+            signature: "late".into(),
+            last_valid_block_height: 0,
+        };
+        let kept = slot.store(late, None).await.unwrap();
+        assert_eq!(kept.signature, landed.signature, "resent, not signed again");
+        assert_eq!(s.chain.supply(&s.counter), Some(1));
+    }
+
+    #[tokio::test]
+    async fn the_reconciler_settles_what_a_worker_left_unrecorded() {
+        let s = setup().await;
+        s.change("one").await.unwrap();
+        // A worker stopped after its anchor landed, before recording it.
+        s.storage
+            .pools()
+            .update::<StoreError>("P1", |doc| {
+                doc.anchored = 0;
+                Ok(Change::Changed)
+            })
+            .await
+            .unwrap();
+        assert_eq!(settle_pools(&s.storage, &s.solana).await.unwrap(), 1);
+        assert_eq!(s.stored().await.anchored, 1);
+        assert_eq!(
+            settle_pools(&s.storage, &s.solana).await.unwrap(),
+            0,
+            "and passes over it after"
+        );
+
+        // Another stopped after writing its change, before storing an anchor.
+        s.storage
+            .pools()
+            .update::<StoreError>("P1", |doc| {
+                doc.generation = 2;
+                doc.anchor = None;
+                Ok(Change::Changed)
+            })
+            .await
+            .unwrap();
+        assert_eq!(settle_pools(&s.storage, &s.solana).await.unwrap(), 1);
+        let doc = s.stored().await;
+        assert_eq!((doc.generation, doc.anchored), (2, 2));
+        assert_eq!(s.chain.supply(&s.counter), Some(2));
     }
 
     #[tokio::test]
@@ -483,7 +567,7 @@ pub(crate) mod tests {
             assert_eq!(on_chain(&solana, &changed, "confirmed").await.unwrap(), n);
         }
         let doc = storage.pools().get(&pool_pda).await.unwrap().unwrap();
-        assert!(doc.anchor.is_none(), "every anchor landed");
+        assert_eq!(doc.anchored, 3, "every anchor landed");
         settle(&storage, &solana, &doc).await.unwrap();
         assert_eq!(on_chain(&solana, &doc, "confirmed").await.unwrap(), 3);
 
