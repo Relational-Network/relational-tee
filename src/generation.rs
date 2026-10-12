@@ -54,6 +54,35 @@ pub fn settling() -> ApiError {
     e
 }
 
+/// The pool made a change while a request ran on an earlier document: the
+/// request starts again from the latest.
+pub fn changed() -> ApiError {
+    let mut e =
+        ApiError::service_unavailable("the pool changed while this request ran; retry shortly")
+            .with_code("pool_settling");
+    e.retry_after = Some(SETTLING_RETRY_SECS);
+    e
+}
+
+/// Whether the pool's stored document has made a change since `doc`.
+pub async fn changed_since(storage: &Storage, doc: &PoolDoc) -> Result<bool, ApiError> {
+    Ok(storage
+        .pools()
+        .get(&doc.pool_pda)
+        .await?
+        .is_some_and(|latest| latest.generation > doc.generation))
+}
+
+/// Refuse to answer from `doc` if the pool has made a change since: a
+/// revocation recorded while a request ran holds for its answer too.
+pub async fn still_current(storage: &Storage, doc: &PoolDoc) -> Result<(), ApiError> {
+    if changed_since(storage, doc).await? {
+        Err(changed())
+    } else {
+        Ok(())
+    }
+}
+
 /// `503 pool_records_stale`, with an alert: `doc` is behind the counter's
 /// generation `chain`, so it was restored from before a change.
 fn stale(doc: &PoolDoc, chain: u64) -> ApiError {
@@ -439,6 +468,20 @@ pub(crate) mod tests {
             !landed.iter().any(|(sig, _)| *sig == first.signature),
             "the expired one never landed"
         );
+    }
+
+    #[tokio::test]
+    async fn an_answer_waits_for_a_change_made_while_its_request_ran() {
+        let s = setup().await;
+        let read = s.stored().await;
+        assert!(still_current(&s.storage, &read).await.is_ok());
+        s.change("one").await.unwrap();
+        let refused = still_current(&s.storage, &read).await.unwrap_err();
+        assert_eq!(
+            (refused.code, refused.retry_after),
+            ("pool_settling", Some(2))
+        );
+        assert!(still_current(&s.storage, &s.stored().await).await.is_ok());
     }
 
     #[tokio::test]

@@ -273,8 +273,9 @@ impl GrantChecks {
     /// Check that `doc` is the pool's latest document: that its generation
     /// is what the pool's counter shows. A reading behind the document is
     /// read again first, as it may be from before the pool's last change; one
-    /// ahead of it is conclusive, as the counter never goes down. A pool
-    /// still settling is finished in the background.
+    /// ahead of it is conclusive, as the counter never goes down, unless the
+    /// stored document has moved on too: then the pool changed while the
+    /// request ran. A pool still settling is finished in the background.
     async fn check_generation(
         self: &Arc<Self>,
         storage: &Arc<Storage>,
@@ -294,6 +295,9 @@ impl GrantChecks {
             chain = shown();
         }
         let chain = chain.ok_or_else(|| ApiError::internal("the pool's counter wasn't read"))?;
+        if chain > doc.generation && crate::generation::changed_since(storage, doc).await? {
+            return Err(crate::generation::changed());
+        }
         let checked = crate::generation::check(doc, chain);
         if checked.as_ref().is_err_and(|e| e.code == "pool_settling") {
             self.settle_in_background(storage, solana, doc);
@@ -853,6 +857,31 @@ mod tests {
             (settling.code, settling.retry_after),
             ("pool_settling", Some(2))
         );
+    }
+
+    #[tokio::test]
+    async fn a_counter_ahead_of_a_request_that_raced_a_change_isnt_a_restore() {
+        // The request read the pool's document, then the owner revoked a
+        // grant as the pool's next generation, whose anchor landed before the
+        // request read the counter.
+        let s = setup(Timing::default());
+        let mut latest = s.doc.clone();
+        latest.generation = 1;
+        s.storage.pools().create(&latest).await.unwrap();
+        s.counter_at(1);
+        let raced = s.verify().await.unwrap_err();
+        assert_eq!((raced.code, raced.retry_after), ("pool_settling", Some(2)));
+        let retried = s
+            .checks
+            .verify(&s.storage, &s.solana, &latest, &s.grant)
+            .await;
+        assert!(retried.unwrap().live, "a retry has the latest document");
+
+        // A restored document is the stored one, and behind the counter.
+        let s = setup(Timing::default());
+        s.storage.pools().create(&s.doc).await.unwrap();
+        s.counter_at(1);
+        assert_eq!(s.verify().await.unwrap_err().code, "pool_records_stale");
     }
 
     #[tokio::test]
