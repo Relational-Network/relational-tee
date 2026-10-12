@@ -95,6 +95,10 @@ fn multipart_error(e: MultipartError) -> ApiError {
 }
 
 impl SealedUpload {
+    pub fn ciphertext_len(&self) -> usize {
+        self.ct.len()
+    }
+
     /// Read the parts `v`, `kid`, `enc` and `ct`, each exactly once, and
     /// nothing else.
     pub async fn read(mut multipart: Multipart) -> Result<Self, ApiError> {

@@ -257,5 +257,7 @@ pub async fn check_scope(
         .analyses
         .scope_counts(&state.storage, &doc, &def)
         .await?;
-    Ok(Json(check(&def, &counts, &request.scope)))
+    Ok(Json(crate::work::cpu(|| {
+        check(&def, &counts, &request.scope)
+    })))
 }

@@ -8,7 +8,6 @@
 //! one of the definition's output columns.
 
 use std::collections::BTreeMap;
-use std::time::Instant;
 
 use rusqlite::{Connection, Statement, ToSql};
 use serde::{Deserialize, Serialize};
@@ -18,6 +17,7 @@ use utoipa::ToSchema;
 use super::dates;
 use super::definition::{ColumnType, Definition, Direction, FilterKind, RECORD_ID};
 use super::table::Table;
+use crate::work::Stop;
 
 /// The most values one select filter may name.
 const MAX_SELECTED: usize = 1000;
@@ -488,14 +488,18 @@ fn like_prefix(prefix: &str) -> String {
 }
 
 impl Table {
-    /// Run `f` on the connection, stopping it at `deadline`.
+    /// Run `f` on the connection, stopping it once `stop` fires.
     fn run<T>(
         &self,
-        deadline: Instant,
+        stop: &Stop,
         f: impl FnOnce(&Connection) -> Result<T, QueryError>,
     ) -> Result<T, QueryError> {
+        if stop.stopped() {
+            return Err(QueryError::Timeout);
+        }
         let conn = self.connection();
-        conn.progress_handler(DEADLINE_STEPS, Some(move || Instant::now() >= deadline))?;
+        let stopping = stop.clone();
+        conn.progress_handler(DEADLINE_STEPS, Some(move || stopping.stopped()))?;
         let result = f(&conn);
         conn.progress_handler(0, None::<fn() -> bool>)?;
         result
@@ -503,14 +507,9 @@ impl Table {
 
     /// The page `query` asks for, and how many rows match in all: every row
     /// when it sets no filter, so then nothing is counted.
-    pub fn page(
-        &self,
-        def: &Definition,
-        query: &Query,
-        deadline: Instant,
-    ) -> Result<Page, QueryError> {
+    pub fn page(&self, def: &Definition, query: &Query, stop: &Stop) -> Result<Page, QueryError> {
         let (conditions, binds) = query.conditions();
-        self.run(deadline, |conn| {
+        self.run(stop, |conn| {
             let total = if query.filters.is_empty() {
                 self.rows as u64
             } else {
@@ -545,7 +544,7 @@ impl Table {
         &self,
         def: &Definition,
         query: &Query,
-        deadline: Instant,
+        stop: &Stop,
     ) -> Result<BTreeMap<String, FilterOptions>, QueryError> {
         let mut options = self.options().clone();
         let narrowed_filters: Vec<_> = def
@@ -561,7 +560,7 @@ impl Table {
         if narrowed_filters.is_empty() {
             return Ok(options);
         }
-        self.run(deadline, |conn| {
+        self.run(stop, |conn| {
             for (filter, sql, binds) in narrowed_filters {
                 options.insert(
                     filter.name.clone(),
@@ -581,7 +580,7 @@ impl Table {
         prefix: &str,
         limit: u32,
         query: &Query,
-        deadline: Instant,
+        stop: &Stop,
     ) -> Result<Vec<String>, QueryError> {
         match def.filter(filter).map(|f| f.kind) {
             Some(FilterKind::SearchSelect) => {}
@@ -598,7 +597,7 @@ impl Table {
         };
         let (conditions, binds) = query.conditions_except(Some(filter));
         let sql = narrowed(def, &conditions, sql);
-        self.run(deadline, |conn| {
+        self.run(stop, |conn| {
             let mut statement = conn.prepare(&sql)?;
             bind_all(&mut statement, &binds)?;
             bind(&mut statement, ":search", &like_prefix(prefix))?;
@@ -620,7 +619,7 @@ mod tests {
     use super::*;
     use crate::analysis::definition::tests::{awards_report, AWARDS_REPORT};
     use crate::analysis::table::tests::only;
-    use crate::analysis::table::{check_targets, Conditions, Scope, Target};
+    use crate::analysis::table::{check_targets, Conditions, Scope, TableError, Target};
 
     const HEADER: &str = "Staff Number,Membership Number,Title,First Name,Surname,Date of Birth,\
                           Employer,Employer Group,Award,Award Grade,Exam Board Date";
@@ -714,7 +713,11 @@ mod tests {
 
     fn table(scope: &Scope) -> Table {
         let (first, second) = (upload(&ROWS[..6]), upload(&ROWS[6..]));
-        Table::build(&awards_report(), &[&first, &second], scope).unwrap()
+        build(&awards_report(), &[&first, &second], scope)
+    }
+
+    fn build(def: &Definition, datasets: &[&[u8]], scope: &Scope) -> Table {
+        Table::build(def, datasets, scope, &soon()).unwrap()
     }
 
     fn groups(names: &[&str]) -> Scope {
@@ -726,8 +729,8 @@ mod tests {
         )
     }
 
-    fn soon() -> Instant {
-        Instant::now() + Duration::from_secs(5)
+    fn soon() -> Stop {
+        Stop::after(Duration::from_secs(5))
     }
 
     fn request(json: serde_json::Value) -> QueryRequest {
@@ -737,7 +740,7 @@ mod tests {
     fn run(table: &Table, json: serde_json::Value) -> Page {
         let def = awards_report();
         let query = Query::check(&def, &request(json)).unwrap();
-        table.page(&def, &query, soon()).unwrap()
+        table.page(&def, &query, &soon()).unwrap()
     }
 
     fn column(page: &Page, name: &str) -> Vec<String> {
@@ -755,7 +758,7 @@ mod tests {
             .map(|award| ["000123", "Bravo", "Bank A", "Group A", award, "01/01/2026"])
             .collect();
         let csv = upload(&rows);
-        let table = Table::build(&awards_report(), &[&csv], &Scope::All).unwrap();
+        let table = build(&awards_report(), &[&csv], &Scope::All);
         let FilterOptions::Values(values) = &table.options()["award"] else {
             panic!("award is a multi-select");
         };
@@ -798,7 +801,7 @@ mod tests {
         )
         .unwrap();
         let (first, second) = (upload(&ROWS[..6]), upload(&ROWS[6..]));
-        let rows = |scope: &Scope| Table::build(&def, &[&first, &second], scope).unwrap().rows;
+        let rows = |scope: &Scope| build(&def, &[&first, &second], scope).rows;
         assert_eq!(rows(&only(&[&[("surname", "Bravo")]])), 2);
         // An entry's conditions apply together, and entries add up.
         let delta_in_group_a = [("employer_group", "Group A"), ("surname", "Delta")];
@@ -818,12 +821,11 @@ mod tests {
         };
         assert!(check_targets(&awards, std::slice::from_ref(&bravo)).is_err());
         assert!(check_targets(&def, &[bravo]).is_ok());
-        let bank_c_or_bravo = Table::build(
+        let bank_c_or_bravo = build(
             &awards,
             &[&first, &second],
             &only(&[&[("surname", "Bravo")], &[("employer", "Bank C")]]),
-        )
-        .unwrap();
+        );
         assert_eq!(bank_c_or_bravo.rows, 1, "unknown keys match nothing");
     }
 
@@ -851,14 +853,14 @@ mod tests {
 
         let none = Query::check(&def, &QueryRequest::default()).unwrap();
         let search = |prefix: &str, limit: u32| {
-            group_a.search(&def, "staff_number", prefix, limit, &none, soon())
+            group_a.search(&def, "staff_number", prefix, limit, &none, &soon())
         };
         assert_eq!(search("00", 10).unwrap(), ["000123", "001234"]);
         assert_eq!(search("03", 10).unwrap(), Vec::<String>::new());
         assert_eq!(search("0%", 10).unwrap(), Vec::<String>::new());
         assert_eq!(search("", 1).unwrap().len(), 1);
         assert!(matches!(
-            group_a.search(&def, "award", "C", 10, &none, soon()),
+            group_a.search(&def, "award", "C", 10, &none, &soon()),
             Err(QueryError::Invalid(_))
         ));
         assert!(matches!(search("0", 101), Err(QueryError::Invalid(_))));
@@ -871,7 +873,7 @@ mod tests {
         let filtered = |json: serde_json::Value| {
             Query::check(&def, &request(serde_json::json!({ "filters": json }))).unwrap()
         };
-        let facets = |query: &Query| all.facets(&def, query, soon()).unwrap();
+        let facets = |query: &Query| all.facets(&def, query, &soon()).unwrap();
         let award_counts = |options: &BTreeMap<String, FilterOptions>| {
             let FilterOptions::Values(values) = &options["award"] else {
                 panic!("award options are values");
@@ -915,7 +917,7 @@ mod tests {
 
         // A search keeps to the rows the other filters match, not its own.
         let search = |query: &Query| {
-            all.search(&def, "staff_number", "0", 20, query, soon())
+            all.search(&def, "staff_number", "0", 20, query, &soon())
                 .unwrap()
         };
         assert_eq!(search(&diploma), ["000123", "001234", "030002"]);
@@ -925,7 +927,7 @@ mod tests {
         }));
         assert_eq!(search(&staff), ["000123", "001234", "030002"]);
         let membership = all
-            .search(&def, "membership_number", "M", 20, &staff, soon())
+            .search(&def, "membership_number", "M", 20, &staff, &soon())
             .unwrap();
         assert_eq!(membership, ["M0001"]);
     }
@@ -1111,13 +1113,37 @@ mod tests {
         let def = awards_report();
         // Enough rows that a query takes more steps than one deadline check.
         let many = upload(&[ROWS[0]; 5000]);
-        let all = Table::build(&def, &[&many], &Scope::All).unwrap();
+        let all = build(&def, &[&many], &Scope::All);
         let query = Query::check(&def, &QueryRequest::default()).unwrap();
-        assert_eq!(
-            all.page(&def, &query, Instant::now()),
-            Err(QueryError::Timeout)
-        );
-        all.page(&def, &query, soon()).unwrap();
+        let past = Stop::at(std::time::Instant::now());
+        assert_eq!(all.page(&def, &query, &past), Err(QueryError::Timeout));
+        let abandoned = soon();
+        abandoned.abandon();
+        assert_eq!(all.page(&def, &query, &abandoned), Err(QueryError::Timeout));
+        all.page(&def, &query, &soon()).unwrap();
+    }
+
+    #[test]
+    fn a_build_stops_between_records_and_inside_sqlite() {
+        let def = awards_report();
+        let many = upload(&[ROWS[0]; 5000]);
+        let stopped = Stop::at(std::time::Instant::now());
+        assert!(matches!(
+            Table::build(&def, &[&many], &Scope::All, &stopped),
+            Err(TableError::Stopped)
+        ));
+        // A build abandoned while it runs stops soon after.
+        let stop = Stop::after(Duration::from_secs(60));
+        let abandoning = stop.clone();
+        let started = std::time::Instant::now();
+        let builder = std::thread::spawn(move || {
+            let big = upload(&[ROWS[0]; 200_000]);
+            Table::build(&def, &[&big], &Scope::All, &stop).map(|t| t.rows)
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        abandoning.abandon();
+        assert!(matches!(builder.join().unwrap(), Err(TableError::Stopped)));
+        assert!(started.elapsed() < Duration::from_secs(10));
     }
 
     /// `n` rows that tie, differ only in case, repeat and leave values
@@ -1163,7 +1189,7 @@ mod tests {
     fn wrapped(table: &Table, def: &Definition, query: &Query) -> Page {
         let (_, binds) = query.conditions();
         table
-            .run(soon(), |conn| {
+            .run(&soon(), |conn| {
                 let mut count = conn.prepare(&def.count_sql())?;
                 bind_all(&mut count, &binds)?;
                 let total: i64 = count.raw_query().next()?.map_or(Ok(0), |row| row.get(0))?;
@@ -1222,10 +1248,10 @@ mod tests {
             }
         }
         for scope in [Scope::All, groups(&["Group A"])] {
-            let table = Table::build(&def, &[&data], &scope).unwrap();
+            let table = build(&def, &[&data], &scope);
             for json in &requests {
                 let query = Query::check(&def, &request(json.clone())).unwrap();
-                let page = table.page(&def, &query, soon()).unwrap();
+                let page = table.page(&def, &query, &soon()).unwrap();
                 assert_eq!(page, wrapped(&table, &def, &query), "{scope:?} {json}");
             }
         }
@@ -1246,7 +1272,7 @@ mod tests {
     #[test]
     fn pages_and_searches_read_the_indexes() {
         let def = awards_report();
-        let all = Table::build(&def, &[&varied(400)], &Scope::All).unwrap();
+        let all = build(&def, &[&varied(400)], &Scope::All);
         let page_plan = |json: serde_json::Value| {
             let query = Query::check(&def, &request(json)).unwrap();
             let (conditions, _) = query.conditions();

@@ -8,7 +8,9 @@
 //! only its own. Datasets and tables also reserve their memory from the
 //! worker's budget before they load, and hold it while anything uses them.
 //! SQLite and counting work runs on blocking threads, about one per CPU at a
-//! time.
+//! time, and stops at its deadline or once no request waits for it. Work on
+//! a table waits for the table's earlier work before it takes a thread, so
+//! a busy table can't hold every thread.
 
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -16,18 +18,18 @@ use std::time::Duration;
 
 use lru::LruCache;
 use sha2::{Digest, Sha256};
-use tokio::sync::Semaphore;
 use tracing::info;
 use zeroize::Zeroizing;
 
 use super::cache::{Cache, Weigh};
 use super::definition::Definition;
-use super::table::{Scope, ScopeCounts, Table};
+use super::table::{Scope, ScopeCounts, Table, TableError};
 use crate::budget::{Budget, Reservation};
 use crate::config::MAX_BODY_SIZE;
 use crate::error::ApiError;
 use crate::storage::pools::{PoolDoc, Upload};
 use crate::storage::{Storage, StoreError};
+use crate::work::{Stop, Threads, QUEUE_WAIT};
 
 /// Memory for decrypted datasets.
 const DATASET_BUDGET: usize = 512 << 20;
@@ -39,13 +41,14 @@ const COUNTS_BUDGET: usize = 64 << 20;
 const MAX_ENTRIES: usize = 1024;
 /// The most parsed definitions kept.
 const MAX_DEFINITIONS: NonZeroUsize = NonZeroUsize::new(256).expect("not zero");
-/// How long a request waits for a free thread before it gets 503.
-const QUEUE_WAIT: Duration = Duration::from_secs(1);
 /// How long a load waits for memory before it gets 503.
 const MEMORY_WAIT: Duration = Duration::from_secs(5);
 /// What building a table reserves per byte of its datasets' CSV, before it
 /// knows the table's size: SQLite's pages and indexes, and the parsed rows.
 const TABLE_BYTES_PER_CSV_BYTE: usize = 4;
+/// How long building a table or counting scope values may take: well inside
+/// the request time limit.
+const BUILD_TIME: Duration = Duration::from_secs(30);
 
 /// How long one statement may run: well inside the request time limit.
 pub const DEADLINE: Duration = Duration::from_secs(10);
@@ -117,7 +120,7 @@ pub struct Analyses {
     datasets: Cache<(String, String), Dataset>,
     tables: Cache<TableKey, Table>,
     counts: Cache<Version, ScopeCounts>,
-    threads: Arc<Semaphore>,
+    threads: Threads,
     memory: Arc<Budget>,
 }
 
@@ -135,16 +138,31 @@ fn busy() -> ApiError {
     e
 }
 
+/// A table build's or count's error, as the API reports it.
+fn build_error(what: &str, e: TableError) -> ApiError {
+    match e {
+        TableError::Stopped => {
+            ApiError::unprocessable(format!("{what} ran out of time; try again shortly"))
+                .with_code("analysis_timeout")
+        }
+        e => ApiError::internal(format!("{what} failed: {e}")),
+    }
+}
+
 impl Analyses {
-    /// Analyses whose datasets and tables reserve their memory from `memory`.
+    /// Analyses whose datasets and tables reserve their memory from `memory`,
+    /// with a thread per CPU.
     pub fn new(memory: Arc<Budget>) -> Self {
-        let cpus = std::thread::available_parallelism().map_or(2, |n| n.get());
+        Self::with_threads(memory, Threads::default())
+    }
+
+    pub fn with_threads(memory: Arc<Budget>, threads: Threads) -> Self {
         Self {
             definitions: Mutex::new(LruCache::new(MAX_DEFINITIONS)),
             datasets: Cache::new(DATASET_BUDGET, MAX_ENTRIES),
             tables: Cache::new(TABLE_BUDGET, MAX_ENTRIES),
             counts: Cache::new(COUNTS_BUDGET, MAX_ENTRIES),
-            threads: Arc::new(Semaphore::new(cpus)),
+            threads,
             memory,
         }
     }
@@ -213,11 +231,11 @@ impl Analyses {
                 let (definition, scope) = (definition.clone(), scope.clone());
                 let pool_pda = doc.pool_pda.clone();
                 let mut table = self
-                    .blocking(move || {
+                    .threads
+                    .run(Stop::after(BUILD_TIME), move |stop| {
                         let csvs: Vec<&[u8]> = datasets.iter().map(|d| d.csv.as_slice()).collect();
-                        let table = Table::build(&definition, &csvs, &scope).map_err(|e| {
-                            ApiError::internal(format!("building the analysis table failed: {e}"))
-                        })?;
+                        let table = Table::build(&definition, &csvs, &scope, stop)
+                            .map_err(|e| build_error("building the analysis table", e))?;
                         info!(pool = %pool_pda, rows = table.rows, bytes = table.bytes,
                             "Built an analysis table");
                         Ok(table)
@@ -244,13 +262,13 @@ impl Analyses {
             .get_or_load(version, || async {
                 let datasets = self.datasets(storage, &doc.pool_pda, &uploads).await?;
                 let definition = definition.clone();
-                self.blocking(move || {
-                    let csvs: Vec<&[u8]> = datasets.iter().map(|d| d.csv.as_slice()).collect();
-                    ScopeCounts::count(&definition, &csvs).map_err(|e| {
-                        ApiError::internal(format!("counting the pool's scope values failed: {e}"))
+                self.threads
+                    .run(Stop::after(BUILD_TIME), move |stop| {
+                        let csvs: Vec<&[u8]> = datasets.iter().map(|d| d.csv.as_slice()).collect();
+                        ScopeCounts::count(&definition, &csvs, stop)
+                            .map_err(|e| build_error("counting the pool's scope values", e))
                     })
-                })
-                .await
+                    .await
             })
             .await
     }
@@ -293,7 +311,9 @@ impl Analyses {
                     .ok_or_else(|| {
                         ApiError::internal(format!("upload {} has no dataset", upload.record_id))
                     })?;
-                if hex::encode(Sha256::digest(csv.as_slice())) != upload.sha256 {
+                let digest =
+                    crate::work::cpu_for(csv.len(), || hex::encode(Sha256::digest(csv.as_slice())));
+                if digest != upload.sha256 {
                     return Err(StoreError::Integrity(format!(
                         "upload {}'s dataset doesn't match its digest",
                         upload.record_id
@@ -306,22 +326,24 @@ impl Analyses {
             .await
     }
 
-    /// Run `work` on a blocking thread once one is free, or 503 if none
-    /// frees up within a second.
-    pub async fn blocking<T: Send + 'static>(
+    /// Run `work` on `table` once the table's earlier work is done and a
+    /// thread is free, waiting up to a second for each, or 503. `work`
+    /// stops after [`DEADLINE`], or once this future is dropped.
+    pub async fn on_table<T: Send + 'static>(
         &self,
-        work: impl FnOnce() -> Result<T, ApiError> + Send + 'static,
+        table: Arc<Table>,
+        work: impl FnOnce(&Table, &Stop) -> Result<T, ApiError> + Send + 'static,
     ) -> Result<T, ApiError> {
-        let permit = tokio::time::timeout(QUEUE_WAIT, self.threads.clone().acquire_owned())
+        let turn = tokio::time::timeout(QUEUE_WAIT, table.turn())
             .await
             .map_err(|_| busy())?
-            .map_err(|_| ApiError::internal("the analysis threads are closed"))?;
-        tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            work()
-        })
-        .await
-        .map_err(|e| ApiError::internal(format!("an analysis task failed: {e}")))?
+            .ok_or_else(|| ApiError::internal("the table's queue is closed"))?;
+        self.threads
+            .run(Stop::after(DEADLINE), move |stop| {
+                let _turn = turn;
+                work(&table, stop)
+            })
+            .await
     }
 
     /// The datasets and tables loaded so far, and their bytes.
@@ -575,34 +597,74 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn work_waits_for_a_free_thread_and_then_gives_up() {
-        let analyses = Analyses {
-            threads: Arc::new(Semaphore::new(1)),
-            ..Analyses::default()
-        };
-        let (started, release) = (
-            Arc::new(tokio::sync::Notify::new()),
-            Arc::new(std::sync::Barrier::new(2)),
+    async fn a_busy_table_queues_its_own_work_and_leaves_threads_for_others() {
+        let storage = Storage::new(
+            Arc::new(LocalFiles::temporary()),
+            StorageKeys::derive(&fixed_key(1)),
+            "worker-a".into(),
         );
-        let (notify, wait) = (started.clone(), release.clone());
-        let busy = analyses.blocking(move || {
-            notify.notify_one();
-            wait.wait();
-            Ok(1)
-        });
-        let refused = async {
-            started.notified().await;
-            let refused = analyses.blocking(|| Ok(2)).await;
+        let hash = storage
+            .scripts()
+            .put(AWARDS_REPORT.as_bytes())
+            .await
+            .unwrap();
+        let analyses = Analyses::with_threads(Arc::new(Budget::default()), Threads::new(2));
+        let definition = analyses.definition(&storage, &hash).await.unwrap();
+        let mut doc = pool("P1", "w1");
+        doc.initial = Some(
+            upload(
+                &storage,
+                INITIAL,
+                &[("Bank A", "Group A"), ("Bank C", "Group C")],
+            )
+            .await,
+        );
+        let busy = analyses
+            .table(&storage, &doc, &definition, &Scope::All)
+            .await
+            .unwrap();
+        let other = analyses
+            .table(
+                &storage,
+                &doc,
+                &definition,
+                &only(&[&[("employer_group", "Group A")]]),
+            )
+            .await
+            .unwrap();
+
+        // A slow request holds the busy table, and five more queue for it.
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let (started, running) = tokio::sync::oneshot::channel();
+        let slow = {
+            let release = release.clone();
+            analyses.on_table(busy.clone(), move |table, _| {
+                let _ = started.send(());
+                release.wait();
+                Ok(table.rows)
+            })
+        };
+        let queued = futures_util::future::join_all(
+            (0..5).map(|_| analyses.on_table(busy.clone(), |table, _| Ok(table.rows))),
+        );
+        let meanwhile = async {
+            running.await.unwrap();
+            tokio::task::yield_now().await;
+            assert_eq!(
+                analyses.threads.available(),
+                1,
+                "queued work holds no thread"
+            );
+            let rows = analyses
+                .on_table(other.clone(), |table, _| Ok(table.rows))
+                .await;
             release.wait();
-            refused
+            rows
         };
-        let (busy, refused) = tokio::join!(busy, refused);
-        assert_eq!(busy.unwrap(), 1);
-        let refused = refused.unwrap_err();
-        assert_eq!(
-            (refused.code, refused.retry_after),
-            ("analysis_busy", Some(1))
-        );
-        assert_eq!(analyses.blocking(|| Ok(3)).await.unwrap(), 3);
+        let (slow, queued, meanwhile) = tokio::join!(slow, queued, meanwhile);
+        assert_eq!(slow.unwrap(), 2);
+        assert_eq!(meanwhile.unwrap(), 1, "the other table didn't wait");
+        assert!(queued.into_iter().all(|rows| rows.unwrap() == 2));
+        assert_eq!(analyses.threads.available(), 2);
     }
 }

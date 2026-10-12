@@ -319,7 +319,9 @@ impl Sealed {
         path: &str,
     ) -> Result<Option<Zeroizing<Vec<u8>>>, StoreError> {
         match self.store.get(path, None).await? {
-            Fetched::Found { body, .. } => Ok(Some(self.keys.open(self.container, path, &body)?)),
+            Fetched::Found { body, .. } => Ok(Some(crate::work::cpu_for(body.len(), || {
+                self.keys.open(self.container, path, &body)
+            })?)),
             Fetched::Missing => Ok(None),
             Fetched::NotModified => Err(StoreError::Invalid(format!(
                 "{path} was \"not modified\" on an unconditional read"
@@ -345,7 +347,8 @@ impl Sealed {
 
     /// Create the object unless `path` is taken, without caching it.
     pub async fn create_uncached(&self, path: &str, plain: &[u8]) -> Result<Created, StoreError> {
-        let sealed = self.keys.seal(self.container, path, plain)?;
+        let sealed =
+            crate::work::cpu_for(plain.len(), || self.keys.seal(self.container, path, plain))?;
         self.store.put_if_absent(path, Bytes::from(sealed)).await
     }
 

@@ -59,6 +59,7 @@ mod storage;
 mod store;
 mod tee;
 mod tls;
+mod work;
 
 use axum::{
     http::{header, HeaderValue},
@@ -499,9 +500,26 @@ async fn open_storage(
     Ok((storage::Storage::new(state, keys, worker_id), public))
 }
 
-/// Service entrypoint: read configuration, build the router, and serve.
-#[tokio::main]
-async fn main() {
+/// How long blocking work still running when serving stops may delay the
+/// exit. Abandoned work stops sooner by itself.
+const SHUTDOWN_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Service entrypoint: serve until shut down, then give blocking work
+/// [`SHUTDOWN_WAIT`] to finish.
+fn main() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap_or_else(|e| {
+            eprintln!("Couldn't start the async runtime: {e}");
+            std::process::exit(1);
+        });
+    runtime.block_on(serve());
+    runtime.shutdown_timeout(SHUTDOWN_WAIT);
+}
+
+/// Read configuration, build the router, and serve.
+async fn serve() {
     if std::env::args().nth(1).as_deref() == Some("openapi") {
         println!("{}", openapi_document());
         return;

@@ -117,23 +117,26 @@ impl Attestation {
     /// keep serving the previous token until it expires.
     pub fn spawn_refresher(self: &Arc<Self>, provider: Arc<dyn AttestationProvider>) {
         let this = Arc::clone(self);
-        tokio::spawn(async move {
-            let mut delay = FIRST_RETRY_DELAY;
-            loop {
-                match this.refresh(provider.as_ref()).await {
-                    Ok(next) => {
-                        info!(
-                            refresh_in_secs = next.as_secs(),
-                            "Next attestation refresh scheduled"
-                        );
-                        delay = FIRST_RETRY_DELAY;
-                        tokio::time::sleep(next).await;
-                    }
-                    Err(e) => {
-                        warn!(error = %e, retry_in_secs = delay.as_secs(),
-                            "Attestation token refresh failed");
-                        tokio::time::sleep(delay).await;
-                        delay = (delay * 2).min(MAX_RETRY_DELAY);
+        crate::work::supervise("attestation", move || {
+            let (this, provider) = (this.clone(), provider.clone());
+            async move {
+                let mut delay = FIRST_RETRY_DELAY;
+                loop {
+                    match this.refresh(provider.as_ref()).await {
+                        Ok(next) => {
+                            info!(
+                                refresh_in_secs = next.as_secs(),
+                                "Next attestation refresh scheduled"
+                            );
+                            delay = FIRST_RETRY_DELAY;
+                            tokio::time::sleep(next).await;
+                        }
+                        Err(e) => {
+                            warn!(error = %e, retry_in_secs = delay.as_secs(),
+                                "Attestation token refresh failed");
+                            tokio::time::sleep(delay).await;
+                            delay = (delay * 2).min(MAX_RETRY_DELAY);
+                        }
                     }
                 }
             }

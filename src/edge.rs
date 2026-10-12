@@ -126,14 +126,17 @@ impl Limiter {
     /// so memory follows recent callers rather than every caller ever seen.
     pub fn spawn_cleanup(self: &Arc<Self>) {
         let limiter = Arc::clone(self);
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(CLEANUP_INTERVAL);
-            loop {
-                tick.tick().await;
-                limiter.per_ip.retain_recent();
-                limiter.per_ip.shrink_to_fit();
-                limiter.per_user.retain_recent();
-                limiter.per_user.shrink_to_fit();
+        crate::work::supervise("rate_limit_cleanup", move || {
+            let limiter = limiter.clone();
+            async move {
+                let mut tick = tokio::time::interval(CLEANUP_INTERVAL);
+                loop {
+                    tick.tick().await;
+                    limiter.per_ip.retain_recent();
+                    limiter.per_ip.shrink_to_fit();
+                    limiter.per_user.retain_recent();
+                    limiter.per_user.shrink_to_fit();
+                }
             }
         });
     }

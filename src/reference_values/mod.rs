@@ -196,14 +196,17 @@ impl ReferenceValues {
     /// Keep the manifest fresh for the process lifetime.
     pub fn spawn(self: &Arc<Self>) {
         let this = Arc::clone(self);
-        tokio::spawn(async move {
-            loop {
-                if let Err(e) = this.refresh().await {
-                    warn!(error = %e, "Reference-values check failed");
+        crate::work::supervise("reference_values", move || {
+            let this = this.clone();
+            async move {
+                loop {
+                    if let Err(e) = this.refresh().await {
+                        warn!(error = %e, "Reference-values check failed");
+                    }
+                    let settled = this.served.read().is_ok_and(|s| s.is_some())
+                        && this.followed.load(Ordering::Relaxed);
+                    tokio::time::sleep(if settled { POLL } else { FIRST_POLL }).await;
                 }
-                let settled = this.served.read().is_ok_and(|s| s.is_some())
-                    && this.followed.load(Ordering::Relaxed);
-                tokio::time::sleep(if settled { POLL } else { FIRST_POLL }).await;
             }
         });
     }

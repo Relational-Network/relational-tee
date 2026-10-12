@@ -156,14 +156,17 @@ impl Health {
     /// Run the storage canary now and then every [`CANARY_INTERVAL`].
     pub fn spawn_canary(self: &Arc<Self>, storage: Arc<Storage>) {
         let health = Arc::clone(self);
-        tokio::spawn(async move {
-            loop {
-                let result = storage.canary().await;
-                if let Err(e) = &result {
-                    warn!(error = %e, "Storage canary failed");
+        crate::work::supervise("storage_canary", move || {
+            let (health, storage) = (health.clone(), storage.clone());
+            async move {
+                loop {
+                    let result = storage.canary().await;
+                    if let Err(e) = &result {
+                        warn!(error = %e, "Storage canary failed");
+                    }
+                    health.record_canary(result.is_ok());
+                    tokio::time::sleep(CANARY_INTERVAL).await;
                 }
-                health.record_canary(result.is_ok());
-                tokio::time::sleep(CANARY_INTERVAL).await;
             }
         });
     }
@@ -171,17 +174,20 @@ impl Health {
     /// Check Solana RPC every [`RPC_CHECK_INTERVAL`], for `/health` only.
     pub fn spawn_rpc_check(self: &Arc<Self>, solana: Arc<SolanaClient>) {
         let health = Arc::clone(self);
-        tokio::spawn(async move {
-            loop {
-                let ok = match solana.rpc().get_health().await {
-                    Ok(()) => true,
-                    Err(e) => {
-                        warn!(error = %e, "Solana RPC check failed");
-                        false
-                    }
-                };
-                health.record_rpc(ok);
-                tokio::time::sleep(RPC_CHECK_INTERVAL).await;
+        crate::work::supervise("rpc_check", move || {
+            let (health, solana) = (health.clone(), solana.clone());
+            async move {
+                loop {
+                    let ok = match solana.rpc().get_health().await {
+                        Ok(()) => true,
+                        Err(e) => {
+                            warn!(error = %e, "Solana RPC check failed");
+                            false
+                        }
+                    };
+                    health.record_rpc(ok);
+                    tokio::time::sleep(RPC_CHECK_INTERVAL).await;
+                }
             }
         });
     }
