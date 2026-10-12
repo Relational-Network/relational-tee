@@ -34,6 +34,7 @@ mod attestation;
 mod audit;
 mod auth;
 mod blockchain;
+mod budget;
 mod chain;
 mod config;
 mod data_validation;
@@ -649,8 +650,14 @@ async fn main() {
         history,
         grant_checks: Arc::default(),
         fetcher: Arc::new(analysis::fetch::GitHub::new()),
-        analyses: Arc::default(),
+        analyses: Arc::new(analysis::runner::Analyses::new(Arc::new(
+            budget::Budget::new(server_config.memory_budget_mib << 20),
+        ))),
     };
+    info!(
+        mib = server_config.memory_budget_mib,
+        "Memory budget for uploads, datasets and tables"
+    );
 
     state.health.spawn_canary(state.storage.clone());
     state.health.spawn_rpc_check(state.solana_client.clone());
@@ -706,10 +713,12 @@ async fn main() {
 /// request context is outermost, so every response, the fallback's and
 /// CORS preflights included, carries `X-Request-Id` and the error body;
 /// CORS comes next, so rate-limited responses carry its headers too. The
-/// upload routes may send more, for longer, than the rest.
+/// upload routes may send more, for longer, than the rest, once there's
+/// memory for what they send.
 fn router(state: AppState) -> Router {
     let cors = edge::cors(&state.dashboard_origin);
     let limiter = state.limiter.clone();
+    let memory = state.analyses.memory().clone();
     let routes = Router::new()
         // Health endpoints (unversioned for k8s probes).
         .route("/health", get(health))
@@ -725,9 +734,16 @@ fn router(state: AppState) -> Router {
         .merge(api::wallet_router())
         // DRT pool routes.
         .merge(api::drt_router());
+    let uploads =
+        edge::UPLOADS
+            .apply(api::upload_router())
+            .layer(axum::middleware::from_fn_with_state(
+                memory,
+                edge::admit_upload,
+            ));
     let app = edge::REQUESTS
         .apply(routes)
-        .merge(edge::UPLOADS.apply(api::upload_router()))
+        .merge(uploads)
         .fallback(request_id::not_found)
         .layer(axum::middleware::from_fn(audit::record))
         .layer(axum::middleware::from_fn(logs::name_route));

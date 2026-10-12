@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use hyper::{header, HeaderMap, Method, Request, StatusCode};
 use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
@@ -23,6 +23,8 @@ use rustls::{ClientConfig, RootCertStore};
 use serde::Serialize;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+/// The largest response body read unless a client allows more.
+const DEFAULT_MAX_BODY: usize = 4 << 20;
 const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 
 type HyperClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, Full<Bytes>>;
@@ -56,6 +58,7 @@ impl std::error::Error for HttpError {}
 pub struct HttpClient {
     inner: Arc<HyperClient>,
     timeout: Duration,
+    max_body: usize,
 }
 
 impl HttpClient {
@@ -64,9 +67,17 @@ impl HttpClient {
         Self::build(default_root_store())
     }
 
-    /// Override the per-request timeout (default: 30s).
+    /// Override the time a request has, from sending it to the last byte of
+    /// the response (default: 30s).
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    /// Override the largest response body read (default: 4 MiB). A larger
+    /// one is an error, and is never held whole.
+    pub fn with_max_body(mut self, bytes: usize) -> Self {
+        self.max_body = bytes;
         self
     }
 
@@ -96,18 +107,35 @@ impl HttpClient {
             );
         }
 
-        let resp = tokio::time::timeout(self.timeout, self.inner.request(req))
+        let deadline = tokio::time::Instant::now() + self.timeout;
+        let resp = tokio::time::timeout_at(deadline, self.inner.request(req))
             .await
             .map_err(|_| HttpError::new(format!("request timed out after {:?}", self.timeout)))?
             .map_err(|e| HttpError::new(format!("request failed: {e}")))?;
 
         let status = resp.status();
         let (parts, body) = resp.into_parts();
-        let collected = tokio::time::timeout(self.timeout, body.collect())
-            .await
-            .map_err(|_| HttpError::new("timed out reading the response body"))?
-            .map_err(|e| HttpError::new(format!("read response body: {e}")))?
-            .to_bytes();
+        let too_large =
+            || HttpError::new(format!("the response body is over {} bytes", self.max_body));
+        let announced = parts
+            .headers
+            .get(header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok()?.parse::<u64>().ok());
+        if announced.is_some_and(|n| n > self.max_body as u64) {
+            return Err(too_large());
+        }
+        let collected =
+            tokio::time::timeout_at(deadline, Limited::new(body, self.max_body).collect())
+                .await
+                .map_err(|_| HttpError::new("timed out reading the response body"))?
+                .map_err(|e| {
+                    if e.downcast_ref::<LengthLimitError>().is_some() {
+                        too_large()
+                    } else {
+                        HttpError::new(format!("read response body: {e}"))
+                    }
+                })?
+                .to_bytes();
 
         Ok(Response {
             status,
@@ -134,6 +162,7 @@ impl HttpClient {
         Self {
             inner: Arc::new(inner),
             timeout: DEFAULT_TIMEOUT,
+            max_body: DEFAULT_MAX_BODY,
         }
     }
 
@@ -221,4 +250,49 @@ fn default_root_store() -> RootCertStore {
     let mut roots = RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     roots
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A local server whose `/` answers `length` bytes, streamed without a
+    /// `Content-Length` if `chunked`. Returns its URL.
+    fn serve(length: usize, chunked: bool) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::get(move || async move {
+                if chunked {
+                    let chunks = (0..length.div_ceil(1024)).map(move |i| {
+                        let n = 1024.min(length - i * 1024);
+                        Ok::<_, std::io::Error>(Bytes::from(vec![b'a'; n]))
+                    });
+                    axum::body::Body::from_stream(futures_util::stream::iter(chunks))
+                } else {
+                    axum::body::Body::from(vec![b'a'; length])
+                }
+            }),
+        );
+        let server = axum_server::from_tcp(listener).unwrap();
+        tokio::spawn(server.serve(app.into_make_service()));
+        url
+    }
+
+    #[tokio::test]
+    async fn bodies_over_the_limit_are_errors_announced_or_not() {
+        let client = HttpClient::new().with_max_body(10_000);
+        for chunked in [false, true] {
+            let fits = client.get(&serve(10_000, chunked)).await.unwrap();
+            assert_eq!(fits.body().len(), 10_000);
+            let refused = client.get(&serve(10_001, chunked)).await.err().unwrap();
+            assert_eq!(
+                refused.to_string(),
+                "the response body is over 10000 bytes",
+                "chunked: {chunked}"
+            );
+        }
+    }
 }

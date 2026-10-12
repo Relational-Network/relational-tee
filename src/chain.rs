@@ -208,6 +208,7 @@ pub async fn creating_signature(
     commitment: &str,
 ) -> Result<String, ApiError> {
     const PAGE: usize = 1000;
+    const MAX_PAGES: usize = 50;
     let rpc = solana.rpc();
     if let Some(signature) = stored {
         let status = rpc
@@ -220,7 +221,12 @@ pub async fn creating_signature(
     }
     let mut before: Option<String> = None;
     let mut oldest: Option<String> = None;
-    loop {
+    for pages in 1.. {
+        if pages > MAX_PAGES {
+            return Err(ApiError::internal(format!(
+                "{account} has too many transactions to find the one that created it"
+            )));
+        }
         let page = rpc
             .get_signatures_for_address(account, before.as_deref(), None, Some(PAGE), commitment)
             .await

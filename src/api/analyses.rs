@@ -785,6 +785,7 @@ pub(crate) mod tests {
             upload_id: "awards-1".into(),
             sha256: hex::encode(Sha256::digest(csv.as_bytes())),
             rows: ROWS.len() as u64,
+            bytes: Some(csv.len() as u64),
             uploaded_by: owner.user_id.clone(),
             uploaded_at: Utc::now(),
             signature: None,

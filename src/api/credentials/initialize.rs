@@ -124,6 +124,7 @@ pub async fn initialize_pool(
         upload_id,
         sha256: sha256_hex(&csv_bytes),
         rows,
+        bytes: Some(csv_bytes.len() as u64),
         uploaded_by: caller.user_id.clone(),
         uploaded_at: Utc::now(),
         signature: None,

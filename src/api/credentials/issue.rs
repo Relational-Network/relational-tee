@@ -30,6 +30,7 @@ use crate::blockchain::drt::{
 };
 use crate::blockchain::spl_token::token_account_amount;
 use crate::chain::{self, Effect};
+use crate::config::MAX_POOL_BYTES;
 use crate::error::ApiError;
 use crate::handlers::{open_sealed_csv, validate_payload};
 use crate::idempotency::Idempotent;
@@ -89,8 +90,9 @@ pub struct IssueCredentialsResponse {
         (status = 403, description = "Needs pools:write, or the caller's wallet doesn't own the pool"),
         (status = 404, description = "Pool not found"),
         (status = 409, description = "The pool changed concurrently; retry"),
+        (status = 413, description = "The body is over 50 MiB, or the pool's uploads would hold over 200 MiB of CSV (`pool_full`)"),
         (status = 422, description = "The Idempotency-Key was used for a different request"),
-        (status = 503, description = "Solana RPC unavailable"),
+        (status = 503, description = "Solana RPC unavailable, or the worker's memory is taken (`worker_busy`)"),
     )
 )]
 pub async fn issue_credentials(
@@ -176,9 +178,16 @@ pub async fn issue_credentials(
     .map_err(|e| ApiError::rpc_unavailable(format!("Solana RPC error: {e}")))?
         == GrantState::Live;
 
-    // Check the admin holds ≥1 append DRT, unless this upload's burn
-    // already happened: then a retry completes after the last DRT is gone.
+    // Check the pool has room and the admin holds ≥1 append DRT, unless this
+    // upload's burn already happened: then a retry completes regardless.
     if !burned {
+        if doc.dataset_bytes().saturating_add(csv_bytes.len() as u64) > MAX_POOL_BYTES {
+            return Err(ApiError::payload_too_large(format!(
+                "the pool's uploads would hold over {} MiB of CSV",
+                MAX_POOL_BYTES >> 20
+            ))
+            .with_code("pool_full"));
+        }
         let user_ata = derive_user_ata(&keypair.pubkey(), &append_mint);
         let user_balance = match state
             .solana_client
@@ -230,6 +239,7 @@ pub async fn issue_credentials(
                         upload_id: record_id.clone(),
                         sha256: sha256_hex(&csv_bytes),
                         rows: row_count,
+                        bytes: Some(csv_bytes.len() as u64),
                         uploaded_by: caller.user_id.clone(),
                         uploaded_at: Utc::now(),
                         signature: None,

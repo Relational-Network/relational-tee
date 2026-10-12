@@ -18,6 +18,7 @@ use super::dates;
 use super::definition::{Column, ColumnType, Definition, RECORD_ID};
 use super::query::{filter_options, FilterOptions, DEADLINE_STEPS};
 use super::runner::DEADLINE;
+use crate::budget::Reservation;
 
 /// Scope keys, such as `employer_group`, each with the value a row's column
 /// for that key must hold exactly. A row matches when it meets them all.
@@ -155,9 +156,12 @@ pub struct Table {
     conn: Mutex<Connection>,
     /// How many rows it holds.
     pub rows: usize,
-    /// The memory SQLite holds for it, indexes included.
+    /// The memory it holds: SQLite's, indexes included, and its filters'
+    /// options.
     pub bytes: usize,
     options: BTreeMap<String, FilterOptions>,
+    /// Its share of the worker's memory budget, held while it lives.
+    held: Option<Reservation>,
 }
 
 impl Table {
@@ -241,12 +245,19 @@ impl Table {
         conn.progress_handler(DEADLINE_STEPS, Some(move || Instant::now() >= deadline))?;
         let options = filter_options(&conn, def)?;
         conn.progress_handler(0, None::<fn() -> bool>)?;
+        let pages = usize::try_from(page_count.saturating_mul(page_size)).unwrap_or(usize::MAX);
         Ok(Self {
             conn: Mutex::new(conn),
             rows,
-            bytes: usize::try_from(page_count.saturating_mul(page_size)).unwrap_or(usize::MAX),
+            bytes: pages.saturating_add(options.values().map(FilterOptions::bytes).sum()),
             options,
+            held: None,
         })
+    }
+
+    /// Hold `reservation` for as long as the table lives.
+    pub fn hold(&mut self, reservation: Reservation) {
+        self.held = Some(reservation);
     }
 
     /// Each filter's options but the searches', from this table's rows.

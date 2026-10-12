@@ -82,6 +82,10 @@ pub const DEFAULT_BIND_ADDR: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
 /// 1 MiB ([`crate::edge::REQUESTS`]).
 pub const MAX_BODY_SIZE: usize = 50 * 1024 * 1024;
 
+/// The most CSV bytes a pool's uploads hold together: what its analysis
+/// tables are built from.
+pub const MAX_POOL_BYTES: u64 = 200 * 1024 * 1024;
+
 /// How the server speaks to clients.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Transport {
@@ -151,6 +155,9 @@ pub struct ServerConfig {
     pub dashboard_origin: String,
     pub rate_limits: RateLimits,
     pub reconciler: crate::reconciler::Timing,
+    /// `MEMORY_BUDGET_MIB`: the memory the worker's large values may hold
+    /// (see [`crate::budget`]).
+    pub memory_budget_mib: usize,
     /// The dev token signing key, whose public half dev builds also trust.
     #[cfg(feature = "dev")]
     pub dev_token_key: PathBuf,
@@ -208,6 +215,7 @@ impl ServerConfig {
             dashboard_origin: dashboard_origin_from_lookup(&lookup)?,
             rate_limits: RateLimits::from_lookup(&lookup)?,
             reconciler: reconciler_from_lookup(&lookup)?,
+            memory_budget_mib: memory_budget_from_lookup(&lookup)?,
             #[cfg(feature = "dev")]
             dev_token_key: dev_token_key_from_lookup(&lookup),
             #[cfg(feature = "dev")]
@@ -366,6 +374,23 @@ impl RateLimits {
             ip_burst: read("RATE_LIMIT_IP_BURST", 40)?,
             user_mutations_per_second: read("RATE_LIMIT_USER_MUTATIONS_PER_SECOND", 10)?,
         })
+    }
+}
+
+/// The least `MEMORY_BUDGET_MIB` takes: enough for a pool at its size limit.
+const MIN_MEMORY_BUDGET_MIB: usize = 512;
+
+/// `MEMORY_BUDGET_MIB`, or [`crate::budget::DEFAULT_MIB`].
+fn memory_budget_from_lookup(lookup: &impl Fn(&str) -> Option<String>) -> Result<usize, String> {
+    match lookup("MEMORY_BUDGET_MIB") {
+        None => Ok(crate::budget::DEFAULT_MIB),
+        Some(v) => v
+            .parse::<usize>()
+            .ok()
+            .filter(|n| *n >= MIN_MEMORY_BUDGET_MIB)
+            .ok_or_else(|| {
+                format!("MEMORY_BUDGET_MIB {v:?} isn't a whole number of at least {MIN_MEMORY_BUDGET_MIB}")
+            }),
     }
 }
 
@@ -972,6 +997,16 @@ mod tests {
         );
         let config = complete(&[("RATE_LIMIT_USER_MUTATIONS_PER_SECOND", "3")]).unwrap();
         assert_eq!(config.rate_limits.user_mutations_per_second, 3);
+    }
+
+    #[test]
+    fn the_memory_budget_has_a_default_and_a_floor() {
+        assert_eq!(complete(&[]).unwrap().memory_budget_mib, 2048);
+        let config = complete(&[("MEMORY_BUDGET_MIB", "6144")]).unwrap();
+        assert_eq!(config.memory_budget_mib, 6144);
+        for bad in ["100", "lots", "-1"] {
+            assert!(complete(&[("MEMORY_BUDGET_MIB", bad)]).is_err(), "{bad}");
+        }
     }
 
     #[cfg(feature = "dev")]
