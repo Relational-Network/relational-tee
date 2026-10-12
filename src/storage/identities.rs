@@ -344,7 +344,7 @@ mod tests {
         for attempt in attempts {
             user_ids.insert(attempt.await.unwrap());
         }
-        assert_eq!(user_ids.len(), 1, "{user_ids:?}");
+        assert_eq!(user_ids.len(), 1);
         assert_eq!(workers[1].identities().all().await.unwrap().len(), 1);
     }
 

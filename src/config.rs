@@ -1015,7 +1015,7 @@ mod tests {
         let skr = match config.keys {
             KeyProviderConfig::Skr(skr) => skr,
             #[cfg(feature = "dev")]
-            other => panic!("expected the skr provider, got {other:?}"),
+            _ => panic!("expected the skr provider"),
         };
         assert_eq!(skr.endpoint, "http://127.0.0.1:9000");
         assert_eq!(skr.maa_endpoint, "sharedweu.weu.attest.azure.net");
@@ -1048,7 +1048,7 @@ mod tests {
         let azure = match config.storage {
             StorageConfig::Azure(azure) => azure,
             #[cfg(feature = "dev")]
-            other => panic!("expected azure storage, got {other:?}"),
+            _ => panic!("expected azure storage"),
         };
         assert_eq!(azure.blob_url, "https://acct.blob.core.windows.net");
         assert_eq!(
