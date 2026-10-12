@@ -4,8 +4,8 @@
 //! TLS with `tls-key`.
 //!
 //! The private key is `tls-key`, released to attested workers and never
-//! written anywhere. Its certificate chain lives in the public `tls`
-//! container at `{spki_sha256}/chain.pem`, where `spki_sha256` is the
+//! written anywhere. Its certificate chain lives in the `tls` container,
+//! unsealed, at `{spki_sha256}/chain.pem`, where `spki_sha256` is the
 //! lowercase hex SHA-256 of the key's SubjectPublicKeyInfo, so a chain
 //! belongs to one key version and clients can pin the key across renewals.
 //!
@@ -15,8 +15,16 @@
 //! worker (the certificate job) signs it and writes `chain.pem`. The worker
 //! checks for the chain every 10 seconds until it has one, then every 5
 //! minutes, and swaps a new one in through the certificate resolver, with no
-//! restart. It serves a chain only if the leaf's public key is `tls-key`'s;
-//! any other chain is ignored and raises an alert.
+//! restart.
+//!
+//! It serves a chain only if the leaf's public key is `tls-key`'s and a
+//! client would accept it now: rustls's own server certificate verifier
+//! checks that it chains to a root in Mozilla's set, that each certificate
+//! is within its validity, and that the leaf names the API hostname and may
+//! serve TLS. Dev builds also trust the last certificate a chain carries, so
+//! a local CA's chain, or a self-signed one, serves there. Any other chain
+//! is ignored and raises an alert, and the chain already served stays until
+//! it expires.
 
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,10 +34,13 @@ use std::time::Duration;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use p256::pkcs8::EncodePrivateKey;
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, PublicKeyData};
+use rustls::client::danger::ServerCertVerifier;
+use rustls::client::WebPkiServerVerifier;
 use rustls::pki_types::pem::PemObject;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::{CertifiedKey, SigningKey};
+use rustls::RootCertStore;
 use sha2::{Digest, Sha256};
 use tracing::{error, info, warn};
 
@@ -52,10 +63,56 @@ struct Served {
 pub struct Certificates {
     key: Arc<dyn SigningKey>,
     spki_sha256: String,
+    /// The API hostname, which a served leaf must name.
+    hostname: String,
     csr_pem: String,
     store: Arc<dyn ObjectStore>,
     served: RwLock<Option<Served>>,
     csr_written: AtomicBool,
+    /// Roots trusted besides Mozilla's: only tests' own CAs.
+    trusted: Vec<CertificateDer<'static>>,
+}
+
+/// Whether a client trusting Mozilla's roots, and `trusted`, would accept
+/// `chain` for `hostname` at `now`.
+fn verify_chain(
+    chain: &[CertificateDer<'static>],
+    trusted: &[CertificateDer<'static>],
+    hostname: &str,
+    now: DateTime<Utc>,
+) -> Result<(), String> {
+    let (leaf, intermediates) = chain
+        .split_first()
+        .ok_or_else(|| "the chain holds no certificate".to_string())?;
+    let mut roots = RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    for root in trusted {
+        roots
+            .add(root.clone())
+            .map_err(|e| format!("a trusted root doesn't parse: {e}"))?;
+    }
+    #[cfg(feature = "dev")]
+    if let Some(root) = chain.last() {
+        // Dev builds only: a local CA's root, or a self-signed leaf.
+        let _ = roots.add(root.clone());
+    }
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let verifier = WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider)
+        .build()
+        .map_err(|e| format!("building the verifier: {e}"))?;
+    let name = ServerName::try_from(hostname.to_string())
+        .map_err(|e| format!("{hostname:?} isn't a server name: {e}"))?;
+    let seconds = u64::try_from(now.timestamp()).unwrap_or_default();
+    verifier
+        .verify_server_cert(
+            leaf,
+            intermediates,
+            &name,
+            &[],
+            UnixTime::since_unix_epoch(Duration::from_secs(seconds)),
+        )
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 impl fmt::Debug for Certificates {
@@ -126,11 +183,19 @@ impl Certificates {
         Ok(Self {
             key,
             spki_sha256,
+            hostname: hostname.to_string(),
             csr_pem,
             store,
             served: RwLock::new(None),
             csr_written: AtomicBool::new(false),
+            trusted: Vec::new(),
         })
+    }
+
+    /// Also trust chains from `root`, a test's own CA.
+    #[cfg(test)]
+    pub(crate) fn trust(&mut self, root: CertificateDer<'static>) {
+        self.trusted.push(root);
     }
 
     pub fn spki_sha256(&self) -> &str {
@@ -147,10 +212,14 @@ impl Certificates {
 
     /// Whether a chain is loaded and its leaf hasn't expired.
     pub fn valid(&self) -> bool {
+        self.valid_at(Utc::now())
+    }
+
+    fn valid_at(&self, now: DateTime<Utc>) -> bool {
         self.served.read().is_ok_and(|served| {
             served
                 .as_ref()
-                .is_some_and(|s| s.not_after.is_some_and(|t| t > Utc::now()))
+                .is_some_and(|s| s.not_after.is_some_and(|t| t > now))
         })
     }
 
@@ -165,7 +234,7 @@ impl Certificates {
     }
 
     /// Look for the chain once: load a new one, or write the CSR if there's
-    /// none yet.
+    /// none yet. A served chain that has expired raises an alert.
     pub async fn refresh(&self) -> Result<(), String> {
         let cached = self
             .served
@@ -173,7 +242,7 @@ impl Certificates {
             .ok()
             .and_then(|s| s.as_ref().map(|s| s.etag.clone()));
         let path = self.chain_path();
-        match self
+        let result = match self
             .store
             .get(&path, cached.as_ref())
             .await
@@ -182,7 +251,16 @@ impl Certificates {
             Fetched::NotModified => Ok(()),
             Fetched::Missing => self.write_csr().await,
             Fetched::Found { body, etag } => self.load(&body, etag),
+        };
+        if let Some(not_after) = self.status().not_after.filter(|t| *t <= Utc::now()) {
+            error!(
+                alert = "tls_chain_expired",
+                chain = %path,
+                not_after = %not_after.to_rfc3339(),
+                "The served certificate chain has expired, and no valid one replaced it"
+            );
         }
+        result
     }
 
     async fn write_csr(&self) -> Result<(), String> {
@@ -224,6 +302,15 @@ impl Certificates {
                 "Ignoring a certificate chain whose key isn't tls-key"
             );
             return Err(format!("{} doesn't match tls-key", self.chain_path()));
+        }
+        if let Err(e) = verify_chain(&certified.cert, &self.trusted, &self.hostname, Utc::now()) {
+            error!(
+                alert = "tls_chain_invalid",
+                chain = %self.chain_path(),
+                error = %e,
+                "Ignoring a certificate chain a client wouldn't accept; the served one stays"
+            );
+            return Err(format!("{} isn't valid: {e}", self.chain_path()));
         }
         info!(
             chain = %self.chain_path(),
@@ -399,15 +486,44 @@ pub(crate) mod tests {
         assert!(not_after(b"not der").is_none());
     }
 
-    /// A self-signed PEM certificate for `key`, valid for `days` from now
-    /// (negative: already expired).
-    pub(crate) fn self_signed(key: &EcKey, days: i64) -> String {
+    type Ca = rcgen::CertifiedIssuer<'static, KeyPair>;
+
+    /// Make `params` valid from `from` days from now until `to` days from now.
+    fn valid_between(params: &mut CertificateParams, (from, to): (i64, i64)) {
         use chrono::Datelike;
-        let ymd = |t: DateTime<Utc>| rcgen::date_time_ymd(t.year(), t.month() as u8, t.day() as u8);
-        let mut params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
-        params.not_before = ymd(Utc::now() - chrono::Duration::days(days.abs() + 2));
-        params.not_after = ymd(Utc::now() + chrono::Duration::days(days));
-        params.self_signed(&key_pair(key)).unwrap().pem()
+        let day = |days: i64| {
+            let t = Utc::now() + chrono::Duration::days(days);
+            rcgen::date_time_ymd(t.year(), t.month() as u8, t.day() as u8)
+        };
+        params.not_before = day(from);
+        params.not_after = day(to);
+    }
+
+    /// A CA of the tests' own, which no client trusts but the tests'.
+    fn ca(name: &str) -> Ca {
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.distinguished_name.push(DnType::CommonName, name);
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params.key_usages = vec![
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::CrlSign,
+        ];
+        valid_between(&mut params, (-10, 3650));
+        rcgen::CertifiedIssuer::self_signed(params, KeyPair::generate().unwrap()).unwrap()
+    }
+
+    /// A PEM leaf for `key` naming `host`, valid from `from` days from now
+    /// until `to` days from now, issued by `issuer`.
+    fn leaf(issuer: &Ca, key: &EcKey, host: &str, validity: (i64, i64)) -> String {
+        let mut params = CertificateParams::new(vec![host.to_string()]).unwrap();
+        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        valid_between(&mut params, validity);
+        params.signed_by(&key_pair(key), issuer).unwrap().pem()
+    }
+
+    /// A chain for tls-key, test key 3, as a CA would issue it for 30 days.
+    fn good(ca: &Ca, days: i64) -> String {
+        leaf(ca, &fixed_key(3), "localhost", (-1, days))
     }
 
     fn key_pair(key: &EcKey) -> KeyPair {
@@ -415,18 +531,19 @@ pub(crate) mod tests {
         KeyPair::try_from(&PrivatePkcs8KeyDer::from(pkcs8.as_bytes())).unwrap()
     }
 
-    /// Certificates for test key 3 over `store`.
-    fn certificates(store: Arc<LocalFiles>) -> Certificates {
-        Certificates::new(&fixed_key(3), "localhost", store).unwrap()
+    /// Certificates for test key 3 over `store`, trusting `ca`.
+    fn certificates(store: Arc<LocalFiles>, ca: &Ca) -> Certificates {
+        let mut certificates = Certificates::new(&fixed_key(3), "localhost", store).unwrap();
+        certificates.trust(ca.der().clone());
+        certificates
     }
 
-    /// Certificates serving a valid self-signed chain, for readiness tests.
+    /// Certificates serving a valid chain, for readiness tests.
     pub(crate) fn serving() -> Arc<Certificates> {
-        let store = Arc::new(LocalFiles::temporary());
-        let certificates = certificates(store);
-        let pem = self_signed(&fixed_key(3), 30);
+        let ca = ca("Test CA");
+        let certificates = certificates(Arc::new(LocalFiles::temporary()), &ca);
         certificates
-            .load(pem.as_bytes(), ETag("\"test\"".into()))
+            .load(good(&ca, 30).as_bytes(), ETag("\"test\"".into()))
             .unwrap();
         Arc::new(certificates)
     }
@@ -440,9 +557,10 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn writes_one_csr_then_serves_only_a_chain_for_tls_key() {
+        let ca = ca("Test CA");
         let store = Arc::new(LocalFiles::temporary());
-        let a = certificates(store.clone());
-        let b = certificates(store.clone());
+        let a = certificates(store.clone(), &ca);
+        let b = certificates(store.clone(), &ca);
         assert_eq!(a.spki_sha256().len(), 64);
         assert_eq!(a.spki_sha256(), b.spki_sha256(), "keyed by the public key");
 
@@ -460,7 +578,7 @@ pub(crate) mod tests {
         assert!(!a.valid() && !a.status().loaded);
 
         // A chain for another key is ignored.
-        let foreign = self_signed(&fixed_key(4), 30);
+        let foreign = leaf(&ca, &fixed_key(4), "localhost", (-1, 30));
         store
             .put_if_absent(&a.chain_path(), foreign.into())
             .await
@@ -470,9 +588,9 @@ pub(crate) mod tests {
 
         // The right one is served, and swapped when it changes.
         let store = Arc::new(LocalFiles::temporary());
-        let c = certificates(store.clone());
+        let c = certificates(store.clone(), &ca);
         store
-            .put_if_absent(&c.chain_path(), self_signed(&fixed_key(3), 30).into())
+            .put_if_absent(&c.chain_path(), good(&ca, 30).into())
             .await
             .unwrap();
         c.refresh().await.unwrap();
@@ -485,11 +603,7 @@ pub(crate) mod tests {
             panic!("chain");
         };
         store
-            .put_if_match(
-                &c.chain_path(),
-                self_signed(&fixed_key(3), 60).into(),
-                &etag,
-            )
+            .put_if_match(&c.chain_path(), good(&ca, 60).into(), &etag)
             .await
             .unwrap();
         c.refresh().await.unwrap();
@@ -497,15 +611,92 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn an_expired_chain_is_loaded_but_not_valid() {
-        let store = Arc::new(LocalFiles::temporary());
-        let certificates = certificates(store);
-        let pem = self_signed(&fixed_key(3), -1);
+    fn a_candidate_a_client_would_refuse_leaves_the_good_chain_serving() {
+        let trusted = ca("Test CA");
+        let other = ca("Other CA");
+        let certificates = certificates(Arc::new(LocalFiles::temporary()), &trusted);
         certificates
-            .load(pem.as_bytes(), ETag("\"x\"".into()))
+            .load(good(&trusted, 30).as_bytes(), ETag("\"good\"".into()))
             .unwrap();
-        assert!(certificates.status().loaded);
-        assert!(!certificates.valid());
+        let served = certificates.status().not_after;
+
+        let intermediate = {
+            let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+            params
+                .distinguished_name
+                .push(DnType::CommonName, "Test Intermediate");
+            params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
+            valid_between(&mut params, (-5, 365));
+            rcgen::CertifiedIssuer::signed_by(params, KeyPair::generate().unwrap(), &trusted)
+                .unwrap()
+        };
+        let key = fixed_key(3);
+        let complete = format!(
+            "{}{}",
+            leaf(&intermediate, &key, "localhost", (-1, 90)),
+            intermediate.pem()
+        );
+        let candidates = [
+            ("expired", good(&trusted, -1)),
+            ("not yet valid", leaf(&trusted, &key, "localhost", (2, 30))),
+            (
+                "for another host",
+                leaf(&trusted, &key, "api.pilot.example", (-1, 30)),
+            ),
+            (
+                "for another key",
+                leaf(&trusted, &fixed_key(4), "localhost", (-1, 30)),
+            ),
+            (
+                "from an untrusted CA",
+                leaf(&other, &key, "localhost", (-1, 30)),
+            ),
+            (
+                "without its intermediate",
+                leaf(&intermediate, &key, "localhost", (-1, 30)),
+            ),
+            ("not PEM", "-----BEGIN CERTIFICATE-----\nnope\n".to_string()),
+            ("empty", String::new()),
+        ];
+        for (what, pem) in candidates {
+            if what == "from an untrusted CA" && cfg!(feature = "dev") {
+                // Dev builds trust the last certificate a chain carries.
+                continue;
+            }
+            assert!(
+                certificates
+                    .load(pem.as_bytes(), ETag(format!("\"{what}\"")))
+                    .is_err(),
+                "{what}"
+            );
+            assert_eq!(certificates.status().not_after, served, "{what}");
+            assert!(certificates.valid(), "{what}");
+        }
+
+        // A complete renewal replaces it, and readiness follows its expiry.
+        certificates
+            .load(complete.as_bytes(), ETag("\"renewed\"".into()))
+            .unwrap();
+        assert!(certificates.status().not_after > served);
+        assert!(!certificates.valid_at(Utc::now() + chrono::Duration::days(91)));
+    }
+
+    #[cfg(feature = "dev")]
+    #[test]
+    fn dev_builds_also_trust_a_root_the_chain_carries() {
+        let local = ca("Local CA");
+        let certificates = Certificates::new(
+            &fixed_key(3),
+            "localhost",
+            Arc::new(LocalFiles::temporary()),
+        )
+        .unwrap();
+        let chain = format!("{}{}", good(&local, 30), local.pem());
+        certificates
+            .load(chain.as_bytes(), ETag("\"local\"".into()))
+            .unwrap();
+        assert!(certificates.valid());
     }
 
     #[test]

@@ -56,18 +56,21 @@ skr: dev-keys
 
 # The local certificate job: sign each CSR in the files store's tls
 # container that has no chain yet with mkcert's local CA, writing chain.pem
-# beside it. The worker picks the chain up within 10 seconds. Run
-# `mkcert -install` once so browsers trust the CA.
+# beside it, with the CA's root last so dev builds can check the chain. The
+# worker picks the chain up within 10 seconds. Run `mkcert -install` once so
+# browsers trust the CA.
 dev-cert:
     #!/usr/bin/env bash
     set -euo pipefail
     dir="${DATA_DIR:-./data}/tls"
+    root="$(mkcert -CAROOT)/rootCA.pem"
     shopt -s nullglob
     signed=0
     for csr in "$dir"/*/csr.pem; do
         chain="$(dirname "$csr")/chain.pem"
         [[ -e "$chain" ]] && continue
         mkcert -csr "$csr" -cert-file "$chain.tmp"
+        cat "$root" >> "$chain.tmp"
         mv "$chain.tmp" "$chain"
         signed=$((signed + 1))
     done
