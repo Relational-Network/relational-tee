@@ -16,17 +16,20 @@
 //!    missed, and replacing it could produce a second effect.
 //!
 //! So attempts with the same key, on any workers, produce at most one effect.
+//! A transfer leaves nothing of its own on-chain, so it creates a receipt in
+//! the same transaction ([`run_transfer`]): the chain then refuses a second
+//! copy, and the receipt is the effect a retry checks.
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use solana_hash::Hash;
 use solana_pubkey::Pubkey;
 use solana_transaction::Transaction;
-use tracing::warn;
+use tracing::{error, warn};
 
 use crate::blockchain::drt::accounts::{fetch_grant_state, is_pool, GrantState};
 use crate::blockchain::rpc::RpcError;
-use crate::blockchain::transactions::reached;
+use crate::blockchain::transactions::{is_receipt, reached};
 use crate::blockchain::SolanaClient;
 use crate::error::ApiError;
 use crate::idempotency::{Operation, StoredTx};
@@ -43,13 +46,10 @@ pub enum Effect {
     /// A Grant PDA the transaction closes: once its `drt_config` Grant is
     /// gone.
     Closed { pda: Pubkey, drt_config: Pubkey },
-    /// The transaction itself, for a transfer.
-    Transfer,
 }
 
 impl Effect {
-    /// Whether the effect has happened, as seen at `commitment`. A transfer
-    /// leaves nothing to look at, so it never has.
+    /// Whether the effect has happened, as seen at `commitment`.
     pub async fn happened(
         &self,
         solana: &SolanaClient,
@@ -76,15 +76,13 @@ impl Effect {
                     .map_err(lookup)?
                     != GrantState::Live
             }
-            Self::Transfer => false,
         })
     }
 
-    /// The account the effect is about, if any.
-    fn account(&self) -> Option<&Pubkey> {
+    /// The account the effect is about.
+    fn account(&self) -> &Pubkey {
         match self {
-            Self::Pool(pda) | Self::Grant { pda, .. } | Self::Closed { pda, .. } => Some(pda),
-            Self::Transfer => None,
+            Self::Pool(pda) | Self::Grant { pda, .. } | Self::Closed { pda, .. } => pda,
         }
     }
 
@@ -95,9 +93,7 @@ impl Effect {
         stored: Option<&str>,
         commitment: &str,
     ) -> Result<Option<String>, ApiError> {
-        let Some(account) = self.account() else {
-            return Ok(None);
-        };
+        let account = self.account();
         if !self.happened(solana, commitment).await? {
             return Ok(None);
         }
@@ -127,6 +123,59 @@ fn send_failed(e: RpcError) -> ApiError {
         .unwrap_or(&e.message);
     ApiError::bad_request(format!("Solana refused the transaction: {message}"))
         .with_code("transaction_rejected")
+}
+
+/// A transfer's receipt address holds an account this request's transfer
+/// didn't make, so the transfer didn't happen and can't.
+fn receipt_taken() -> ApiError {
+    ApiError::bad_request(
+        "another transaction holds this transfer's receipt address, so the transfer didn't \
+         happen; send it again as a new transfer",
+    )
+    .with_code("receipt_taken")
+}
+
+/// A transfer's receipt exists, but no node reports the transaction that
+/// should have made it: by now only an RPC that has dropped its history,
+/// or an account another transaction made there, leaves that.
+fn outcome_unknown(signature: &str) -> ApiError {
+    error!(alert = "transfer_outcome_unknown", %signature,
+        "A transfer's receipt exists, but no node reports its transaction");
+    ApiError::bad_gateway(format!(
+        "this transfer's receipt exists, but no Solana node reports its transaction \
+         {signature}; check it on an explorer before sending again"
+    ))
+    .with_code("transfer_outcome_unknown")
+}
+
+/// A transfer's send failure. Its receipt is its first instruction, and the
+/// System program's error 0 is "account already in use".
+fn transfer_send_failed(e: RpcError) -> ApiError {
+    let taken = serde_json::json!({ "InstructionError": [0, { "Custom": 0 }] });
+    if e.rejection() == Some(&taken) {
+        return receipt_taken();
+    }
+    send_failed(e)
+}
+
+/// Send `tx` and wait until it has reached `commitment`; `failed` explains
+/// a send the node refused.
+async fn send_and_confirm(
+    solana: &SolanaClient,
+    tx: &StoredTx,
+    commitment: &str,
+    failed: fn(RpcError) -> ApiError,
+) -> Result<String, ApiError> {
+    crate::fault::point("tx_stored");
+    solana
+        .rpc()
+        .send_encoded_transaction(&tx.transaction)
+        .await
+        .map_err(failed)?;
+    crate::fault::point("tx_sent");
+    solana.await_confirmation(&tx.signature, commitment).await?;
+    crate::fault::point("tx_confirmed");
+    Ok(tx.signature.clone())
 }
 
 /// Sign a fresh transaction with the latest blockhash.
@@ -277,25 +326,90 @@ pub async fn run(
             }
         }
     };
+    send_and_confirm(solana, &to_send, commitment, send_failed).await
+}
 
-    crate::fault::point("tx_stored");
-    rpc.send_encoded_transaction(&to_send.transaction)
-        .await
-        .map_err(send_failed)?;
-    crate::fault::point("tx_sent");
-    solana
-        .await_confirmation(&to_send.signature, commitment)
-        .await?;
-    crate::fault::point("tx_confirmed");
-    Ok(to_send.signature)
+/// Run a transfer under the stored-transaction rule and return its
+/// signature once it has reached `commitment`. Every transaction `build`
+/// makes must create the receipt at `receipt` (see
+/// [`crate::blockchain::transactions`]), so the chain lets at most one of
+/// them succeed. A transaction that can no longer land, and whose receipt
+/// is absent at `finalized`, is replaced; a receipt that this request's
+/// transaction didn't make stops the transfer.
+pub async fn run_transfer(
+    solana: &SolanaClient,
+    op: &mut Operation<'_>,
+    receipt: &Pubkey,
+    commitment: &str,
+    build: impl Fn(Hash) -> Transaction,
+) -> Result<String, ApiError> {
+    let rpc = solana.rpc();
+    let receipt_exists = |level: &'static str| async move {
+        rpc.get_account(receipt, level)
+            .await
+            .map(|account| is_receipt(account.as_ref()))
+            .map_err(rpc_error("account lookup failed"))
+    };
+    let to_send = match op.stored_tx().cloned() {
+        // Sent without looking first: where another account holds the
+        // receipt address, the node's preflight refuses it.
+        None => {
+            let fresh = sign(solana, &build).await?;
+            op.store_tx(fresh, None).await?
+        }
+        Some(stored) => {
+            // As in `run`: the finalized height first, so a lookup after it
+            // sees any block that could hold the stored transaction.
+            let height = rpc
+                .get_block_height("finalized")
+                .await
+                .map_err(rpc_error("block height lookup failed"))?;
+            let status = rpc
+                .signature_status(&stored.signature)
+                .await
+                .map_err(rpc_error("status lookup failed"))?;
+            match status {
+                Some(s) if s.err.is_none() => {
+                    if !reached(&s, commitment) {
+                        solana
+                            .await_confirmation(&stored.signature, commitment)
+                            .await?;
+                    }
+                    return Ok(stored.signature);
+                }
+                // It failed for good; a receipt there is another's.
+                Some(s) if reached(&s, "finalized") => {
+                    if receipt_exists("finalized").await? {
+                        return Err(receipt_taken());
+                    }
+                    let fresh = sign(solana, &build).await?;
+                    op.store_tx(fresh, Some(&stored.signature)).await?
+                }
+                Some(_) => {
+                    return Err(ApiError::rpc_unavailable("transaction failed on-chain"));
+                }
+                None if height <= stored.last_valid_block_height => stored,
+                // It can never land, and no node reports it: without its
+                // receipt it didn't happen, and a replacement is safe.
+                None => {
+                    if receipt_exists("finalized").await? {
+                        return Err(outcome_unknown(&stored.signature));
+                    }
+                    let fresh = sign(solana, &build).await?;
+                    op.store_tx(fresh, Some(&stored.signature)).await?
+                }
+            }
+        }
+    };
+    send_and_confirm(solana, &to_send, commitment, transfer_send_failed).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::api::pools::signed;
-    use crate::blockchain::fake::{self, FakeChain, VALID_FOR};
-    use crate::blockchain::transactions::native_transfer;
+    use crate::blockchain::fake::{self, FakeChain, RECEIPT_DEPOSIT, VALID_FOR};
+    use crate::blockchain::transactions::{create_receipt, native_transfer, receipt_address};
     use crate::idempotency::{Idempotent, Opened};
     use crate::storage::tests::files_storage;
     use crate::storage::Storage;
@@ -308,26 +422,37 @@ mod tests {
     use std::sync::Arc;
 
     const KEY: &str = "0f8fad5b-d9cb-469f-a165-70867728950e";
+    const SEED: &str = "133dfaefa5935294a19687842fc22601";
 
     struct Setup {
         storage: Storage,
         chain: Arc<FakeChain>,
         solana: SolanaClient,
         keypair: Keypair,
+        /// A transfer of 1 lamport, which creates `receipt` first.
         transfer: Vec<Instruction>,
+        receipt: Pubkey,
     }
 
     fn setup() -> Setup {
         let chain = Arc::new(FakeChain::default());
         chain.block_height.store(100, SeqCst);
         let keypair = Keypair::new();
-        let transfer = native_transfer(&keypair.pubkey(), &Pubkey::new_from_array([9; 32]), 1);
+        let wallet = keypair.pubkey();
+        let receipt = receipt_address(&wallet, SEED).unwrap();
+        let mut transfer = vec![create_receipt(&wallet, &receipt, SEED, RECEIPT_DEPOSIT)];
+        transfer.extend(native_transfer(
+            &wallet,
+            &Pubkey::new_from_array([9; 32]),
+            1,
+        ));
         Setup {
             storage: files_storage(),
             solana: fake::start(chain.clone()),
             chain,
             keypair,
             transfer,
+            receipt,
         }
     }
 
@@ -359,6 +484,23 @@ mod tests {
             let stored = self.open().await.stored_tx().cloned().unwrap();
             (signature, stored)
         }
+
+        /// One attempt at the transfer.
+        async fn transfer(&self) -> Result<String, ApiError> {
+            let mut op = self.open().await;
+            let build = signed(&self.keypair, &self.transfer);
+            run_transfer(&self.solana, &mut op, &self.receipt, "confirmed", build).await
+        }
+
+        async fn stored(&self) -> StoredTx {
+            self.open().await.stored_tx().cloned().unwrap()
+        }
+
+        /// How many transactions landed, and how many of them succeeded.
+        fn landed(&self) -> (usize, usize) {
+            let landed = self.chain.landed.lock().unwrap();
+            (landed.len(), landed.iter().filter(|(_, ok)| *ok).count())
+        }
     }
 
     #[tokio::test]
@@ -370,10 +512,99 @@ mod tests {
             .block_height
             .store(first.last_valid_block_height, SeqCst);
 
-        let (signature, stored) = s.retry(&Effect::Transfer, "confirmed").await;
+        let signature = s.transfer().await.unwrap();
         assert_eq!(signature, first.signature);
-        assert_eq!(stored, first);
+        assert_eq!(s.stored().await, first);
         assert_eq!(s.chain.sent(), [first.transaction]);
+        assert!(s.chain.exists(&s.receipt));
+    }
+
+    /// The stored transfer landed, then no node could report it once it had
+    /// expired. Its receipt says it happened, so nothing is sent again; and
+    /// a second copy sent regardless couldn't succeed.
+    #[tokio::test]
+    async fn an_expired_transfer_that_no_node_reports_is_judged_by_its_receipt() {
+        let s = setup();
+        let first = s.stored_then_died().await;
+        s.chain.lands.store(true, SeqCst);
+        s.solana
+            .rpc()
+            .send_encoded_transaction(&first.transaction)
+            .await
+            .unwrap();
+        s.chain.landed.lock().unwrap().clear();
+        s.chain
+            .block_height
+            .store(first.last_valid_block_height + 1, SeqCst);
+        let unknown = s.transfer().await.unwrap_err();
+        assert_eq!(
+            (unknown.status, unknown.code),
+            (StatusCode::BAD_GATEWAY, "transfer_outcome_unknown")
+        );
+        assert!(unknown.message.contains(&first.signature));
+        assert_eq!(s.chain.sent().len(), 1, "no second transfer");
+
+        let mut op = s.open().await;
+        let again = sign(&s.solana, &signed(&s.keypair, &s.transfer))
+            .await
+            .unwrap();
+        let again = op.store_tx(again, Some(&first.signature)).await.unwrap();
+        s.solana
+            .rpc()
+            .send_encoded_transaction(&again.transaction)
+            .await
+            .unwrap();
+        assert_eq!(s.landed(), (1, 0), "the chain refuses a second receipt");
+
+        // Expired without landing, with no receipt: a replacement is sent.
+        let s = setup();
+        let first = s.stored_then_died().await;
+        s.chain.lands.store(true, SeqCst);
+        s.chain.block_height.store(100 + VALID_FOR + 1, SeqCst);
+        let signature = s.transfer().await.unwrap();
+        assert_ne!(signature, first.signature);
+        assert_eq!(s.chain.sent(), [s.stored().await.transaction]);
+        assert_eq!(s.landed(), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn a_receipt_another_transaction_made_stops_the_transfer() {
+        let taken = |e: ApiError| {
+            assert_eq!(
+                (e.status, e.code),
+                (StatusCode::BAD_REQUEST, "receipt_taken")
+            );
+        };
+        // Lamports sent to the receipt address before the first attempt: the
+        // node's preflight refuses the transfer.
+        let s = setup();
+        s.chain.accounts.lock().unwrap().push(s.receipt);
+        *s.chain.preflight.lock().unwrap() =
+            Some(json!({ "InstructionError": [0, { "Custom": 0 }] }));
+        taken(s.transfer().await.unwrap_err());
+
+        // The stored transfer failed for good, and the receipt exists: it's
+        // another transaction's, and nothing replaces the transfer.
+        let s = setup();
+        let first = s.stored_then_died().await;
+        s.chain.land(&first.signature, false);
+        s.chain.accounts.lock().unwrap().push(s.receipt);
+        s.chain.lands.store(true, SeqCst);
+        taken(s.transfer().await.unwrap_err());
+        assert!(s.chain.sent().is_empty());
+    }
+
+    #[tokio::test]
+    async fn concurrent_attempts_send_one_transfer() {
+        let s = setup();
+        s.chain.lands.store(true, SeqCst);
+        let (a, b) = tokio::join!(s.transfer(), s.transfer());
+        let (a, b) = (a.unwrap(), b.unwrap());
+        assert_eq!(a, b);
+        let stored = s.stored().await;
+        assert_eq!(stored.signature, a);
+        assert!(s.chain.sent().iter().all(|tx| *tx == stored.transaction));
+        assert_eq!(s.landed(), (1, 1));
     }
 
     #[tokio::test]
@@ -486,7 +717,7 @@ mod tests {
         let s = setup();
         let first = s.stored_then_died().await;
         s.chain.land(&first.signature, true);
-        let (signature, _) = s.retry(&Effect::Transfer, "confirmed").await;
+        let signature = s.transfer().await.unwrap();
         assert_eq!(signature, first.signature);
         assert!(s.chain.sent().is_empty());
 
@@ -494,19 +725,15 @@ mod tests {
         let first = s.stored_then_died().await;
         s.chain.land(&first.signature, false);
         s.chain.lands.store(true, SeqCst);
-        let (signature, stored) = s.retry(&Effect::Transfer, "confirmed").await;
+        let signature = s.transfer().await.unwrap();
         assert_ne!(signature, first.signature);
-        assert_eq!(s.chain.sent(), [stored.transaction]);
+        assert_eq!(s.chain.sent(), [s.stored().await.transaction]);
     }
 
     #[tokio::test]
     async fn a_send_the_preflight_refuses_is_rejected_and_a_retry_resends_it() {
         let s = setup();
-        let attempt = || async {
-            let mut op = s.open().await;
-            let build = signed(&s.keypair, &s.transfer);
-            run(&s.solana, &mut op, &Effect::Transfer, "confirmed", build).await
-        };
+        let attempt = || s.transfer();
 
         let rent = json!({ "InsufficientFundsForRent": { "account_index": 0 } });
         *s.chain.preflight.lock().unwrap() = Some(rent.clone());
@@ -530,7 +757,8 @@ mod tests {
 
         *s.chain.preflight.lock().unwrap() = None;
         s.chain.lands.store(true, SeqCst);
-        let (signature, stored) = s.retry(&Effect::Transfer, "confirmed").await;
+        let signature = attempt().await.unwrap();
+        let stored = s.stored().await;
         assert_eq!(signature, stored.signature);
         assert_eq!(s.chain.sent(), vec![stored.transaction; 3]);
     }

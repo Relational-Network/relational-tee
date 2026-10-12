@@ -13,26 +13,50 @@
 //! its writes is create-only, or a compare-and-swap that adds a missing
 //! entry, so any number of workers can run it at once. Dev builds can
 //! shorten both times, so the fault suite needn't wait 15 minutes.
+//!
+//! The same pass returns transfer receipts' deposits to their wallets once
+//! [`RECEIPTS_KEPT`] has passed and their requests' idempotency records are
+//! gone: a receipt is what refuses a second copy of its transfer, so it
+//! stays while a retry could still come.
 
+use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::{TimeDelta, Utc};
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
+use chrono::{DateTime, TimeDelta, Utc};
 use solana_pubkey::Pubkey;
-use tracing::{info, warn};
+use solana_signer::Signer;
+use tracing::{debug, info, warn};
 
 use crate::api::credentials::decode_right_id;
+use crate::api::pools::signed;
 use crate::blockchain::drt::pda::{derive_drt_config_pda, derive_grant_pda};
 use crate::blockchain::drt::types::APPEND_DRT_NAME;
+use crate::blockchain::signing::keypair_from_bytes_verified;
+use crate::blockchain::transactions::{is_receipt, receipt_address, sweep_receipt};
 use crate::blockchain::SolanaClient;
 use crate::chain::{creating_signature, Effect};
 use crate::error::ApiError;
 use crate::idempotency::stored_signature;
 use crate::storage::pools::{PoolDoc, Recording};
+use crate::storage::receipts::Receipt;
 use crate::storage::staged::{Saga, Staged};
 use crate::storage::{Change, Storage};
 use crate::store::Created;
+
+/// The least time a transfer's receipt stays: a day longer than a storage
+/// lifecycle rule keeps idempotency records. The sweep also waits for the
+/// record itself to be gone.
+pub const RECEIPTS_KEPT: Duration = Duration::from_secs(8 * 24 * 60 * 60);
+
+/// The most receipts one sweep transaction returns.
+const SWEEP_BATCH: usize = 8;
+
+/// A wallet with less than this can't pay a sweep's fee, so it isn't tried.
+const SWEEP_FEE_LAMPORTS: u64 = 5_000;
 
 /// When the reconciler runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,8 +86,110 @@ pub fn spawn(storage: Arc<Storage>, solana: Arc<SolanaClient>, timing: Timing) {
                 Ok(finished) => info!(finished, "Finished abandoned sagas"),
                 Err(e) => warn!(error = %e, "Reconciling staged sagas failed"),
             }
+            let kept = TimeDelta::from_std(RECEIPTS_KEPT).unwrap_or(TimeDelta::MAX);
+            match sweep_receipts(&storage, &solana, Utc::now() - kept).await {
+                Ok(0) => {}
+                Ok(swept) => info!(swept, "Swept transfer receipts"),
+                Err(e) => warn!(error = %e, "Sweeping transfer receipts failed"),
+            }
         }
     });
+}
+
+/// Return the deposits of the receipts created before `before`, whose
+/// requests' idempotency records are gone, to their wallets, a transaction
+/// for each few, and mark them swept. A receipt that isn't there, because
+/// its transfer never landed or another worker swept it, is marked swept
+/// too. Returns how many it marked.
+pub async fn sweep_receipts(
+    storage: &Storage,
+    solana: &SolanaClient,
+    before: DateTime<Utc>,
+) -> Result<usize, ApiError> {
+    let mut by_wallet: BTreeMap<String, Vec<Receipt>> = BTreeMap::new();
+    for receipt in storage.receipts().due(before).await? {
+        by_wallet
+            .entry(receipt.wallet_id.clone())
+            .or_default()
+            .push(receipt);
+    }
+    let mut swept = 0;
+    for (wallet_id, receipts) in by_wallet {
+        match sweep_wallet(storage, solana, &wallet_id, &receipts).await {
+            Ok(n) => swept += n,
+            Err(e) => warn!(wallet_id = %wallet_id, error = %e,
+                "A wallet's transfer receipts couldn't be swept"),
+        }
+    }
+    Ok(swept)
+}
+
+async fn sweep_wallet(
+    storage: &Storage,
+    solana: &SolanaClient,
+    wallet_id: &str,
+    receipts: &[Receipt],
+) -> Result<usize, ApiError> {
+    let wallet = storage
+        .wallets()
+        .get(wallet_id)
+        .await?
+        .ok_or_else(|| ApiError::internal("a receipt's wallet is gone"))?;
+    let bytes = storage.wallets().read_keypair(wallet_id).await?;
+    let keypair = keypair_from_bytes_verified(&bytes, &wallet.public_address)?;
+    let owner = keypair.pubkey();
+    let rpc = solana.rpc();
+    let rpc_error = |e| ApiError::rpc_unavailable(format!("sweeping receipts: {e}"));
+    if rpc.get_balance(&owner).await.map_err(rpc_error)? < SWEEP_FEE_LAMPORTS {
+        debug!(wallet_id, "A wallet can't pay to sweep its receipts yet");
+        return Ok(0);
+    }
+    let mut swept = 0;
+    for batch in receipts.chunks(SWEEP_BATCH) {
+        let addresses = batch
+            .iter()
+            .map(|r| receipt_address(&owner, &r.seed))
+            .collect::<Result<Vec<_>, _>>()?;
+        let (_, accounts) = rpc
+            .get_multiple_accounts(&addresses, "finalized")
+            .await
+            .map_err(rpc_error)?;
+        let mut held = Vec::new();
+        let mut instructions = Vec::new();
+        for ((receipt, address), account) in batch.iter().zip(&addresses).zip(&accounts) {
+            match account {
+                Some(a) if is_receipt(Some(a)) && a.lamports > 0 => {
+                    instructions.push(sweep_receipt(&owner, address, &receipt.seed, a.lamports));
+                    held.push(receipt);
+                }
+                _ => {
+                    storage.receipts().swept(&receipt.seed, None).await?;
+                    swept += 1;
+                }
+            }
+        }
+        if instructions.is_empty() {
+            continue;
+        }
+        let (blockhash, _) = rpc.get_latest_blockhash().await.map_err(rpc_error)?;
+        let tx = signed(&keypair, &instructions)(blockhash);
+        let encoded = bincode::serialize(&tx)
+            .map(|bytes| BASE64.encode(bytes))
+            .map_err(|e| ApiError::internal(format!("serializing a sweep: {e}")))?;
+        rpc.send_encoded_transaction(&encoded)
+            .await
+            .map_err(rpc_error)?;
+        let signature = tx.signatures[0].to_string();
+        solana.await_confirmation(&signature, "confirmed").await?;
+        for receipt in held {
+            storage
+                .receipts()
+                .swept(&receipt.seed, Some(&signature))
+                .await?;
+            swept += 1;
+        }
+    }
+    Ok(swept)
 }
 
 /// One pass over `staged/`, finishing sagas at least `min_age` old. Returns
@@ -269,6 +395,70 @@ mod tests {
             );
         }
         doc
+    }
+
+    #[tokio::test]
+    async fn old_receipts_go_back_to_their_wallet_and_young_ones_stay() {
+        use crate::storage::wallets::NewKeypair;
+        use std::sync::atomic::Ordering::SeqCst;
+
+        let storage = files_storage();
+        let chain = Arc::new(FakeChain::default());
+        let solana = fake::start(chain.clone());
+        chain.lands.store(true, SeqCst);
+        let keypair = solana_keypair::Keypair::new();
+        let owner = keypair.pubkey();
+        let wallet = NewKeypair {
+            bytes: zeroize::Zeroizing::new(keypair.to_bytes().to_vec()),
+            address: owner.to_string(),
+        };
+        storage
+            .wallets()
+            .create("u-1", "w-1", None, wallet, |_| None)
+            .await
+            .unwrap();
+        let at = |seed: &str| receipt_address(&owner, seed).unwrap();
+        let receipt = |seed: &str, created_at| Receipt {
+            seed: seed.into(),
+            wallet_id: "w-1".into(),
+            address: at(seed).to_string(),
+            record: format!("idempotency/u-1/{seed}.json"),
+            created_at,
+            swept_at: None,
+            sweep_signature: None,
+        };
+        // Two old receipts on-chain, an old one whose transfer never landed,
+        // and a young one.
+        let old = Utc::now() - TimeDelta::days(9);
+        for (seed, created_at, on_chain) in [
+            ("s1", old, true),
+            ("s2", old, true),
+            ("s3", old, false),
+            ("s4", Utc::now(), true),
+        ] {
+            storage
+                .receipts()
+                .record(&receipt(seed, created_at))
+                .await
+                .unwrap();
+            if on_chain {
+                chain.accounts.lock().unwrap().push(at(seed));
+            }
+        }
+        let before = Utc::now() - TimeDelta::days(8);
+
+        // A wallet that can't pay the sweep's fee isn't tried.
+        assert_eq!(sweep_receipts(&storage, &solana, before).await.unwrap(), 0);
+        assert!(chain.sent().is_empty());
+
+        chain.balance.store(1_000_000, SeqCst);
+        assert_eq!(sweep_receipts(&storage, &solana, before).await.unwrap(), 3);
+        assert_eq!(chain.sent().len(), 1, "one transaction for the wallet");
+        assert!(!chain.exists(&at("s1")) && !chain.exists(&at("s2")));
+        assert!(chain.exists(&at("s4")), "a young receipt stays");
+        assert!(storage.receipts().due(before).await.unwrap().is_empty());
+        assert_eq!(sweep_receipts(&storage, &solana, before).await.unwrap(), 0);
+        assert_eq!(chain.sent().len(), 1);
     }
 
     #[tokio::test]

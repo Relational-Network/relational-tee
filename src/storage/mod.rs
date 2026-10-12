@@ -17,6 +17,8 @@
 //!   analysis request ([`analysis_log`]).
 //! - `staged/{op_id}.json`: in-flight chain sagas ([`staged`]), and
 //!   `idempotency/…`, the idempotency records ([`crate::idempotency`]).
+//! - `receipts/{seed}.json`: transfer receipts, until their deposits are
+//!   swept back ([`receipts`]).
 //! - `canary/{worker_id}`: the readiness canary.
 //!
 //! Every object is sealed inside the worker ([`crate::store::sealed`]), and
@@ -35,6 +37,7 @@ pub mod analysis_log;
 pub mod chain;
 pub mod identities;
 pub mod pools;
+pub mod receipts;
 pub mod scripts;
 pub mod staged;
 pub mod wallets;
@@ -95,6 +98,10 @@ impl Storage {
 
     pub fn identities(&self) -> identities::Identities<'_> {
         identities::Identities::new(self)
+    }
+
+    pub fn receipts(&self) -> receipts::Receipts<'_> {
+        receipts::Receipts::new(self)
     }
 
     pub fn worker_id(&self) -> &str {

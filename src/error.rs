@@ -139,6 +139,12 @@ impl ApiError {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", msg)
     }
 
+    /// 502 `bad_gateway` — an upstream answered, but not enough to finish
+    /// the request safely; a retry wouldn't change that.
+    pub fn bad_gateway(msg: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_GATEWAY, "bad_gateway", msg)
+    }
+
     /// 503 `service_unavailable` — the worker can't serve this yet.
     pub fn service_unavailable(msg: impl Into<String>) -> Self {
         Self::new(StatusCode::SERVICE_UNAVAILABLE, "service_unavailable", msg)

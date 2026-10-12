@@ -84,7 +84,7 @@ csv = { version = "1.4.0", default-features = false }
 # Replaces monolithic solana-sdk + solana-client + spl-token + spl-ata
 # with granular crates and inline instruction builders.
 # SPL crates replaced with ~40 lines in blockchain/spl_token.rs.
-solana-pubkey = { version = "4.1", default-features = false, features = ["curve25519", "borsh"] }
+solana-pubkey = { version = "4.1", default-features = false, features = ["curve25519", "borsh", "sha2"] }
 solana-keypair = { version = "3.1", default-features = false }
 solana-signer = { version = "3", default-features = false }
 solana-signature = { version = "3.3", default-features = false }
