@@ -214,6 +214,22 @@ async fn authorize(
     Ok((Some(through), scope))
 }
 
+/// `answer`, unless the caller is an analyst and the pool has made a change
+/// since the request read `doc`: then `503 pool_settling`, and the retry
+/// runs on the latest document, so that a revocation recorded while the
+/// request ran holds for its answer too.
+async fn if_current<T>(
+    state: &AppState,
+    doc: &PoolDoc,
+    analyst: bool,
+    answer: T,
+) -> Result<T, ApiError> {
+    if analyst {
+        crate::generation::still_current(&state.storage, doc).await?;
+    }
+    Ok(answer)
+}
+
 /// 415 unless the request's body is JSON.
 fn require_json(headers: &HeaderMap) -> Result<(), ApiError> {
     let is_json = headers
@@ -436,7 +452,7 @@ fn summary(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "No active grant (`no_grant`), a grant the chain doesn't show (`grant_not_live`), or no employer scope (`no_employer_scope`, `groups_overage`)"),
         (status = 404, description = "Pool or analysis not found"),
-        (status = 503, description = "The chain can't be read to check the grant (`rpc_unavailable`)"),
+        (status = 503, description = "The chain can't be read to check the grant (`rpc_unavailable`), the pool's last change is still being anchored or was made while the request ran (`pool_settling`, with Retry-After), or the pool's records are older than its on-chain generation (`pool_records_stale`)"),
     )
 )]
 pub async fn get_analysis(
@@ -450,8 +466,11 @@ pub async fn get_analysis(
         .analyses
         .definition(&state.storage, &analysis.code_hash_hex)
         .await?;
-    let (_, scope) = authorize(&state, &caller, &doc, &analysis, &def).await?;
-    Ok(Json(summary(&doc, &analysis, &def, &scope)))
+    let (through, scope) = authorize(&state, &caller, &doc, &analysis, &def).await?;
+    let answer = summary(&doc, &analysis, &def, &scope);
+    if_current(&state, &doc, through.is_some(), answer)
+        .await
+        .map(Json)
 }
 
 /// Each filter's options, from the caller's rows the other filters match.
@@ -475,7 +494,7 @@ pub async fn get_analysis(
         (status = 404, description = "Pool or analysis not found"),
         (status = 415, description = "The body isn't JSON"),
         (status = 422, description = "The options ran out of time (`analysis_timeout`)"),
-        (status = 503, description = "The worker is busy (`analysis_busy`, with Retry-After), the analysis log is unavailable, the chain can't be read to check the grant (`rpc_unavailable`), the pool's last change is still being anchored (`pool_settling`, with Retry-After), or the pool's records are older than its on-chain generation (`pool_records_stale`)"),
+        (status = 503, description = "The worker is busy (`analysis_busy`, with Retry-After), the analysis log is unavailable, the chain can't be read to check the grant (`rpc_unavailable`), the pool's last change is still being anchored or was made while the request ran (`pool_settling`, with Retry-After), or the pool's records are older than its on-chain generation (`pool_records_stale`)"),
     )
 )]
 pub async fn filtered_options(
@@ -510,6 +529,7 @@ async fn options_for(
             .definition(&state.storage, &analysis.code_hash_hex)
             .await?;
         let (grant, scope) = authorize(state, caller, &doc, &analysis, &def).await?;
+        let analyst = grant.is_some();
         logged.through(grant);
         let request: OptionsRequest = parse(body)?;
         let query = filters_only(&def, request.filters)?;
@@ -518,9 +538,8 @@ async fn options_for(
             .table(&state.storage, &doc, &def, &scope)
             .await?;
         if query.is_unfiltered() {
-            return Ok(OptionsResponse {
-                options: table.options().clone(),
-            });
+            let options = table.options().clone();
+            return if_current(state, &doc, analyst, OptionsResponse { options }).await;
         }
         let options = state
             .analyses
@@ -528,7 +547,7 @@ async fn options_for(
                 table.facets(&def, &query, stop).map_err(query_error)
             })
             .await?;
-        Ok(OptionsResponse { options })
+        if_current(state, &doc, analyst, OptionsResponse { options }).await
     }
     .await;
     logged
@@ -565,7 +584,7 @@ async fn options_for(
         (status = 404, description = "Pool or analysis not found"),
         (status = 415, description = "The body isn't JSON"),
         (status = 422, description = "The search ran out of time (`analysis_timeout`)"),
-        (status = 503, description = "The worker is busy (`analysis_busy`, with Retry-After), the analysis log is unavailable, the chain can't be read to check the grant (`rpc_unavailable`), the pool's last change is still being anchored (`pool_settling`, with Retry-After), or the pool's records are older than its on-chain generation (`pool_records_stale`)"),
+        (status = 503, description = "The worker is busy (`analysis_busy`, with Retry-After), the analysis log is unavailable, the chain can't be read to check the grant (`rpc_unavailable`), the pool's last change is still being anchored or was made while the request ran (`pool_settling`, with Retry-After), or the pool's records are older than its on-chain generation (`pool_records_stale`)"),
     )
 )]
 pub async fn filtered_search(
@@ -606,6 +625,7 @@ async fn search_for(
             .definition(&state.storage, &analysis.code_hash_hex)
             .await?;
         let (grant, scope) = authorize(state, caller, &doc, &analysis, &def).await?;
+        let analyst = grant.is_some();
         logged.through(grant);
         let request: SearchRequest = parse(body)?;
         let query = filters_only(&def, request.filters)?;
@@ -623,7 +643,7 @@ async fn search_for(
                     .map_err(query_error)
             })
             .await?;
-        Ok(SearchResponse { values })
+        if_current(state, &doc, analyst, SearchResponse { values }).await
     }
     .await;
     logged
@@ -652,7 +672,7 @@ async fn search_for(
         (status = 404, description = "Pool or analysis not found"),
         (status = 415, description = "The body isn't JSON"),
         (status = 422, description = "The query ran out of time (`analysis_timeout`)"),
-        (status = 503, description = "The worker is busy (`analysis_busy`, with Retry-After), the analysis log is unavailable, the chain can't be read to check the grant (`rpc_unavailable`), the pool's last change is still being anchored (`pool_settling`, with Retry-After), or the pool's records are older than its on-chain generation (`pool_records_stale`)"),
+        (status = 503, description = "The worker is busy (`analysis_busy`, with Retry-After), the analysis log is unavailable, the chain can't be read to check the grant (`rpc_unavailable`), the pool's last change is still being anchored or was made while the request ran (`pool_settling`, with Retry-After), or the pool's records are older than its on-chain generation (`pool_records_stale`)"),
     )
 )]
 pub async fn run_query(
@@ -673,6 +693,7 @@ pub async fn run_query(
             .definition(&state.storage, &analysis.code_hash_hex)
             .await?;
         let (grant, scope) = authorize(&state, &caller, &doc, &analysis, &def).await?;
+        let analyst = grant.is_some();
         logged.through(grant);
         let request: QueryRequest = parse(&body)?;
         let query = query::Query::check(&def, &request).map_err(query_error)?;
@@ -689,12 +710,13 @@ pub async fn run_query(
             .analyses
             .table(&state.storage, &doc, &def, &scope)
             .await?;
-        state
+        let page = state
             .analyses
             .on_table(table, move |table, stop| {
                 table.page(&def, &query, stop).map_err(query_error)
             })
-            .await
+            .await?;
+        if_current(&state, &doc, analyst, page).await
     }
     .await;
     let page = logged

@@ -1108,7 +1108,7 @@ pub async fn list_grants(
     responses(
         (status = 200, description = "The caller's analyses", body = MyAnalysesResponse),
         (status = 401, description = "Unauthorized"),
-        (status = 503, description = "The chain can't be read to check a grant (`rpc_unavailable`)"),
+        (status = 503, description = "The chain can't be read to check a grant (`rpc_unavailable`), a pool's last change is still being anchored or was made while the request ran (`pool_settling`, with Retry-After), or a pool's records are older than its on-chain generation (`pool_records_stale`)"),
     )
 )]
 pub async fn my_analyses(
