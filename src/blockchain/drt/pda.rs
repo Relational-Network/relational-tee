@@ -13,11 +13,8 @@ use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use solana_pubkey::Pubkey;
-use std::str::FromStr;
-use std::sync::OnceLock;
 use zeroize::Zeroizing;
 
-use super::types::{ASSOCIATED_TOKEN_PROGRAM_ID_STR, TOKEN_PROGRAM_ID_STR};
 use crate::config::drt_program_id;
 use crate::tee::EcKey;
 
@@ -49,19 +46,7 @@ pub fn derive_grant_pda(commitment: &[u8; 32]) -> (Pubkey, u8) {
 ///
 /// Seeds: `[holder, TOKEN_PROGRAM, mint]` under the ATA program.
 pub fn derive_user_ata(holder: &Pubkey, mint: &Pubkey) -> Pubkey {
-    static TOKEN_PROGRAM: OnceLock<Pubkey> = OnceLock::new();
-    static ATA_PROGRAM: OnceLock<Pubkey> = OnceLock::new();
-    let token_program = TOKEN_PROGRAM.get_or_init(|| {
-        Pubkey::from_str(TOKEN_PROGRAM_ID_STR).expect("valid SPL Token program ID")
-    });
-    let ata_program = ATA_PROGRAM.get_or_init(|| {
-        Pubkey::from_str(ASSOCIATED_TOKEN_PROGRAM_ID_STR).expect("valid ATA program ID")
-    });
-    Pubkey::find_program_address(
-        &[holder.as_ref(), token_program.as_ref(), mint.as_ref()],
-        ata_program,
-    )
-    .0
+    crate::blockchain::spl_token::get_associated_token_address(holder, mint)
 }
 
 /// Computes grant commitments: HMAC-SHA256 under a key derived from the

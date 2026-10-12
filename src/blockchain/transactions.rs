@@ -11,23 +11,15 @@
 //! need for the RPC's history. The deposit goes back to the wallet once
 //! retries of the request are no longer accepted.
 
-use std::str::FromStr;
-use std::sync::OnceLock;
-
 use solana_instruction::Instruction;
 use solana_message::Message;
 use solana_pubkey::Pubkey;
 use solana_system_interface::instruction as system_instruction;
 
 use super::client::SolanaClient;
-use super::drt::types::SYSTEM_PROGRAM_ID_STR;
 use super::rpc::{Account, SignatureStatus};
+use super::spl_token::system_program_id;
 use crate::error::ApiError;
-
-fn system_program_id() -> &'static Pubkey {
-    static ID: OnceLock<Pubkey> = OnceLock::new();
-    ID.get_or_init(|| Pubkey::from_str(SYSTEM_PROGRAM_ID_STR).expect("valid system program ID"))
-}
 
 /// The receipt address of the transfer from `wallet` that `seed` names.
 pub fn receipt_address(wallet: &Pubkey, seed: &str) -> Result<Pubkey, ApiError> {
