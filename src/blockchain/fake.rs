@@ -79,6 +79,10 @@ pub struct FakeChain {
     /// The error a send's preflight simulation fails with, if any.
     pub preflight: Mutex<Option<Value>>,
     blockhashes: AtomicU8,
+    /// Held while a sent transaction is checked and applied, so that
+    /// transactions apply one at a time and each signature once, as a
+    /// validator applies them.
+    ledger: Mutex<()>,
 }
 
 impl FakeChain {
@@ -396,6 +400,7 @@ impl FakeChain {
                 let bytes = BASE64.decode(encoded).unwrap();
                 let tx: Transaction = bincode::deserialize(&bytes).unwrap();
                 let signature = tx.signatures[0].to_string();
+                let _ledger = self.ledger.lock().unwrap();
                 let processed = self
                     .landed
                     .lock()
