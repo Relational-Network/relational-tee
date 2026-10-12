@@ -97,9 +97,15 @@ impl StorageKeys {
     }
 
     /// Seal `plaintext` for `container/path`.
-    pub fn seal(&self, container: &str, path: &str, plaintext: &[u8]) -> Vec<u8> {
+    pub fn seal(
+        &self,
+        container: &str,
+        path: &str,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, StoreError> {
         let mut nonce = [0u8; NONCE_LEN];
-        OsRng.fill_bytes(&mut nonce);
+        getrandom::fill(&mut nonce)
+            .map_err(|e| StoreError::Unavailable(format!("drawing a nonce: {e}")))?;
         let ciphertext = self
             .cipher()
             .encrypt(
@@ -114,7 +120,7 @@ impl StorageKeys {
         out.extend_from_slice(MAGIC);
         out.extend_from_slice(&nonce);
         out.extend_from_slice(&ciphertext);
-        out
+        Ok(out)
     }
 
     /// Open an object sealed for the same `container/path`.
@@ -270,7 +276,7 @@ impl Sealed {
 
     /// Create the object unless `path` is taken.
     pub async fn create(&self, path: &str, plain: &[u8]) -> Result<Created, StoreError> {
-        let sealed = self.keys.seal(self.container, path, plain);
+        let sealed = self.keys.seal(self.container, path, plain)?;
         let created = self.store.put_if_absent(path, Bytes::from(sealed)).await?;
         if let Created::New(etag) = &created {
             self.remember(
@@ -286,7 +292,7 @@ impl Sealed {
 
     /// Create the object unless `path` is taken, without caching it.
     pub async fn create_uncached(&self, path: &str, plain: &[u8]) -> Result<Created, StoreError> {
-        let sealed = self.keys.seal(self.container, path, plain);
+        let sealed = self.keys.seal(self.container, path, plain)?;
         self.store.put_if_absent(path, Bytes::from(sealed)).await
     }
 
@@ -297,7 +303,7 @@ impl Sealed {
         plain: &[u8],
         etag: &ETag,
     ) -> Result<Replaced, StoreError> {
-        let sealed = self.keys.seal(self.container, path, plain);
+        let sealed = self.keys.seal(self.container, path, plain)?;
         let replaced = self
             .store
             .put_if_match(path, Bytes::from(sealed), etag)
@@ -455,7 +461,7 @@ pub(crate) mod tests {
     #[test]
     fn objects_open_only_at_their_own_path_with_their_own_key() {
         let k = keys();
-        let sealed = k.seal("state", "pools/P1.json", b"{\"a\":1}");
+        let sealed = k.seal("state", "pools/P1.json", b"{\"a\":1}").unwrap();
         assert_eq!(&sealed[..4], b"RTS1");
         assert_eq!(
             k.open("state", "pools/P1.json", &sealed)
