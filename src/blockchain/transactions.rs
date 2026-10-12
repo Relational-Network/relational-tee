@@ -256,7 +256,7 @@ mod tests {
         transfer.extend(native_transfer(&wallet, &Pubkey::new_unique(), 1_000_000));
         send(transfer.clone()).await.unwrap();
         let made = rpc.get_account(&receipt, "confirmed").await.unwrap();
-        assert!(is_receipt(made.as_ref()), "{made:?}");
+        assert!(is_receipt(made.as_ref()), "the transfer makes its receipt");
 
         let refused = send(transfer).await.unwrap_err();
         assert_eq!(
