@@ -24,14 +24,12 @@ fn strip_discriminator<'a>(
     max: usize,
     label: &str,
 ) -> Result<&'a [u8], ApiError> {
-    if data.len() < 8 {
+    let Some((disc, payload)) = data.split_first_chunk::<8>() else {
         return Err(ApiError::internal(format!("{label} account too short")));
-    }
-    let disc: [u8; 8] = data[..8].try_into().unwrap();
-    if &disc != expected {
+    };
+    if disc != expected {
         return Err(ApiError::internal(format!("invalid {label} discriminator")));
     }
-    let payload = &data[8..];
     if payload.len() > max {
         return Err(ApiError::internal(format!(
             "{label} account too large ({} bytes, max {max})",

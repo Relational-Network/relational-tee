@@ -497,6 +497,7 @@ pub(crate) mod tests {
         let table = Table::build(&awards_report(), &[csv.as_bytes()], &Scope::All).unwrap();
         assert_eq!(table.rows, 1);
         // SAFETY: reads a counter; SQLite is initialised by the build above.
+        #[allow(unsafe_code)]
         let used = unsafe { rusqlite::ffi::sqlite3_memory_used() };
         assert_eq!(
             used, 0,

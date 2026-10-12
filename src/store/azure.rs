@@ -96,7 +96,7 @@ impl Endpoint {
             .ok_or_else(|| format!("storage URL {url:?} must be http:// or https://"))?;
         let rest = rest.trim_end_matches('/');
         let (authority, prefix) = match rest.find('/') {
-            Some(i) => (&rest[..i], &rest[i..]),
+            Some(i) => rest.split_at_checked(i).unwrap_or((rest, "")),
             None => (rest, ""),
         };
         if authority.is_empty() {
@@ -436,9 +436,9 @@ fn etag_of(response: &Response) -> Result<ETag, StoreError> {
 fn element(xml: &str, tag: &str) -> Option<String> {
     let open = format!("<{tag}");
     let mut from = 0;
-    while let Some(i) = xml[from..].find(&open) {
+    while let Some(i) = xml.get(from..)?.find(&open) {
         let start = from + i + open.len();
-        let rest = &xml[start..];
+        let rest = xml.get(start..)?;
         // Skip longer names that share the prefix, such as `<BlobPrefix>`.
         match rest.chars().next() {
             Some('>') | Some(' ') => {}
@@ -449,11 +449,12 @@ fn element(xml: &str, tag: &str) -> Option<String> {
             }
         }
         let body_start = start + rest.find('>')? + 1;
-        if xml[..body_start].ends_with("/>") {
+        if xml.get(..body_start)?.ends_with("/>") {
             return Some(String::new());
         }
-        let end = xml[body_start..].find(&format!("</{tag}>"))?;
-        return Some(unescape(&xml[body_start..body_start + end]));
+        let body = xml.get(body_start..)?;
+        let end = body.find(&format!("</{tag}>"))?;
+        return Some(unescape(body.get(..end)?));
     }
     None
 }
@@ -472,10 +473,13 @@ fn parse_list(xml: &str) -> Result<(Vec<Listed>, Option<String>), StoreError> {
     let mut listed = Vec::new();
     let mut rest = xml;
     while let Some(i) = rest.find("<Blob>") {
-        let end = rest[i..]
+        let (_, from_blob) = rest.split_at_checked(i).ok_or_else(|| bad("unreadable"))?;
+        let end = from_blob
             .find("</Blob>")
             .ok_or_else(|| bad("unclosed Blob"))?;
-        let blob = &rest[i..i + end];
+        let (blob, after) = from_blob
+            .split_at_checked(end)
+            .ok_or_else(|| bad("unreadable"))?;
         let path = element(blob, "Name").ok_or_else(|| bad("a Blob has no Name"))?;
         let etag = element(blob, "Etag").ok_or_else(|| bad("a Blob has no Etag"))?;
         let modified = element(blob, "Last-Modified").ok_or_else(|| bad("no Last-Modified"))?;
@@ -486,7 +490,7 @@ fn parse_list(xml: &str) -> Result<(Vec<Listed>, Option<String>), StoreError> {
                 .map_err(|_| bad("Last-Modified isn't an HTTP date"))?
                 .with_timezone(&Utc),
         });
-        rest = &rest[i + end..];
+        rest = after;
     }
     let next = element(xml, "NextMarker").filter(|m| !m.is_empty());
     Ok((listed, next))

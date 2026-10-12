@@ -696,8 +696,7 @@ pub fn is_loopback_http_url(url: &str) -> bool {
         return false;
     };
     // Authority ends at the first '/', '?', or '#'.
-    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let authority = &rest[..authority_end];
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
     // Strip optional userinfo (`user:pass@host`).
     let host_port = authority
         .rsplit_once('@')
