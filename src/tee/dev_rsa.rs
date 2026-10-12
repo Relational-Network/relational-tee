@@ -13,7 +13,10 @@ use base64::Engine;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 #[cfg(feature = "dev")]
-use {std::fs, std::path::Path, zeroize::Zeroizing};
+use {
+    rustls::pki_types::pem::PemObject, rustls::pki_types::PrivateKeyDer, std::fs, std::path::Path,
+    zeroize::Zeroizing,
+};
 
 /// An RSA signing key, with its public half as JWK members and its RFC 7638
 /// thumbprint as its `kid`.
@@ -42,8 +45,8 @@ impl RsaSigner {
                 path.display()
             )
         })?);
-        let der = match rustls_pemfile::private_key(&mut pem.as_slice()) {
-            Ok(Some(rustls::pki_types::PrivateKeyDer::Pkcs8(der))) => der,
+        let der = match PrivateKeyDer::from_pem_slice(&pem) {
+            Ok(PrivateKeyDer::Pkcs8(der)) => der,
             _ => return Err(format!("{} isn't a PKCS#8 private key", path.display())),
         };
         let key = RsaKeyPair::from_pkcs8(der.secret_pkcs8_der())

@@ -26,6 +26,7 @@ use std::time::Duration;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use p256::pkcs8::EncodePrivateKey;
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, PublicKeyData};
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::{CertifiedKey, SigningKey};
@@ -207,7 +208,7 @@ impl Certificates {
     }
 
     fn load(&self, pem: &[u8], etag: ETag) -> Result<(), String> {
-        let chain = rustls_pemfile::certs(&mut &pem[..])
+        let chain = CertificateDer::pem_slice_iter(pem)
             .collect::<Result<Vec<CertificateDer<'static>>, _>>()
             .map_err(|e| format!("reading {}: {e}", self.chain_path()))?;
         let Some(leaf) = chain.first() else {
@@ -341,6 +342,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::store::files::LocalFiles;
     use crate::tee::tests::fixed_key;
+    use rustls::pki_types::CertificateSigningRequestDer;
 
     fn der(tag: u8, contents: &[u8]) -> Vec<u8> {
         let mut out = vec![tag];
@@ -445,9 +447,8 @@ pub(crate) mod tests {
         b.refresh().await.unwrap();
         let csr = body(&store, &a.csr_path()).await.expect("a CSR");
         assert_eq!(csr, a.csr_pem, "the first write wins");
-        let csr_der = rustls_pemfile::csr(&mut csr.as_bytes())
-            .unwrap()
-            .expect("a PEM CSR");
+        let csr_der =
+            CertificateSigningRequestDer::from_pem_slice(csr.as_bytes()).expect("a PEM CSR");
         let spki = key_pair(&fixed_key(3)).subject_public_key_info();
         assert!(
             csr_der.as_ref().windows(spki.len()).any(|w| w == spki),

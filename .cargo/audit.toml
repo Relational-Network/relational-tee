@@ -4,5 +4,4 @@
 [advisories]
 ignore = [
     "RUSTSEC-2025-0141", # bincode unmaintained; transitive via Solana; waiting on upstream fix
-    "RUSTSEC-2025-0134", # rustls-pemfile 2.2.0 unmaintained
 ]
