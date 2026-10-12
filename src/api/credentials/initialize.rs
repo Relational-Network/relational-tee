@@ -15,7 +15,7 @@ use serde::Serialize;
 use tracing::info;
 use utoipa::ToSchema;
 
-use super::{count_csv_rows, parse_pda, pool_not_found, sha256_hex, validation_failed};
+use super::{parse_pda, pool_not_found, sha256_hex, validation_failed};
 use crate::api::pools::{load_pool, verify_pool_ownership};
 use crate::audit;
 use crate::auth::{Caller, Permission};
@@ -97,27 +97,33 @@ pub async fn initialize_pool(
 
     let doc = load_pool(&state, &pool_pda_str).await?;
     let upload_id = ids::upload_id(&caller.user_id, &pool_pda_str, &request.key);
-    let ours = doc
+    let recorded = doc
         .initial
         .as_ref()
-        .is_some_and(|u| u.upload_id == upload_id);
-    if !ours {
-        if doc.state() != PoolState::NeedsInit {
-            return Err(ApiError::bad_request(
-                "pool is already initialized — use /issue to add credentials",
-            ));
+        .filter(|u| u.upload_id == upload_id)
+        .map(|u| u.rows);
+    let ours = recorded.is_some();
+    let rows = match recorded {
+        Some(rows) => rows,
+        None => {
+            if doc.state() != PoolState::NeedsInit {
+                return Err(ApiError::bad_request(
+                    "pool is already initialized — use /issue to add credentials",
+                ));
+            }
+            let summary = validate_payload(&doc.schema, &pool_pda_str, &csv_bytes)?;
+            if !summary.valid {
+                return Err(validation_failed(summary.errors.len()));
+            }
+            summary.rows_validated as u64
         }
-        let summary = validate_payload(&doc.schema, &pool_pda_str, &csv_bytes)?;
-        if !summary.valid {
-            return Err(validation_failed(summary.errors.len()));
-        }
-    }
+    };
 
     let upload = Upload {
         record_id: INITIAL.to_string(),
         upload_id,
         sha256: sha256_hex(&csv_bytes),
-        rows: count_csv_rows(&csv_bytes),
+        rows,
         uploaded_by: caller.user_id.clone(),
         uploaded_at: Utc::now(),
         signature: None,

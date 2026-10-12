@@ -18,9 +18,7 @@ use std::str::FromStr;
 use tracing::{info, warn};
 use utoipa::ToSchema;
 
-use super::{
-    count_csv_rows, decode_right_id, parse_pda, pool_not_found, sha256_hex, validation_failed,
-};
+use super::{decode_right_id, parse_pda, pool_not_found, sha256_hex, validation_failed};
 use crate::api::pools::{load_pool, signed, verify_pool_ownership};
 use crate::audit;
 use crate::auth::{Caller, Permission};
@@ -207,7 +205,7 @@ pub async fn issue_credentials(
         return Err(validation_failed(summary.errors.len()));
     }
 
-    let row_count = count_csv_rows(&csv_bytes);
+    let row_count = summary.rows_validated as u64;
 
     // ── STORE THE DATASET, STAGE THE UPLOAD ───────────────────────
 
