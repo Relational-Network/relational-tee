@@ -4,20 +4,24 @@
 //! Entra ID's signing keys, cached.
 //!
 //! The keys are fetched from the tenant's JWKS endpoint and cached for 24
-//! hours. Only one fetch runs at a time: concurrent requests that need keys
-//! wait for it. A token naming a key the cache doesn't hold triggers a
-//! refresh, at most once a minute, so Entra's key rollover is picked up
-//! without letting unknown `kid`s drive a fetch per request. If a refresh
-//! fails, the keys already held keep working.
+//! hours. One fetch runs at a time, in a task of its own, and every request
+//! that needs its result waits for that one fetch, failed or not; a request
+//! that gives up doesn't cancel it. A key the cache holds keeps working
+//! while a refresh runs, and, if refreshes fail, until 72 hours after the
+//! last one that succeeded. A token naming a key the cache doesn't hold
+//! triggers a refresh at most once a minute, so Entra's key rollover is
+//! picked up without letting unknown `kid`s drive a fetch per request.
+//! After a failed fetch the next waits 5 seconds, doubling to 5 minutes
+//! while they keep failing, however stale the keys are.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use futures_util::future::BoxFuture;
 use jsonwebtoken::DecodingKey;
 use serde::Deserialize;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::watch;
 use tokio::time::Instant;
 use tracing::{info, warn};
 
@@ -25,8 +29,13 @@ use crate::http_client::HttpClient;
 
 /// How long fetched keys are trusted without a refresh.
 pub const CACHE_TTL: Duration = Duration::from_secs(24 * 3600);
+/// How long after the last successful fetch held keys still verify tokens,
+/// while refreshes fail.
+pub const MAX_KEY_AGE: Duration = Duration::from_secs(72 * 3600);
 /// The shortest interval between refreshes caused by an unknown `kid`.
 pub const UNKNOWN_KID_INTERVAL: Duration = Duration::from_secs(60);
+/// The wait after a failed fetch, at first and at most.
+pub const RETRY_WAIT: (Duration, Duration) = (Duration::from_secs(5), Duration::from_secs(300));
 
 /// Where signing keys come from.
 pub trait KeySource: Send + Sync {
@@ -111,91 +120,132 @@ struct Cached {
     keys: HashMap<String, DecodingKey>,
     /// When the keys were last fetched successfully.
     fetched_at: Option<Instant>,
-    /// When a fetch was last attempted, successful or not.
+    /// When the last fetch started, and how many in a row have failed.
     attempted_at: Option<Instant>,
+    failures: u32,
+    refreshing: bool,
 }
 
 impl Cached {
-    fn fresh(&self, now: Instant) -> bool {
-        self.fetched_at
-            .is_some_and(|at| now.duration_since(at) < CACHE_TTL)
+    fn age(&self, now: Instant) -> Option<Duration> {
+        self.fetched_at.map(|at| now.duration_since(at))
     }
 
-    fn may_refresh_for_unknown_kid(&self, now: Instant) -> bool {
-        self.attempted_at
-            .is_none_or(|at| now.duration_since(at) >= UNKNOWN_KID_INTERVAL)
+    fn fresh(&self, now: Instant) -> bool {
+        self.age(now).is_some_and(|age| age < CACHE_TTL)
+    }
+
+    /// `kid`, unless the keys are too old to trust.
+    fn key(&self, kid: &str, now: Instant) -> Option<DecodingKey> {
+        let usable = self.age(now).is_some_and(|age| age < MAX_KEY_AGE);
+        self.keys.get(kid).filter(|_| usable).cloned()
+    }
+
+    /// Whether a fetch may start now: none is running, the last one's
+    /// failure has been waited out, and, if the keys are fresh, the last
+    /// one was over a minute ago.
+    fn may_fetch(&self, now: Instant) -> bool {
+        let Some(at) = self.attempted_at else {
+            return true;
+        };
+        let since = now.duration_since(at);
+        if self.refreshing || since < crate::work::backoff(self.failures, RETRY_WAIT) {
+            return false;
+        }
+        !self.fresh(now) || since >= UNKNOWN_KID_INTERVAL
     }
 }
 
 /// The signing keys, cached, with single-flight refresh.
 pub struct KeySet {
     source: Arc<dyn KeySource>,
-    cached: RwLock<Cached>,
-    refreshing: Mutex<()>,
+    cached: Arc<Mutex<Cached>>,
+    /// How many fetches have finished, successful or not.
+    finished: watch::Sender<u64>,
 }
 
 impl KeySet {
     pub fn new(source: Arc<dyn KeySource>) -> Self {
         Self {
             source,
-            cached: RwLock::new(Cached::default()),
-            refreshing: Mutex::new(()),
+            cached: Arc::default(),
+            finished: watch::Sender::new(0),
         }
     }
 
-    /// The key named `kid`, refreshing the cache if it's stale, or if it
-    /// doesn't hold `kid` and no refresh ran in the last minute.
+    fn lock(&self) -> MutexGuard<'_, Cached> {
+        self.cached.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The key named `kid`. A fresh key is returned at once, and so is a
+    /// stale one while a refresh runs in the background. Without one, this
+    /// waits for a refresh, if one is running or may start.
     pub async fn get(&self, kid: &str) -> Option<DecodingKey> {
-        if let Some(key) = self.lookup(kid, false).await {
-            return Some(key);
-        }
-        let _flight = self.refreshing.lock().await;
-        // Another request may have refreshed while this one waited.
-        if let Some(key) = self.lookup(kid, false).await {
-            return Some(key);
-        }
+        let mut finished = self.finished.subscribe();
+        let seen = *finished.borrow_and_update();
         let now = Instant::now();
-        let needed = {
-            let cached = self.cached.read().await;
-            !cached.fresh(now) || cached.may_refresh_for_unknown_kid(now)
+        let (key, fresh, started) = {
+            let mut cached = self.lock();
+            let key = cached.key(kid, now);
+            let fresh = cached.fresh(now);
+            let started = (key.is_none() || !fresh) && self.start_fetch(&mut cached, now);
+            (key, fresh, started || cached.refreshing)
         };
-        if needed {
-            self.refresh(now).await;
-        }
-        self.lookup(kid, true).await
-    }
-
-    /// `kid` from the cache: only while fresh, unless `stale_ok`.
-    async fn lookup(&self, kid: &str, stale_ok: bool) -> Option<DecodingKey> {
-        let cached = self.cached.read().await;
-        if !stale_ok && !cached.fresh(Instant::now()) {
-            return None;
-        }
-        cached.keys.get(kid).cloned()
-    }
-
-    async fn refresh(&self, now: Instant) {
-        let fetched = self.source.fetch().await;
-        let mut cached = self.cached.write().await;
-        cached.attempted_at = Some(now);
-        match fetched {
-            Ok(keys) => {
-                info!(keys = keys.len(), "Fetched Entra ID signing keys");
-                cached.keys = keys;
-                cached.fetched_at = Some(now);
+        match key {
+            Some(key) => Some(key),
+            None if started => {
+                // One fetch serves every waiter, whatever its outcome.
+                let _ = finished.wait_for(|n| *n > seen).await;
+                self.lock().key(kid, Instant::now())
             }
-            Err(e) => warn!(error = %e, held = cached.keys.len(),
-                "Fetching Entra ID signing keys failed; keeping the keys held"),
+            None => {
+                if fresh {
+                    warn!(kid, "A token names a signing key Entra ID didn't list");
+                }
+                None
+            }
         }
+    }
+
+    /// Start a fetch in a task of its own, if one may start now.
+    fn start_fetch(&self, cached: &mut Cached, now: Instant) -> bool {
+        if !cached.may_fetch(now) {
+            return false;
+        }
+        cached.refreshing = true;
+        cached.attempted_at = Some(now);
+        let (source, shared, finished) = (
+            self.source.clone(),
+            self.cached.clone(),
+            self.finished.clone(),
+        );
+        tokio::spawn(async move {
+            let fetched = source.fetch().await;
+            {
+                let mut cached = shared.lock().unwrap_or_else(PoisonError::into_inner);
+                cached.refreshing = false;
+                match fetched {
+                    Ok(keys) => {
+                        info!(keys = keys.len(), "Fetched Entra ID signing keys");
+                        cached.keys = keys;
+                        cached.fetched_at = Some(now);
+                        cached.failures = 0;
+                    }
+                    Err(e) => {
+                        cached.failures = cached.failures.saturating_add(1);
+                        warn!(error = %e, held = cached.keys.len(), failures = cached.failures,
+                            "Fetching Entra ID signing keys failed; keeping the keys held");
+                    }
+                }
+            }
+            finished.send_modify(|n| *n += 1);
+        });
+        true
     }
 
     /// How long ago the keys were fetched, for `/health`.
     pub async fn age(&self) -> Option<Duration> {
-        self.cached
-            .read()
-            .await
-            .fetched_at
-            .map(|at| Instant::now().duration_since(at))
+        self.lock().age(Instant::now())
     }
 }
 
@@ -265,6 +315,11 @@ pub(crate) mod tests {
         assert_eq!(source.fetches.load(Ordering::SeqCst), 2);
     }
 
+    /// Long enough for a fetch, which takes 20 ms, to finish.
+    async fn settle() {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
     #[tokio::test(start_paused = true)]
     async fn keys_are_refetched_after_a_day_and_kept_when_that_fails() {
         let source = Fixed::new(HashMap::from([("a".to_string(), key())]));
@@ -274,9 +329,63 @@ pub(crate) mod tests {
         source.fail.store(true, Ordering::SeqCst);
         assert!(
             set.get("a").await.is_some(),
-            "stale keys serve while Entra is down"
+            "a stale key serves at once while the refresh runs"
         );
+        settle().await;
         assert_eq!(source.fetches.load(Ordering::SeqCst), 2);
+        assert!(set.get("a").await.is_some(), "and after it fails");
+
+        // Until the keys are too old to trust.
+        tokio::time::advance(MAX_KEY_AGE - CACHE_TTL).await;
+        assert!(set.get("a").await.is_none());
+        source.fail.store(false, Ordering::SeqCst);
+        tokio::time::advance(RETRY_WAIT.1).await;
+        assert!(
+            set.get("a").await.is_some(),
+            "a fetch that works restores them"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failing_upstream_is_fetched_once_for_every_caller_then_backed_off() {
+        let source = Fixed::new(HashMap::from([("a".to_string(), key())]));
+        source.fail.store(true, Ordering::SeqCst);
+        let set = Arc::new(KeySet::new(source.clone()));
+        let fetches = || source.fetches.load(Ordering::SeqCst);
+        let callers = (0..100).map(|_| {
+            let set = set.clone();
+            tokio::spawn(async move { set.get("a").await.is_some() })
+        });
+        let started = Instant::now();
+        for found in futures_util::future::join_all(callers).await {
+            assert!(!found.unwrap());
+        }
+        assert_eq!(fetches(), 1, "one fetch answered all hundred");
+        assert!(started.elapsed() < Duration::from_millis(100));
+
+        // Its failure holds for the next 5 seconds, then 10, then 20.
+        assert!(set.get("a").await.is_none());
+        assert_eq!(fetches(), 1);
+        for (wait, expected) in [(5, 2), (5, 2), (5, 3), (10, 3), (10, 4)] {
+            tokio::time::advance(Duration::from_secs(wait)).await;
+            assert!(set.get("a").await.is_none());
+            settle().await;
+            assert_eq!(fetches(), expected, "after {wait} more seconds");
+        }
+        source.fail.store(false, Ordering::SeqCst);
+        tokio::time::advance(RETRY_WAIT.1).await;
+        assert!(set.get("a").await.is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_caller_that_gives_up_leaves_the_fetch_running() {
+        let source = Fixed::new(HashMap::from([("a".to_string(), key())]));
+        let set = KeySet::new(source.clone());
+        let impatient = tokio::time::timeout(Duration::from_millis(1), set.get("a")).await;
+        assert!(impatient.is_err());
+        settle().await;
+        assert!(set.get("a").await.is_some());
+        assert_eq!(source.fetches.load(Ordering::SeqCst), 1);
     }
 
     #[test]
