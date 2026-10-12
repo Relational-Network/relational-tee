@@ -276,6 +276,28 @@ pub(crate) mod tests {
             .any(|e| e.message == "field is required"));
     }
 
+    /// A quoted newline, CRLF endings, a quoted empty value and a blank
+    /// line: the count is of records, as the analysis reads them.
+    #[test]
+    fn rows_are_counted_as_records() {
+        let field = |name: &str, nullable| FieldSchema {
+            name: name.into(),
+            field_type: FieldType::Text,
+            nullable,
+        };
+        let schema = vec![field("name", false), field("note", true)];
+        let data = b"name,note\r\n\"Alex\r\nAlpha\",\"\"\r\n\r\nBo,\"a, b\"\r\n";
+        let result = validate_csv_bytes(data, &schema);
+        assert!(result.valid, "{:?}", result.errors);
+        assert_eq!(result.rows_validated, 2);
+        let records = csv::Reader::from_reader(&data[..]).records().count();
+        assert_eq!(records, 2);
+
+        let header_only = validate_csv_bytes(b"name,note\r\n", &schema);
+        assert!(header_only.valid);
+        assert_eq!(header_only.rows_validated, 0);
+    }
+
     #[test]
     fn older_field_types_still_load() {
         let stored = r#"[

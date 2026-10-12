@@ -36,17 +36,6 @@ pub(crate) fn decode_right_id(hex: &str) -> Result<[u8; 16], ApiError> {
     fixed_hex(hex).ok_or_else(|| ApiError::internal("invalid hex in 16-byte id"))
 }
 
-/// Count CSV rows (excluding header).
-fn count_csv_rows(csv_bytes: &[u8]) -> u64 {
-    let text = String::from_utf8_lossy(csv_bytes);
-    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
-    if lines.len() > 1 {
-        (lines.len() - 1) as u64 // subtract header
-    } else {
-        0
-    }
-}
-
 fn validation_failed(errors: usize) -> ApiError {
     ApiError::bad_request(format!("CSV validation failed: {errors} error(s)"))
         .with_code("validation_failed")
@@ -381,6 +370,28 @@ pub(crate) mod tests {
         let (status, _, err) = send(&app, upload(&path, &fresh, &admin, old)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(err["code"], "sealed_payload_invalid");
+    }
+
+    #[tokio::test]
+    async fn an_upload_records_its_csv_records_not_its_lines() {
+        let worker = worker();
+        let owner = worker.admin("oid-admin").await;
+        let pool_pda = worker.pool(&owner, None).await;
+        let path = format!("/v1/drt/pools/{pool_pda}/initialize");
+        let key = uuid::Uuid::new_v4().to_string();
+        let csv = b"name,score\r\n\"alice\r\nsmith\",1\r\n\r\nbob,\"2\"\r\n";
+        let sealed = worker.sealed(&owner, &path, &key, csv);
+        let (status, _, body) = send(&worker.app, upload(&path, &key, &owner.token, sealed)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["rows"], 2);
+        let doc = worker
+            .storage
+            .pools()
+            .get(&pool_pda.to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(doc.initial.map(|u| u.rows), Some(2));
     }
 
     #[tokio::test]
