@@ -163,6 +163,15 @@ pub fn cpu_for<T>(bytes: usize, work: impl FnOnce() -> T) -> T {
     }
 }
 
+/// How long to wait after `failures` failures in a row: none after none,
+/// then `wait.0`, doubling up to `wait.1`.
+pub fn backoff(failures: u32, wait: (Duration, Duration)) -> Duration {
+    match failures {
+        0 => Duration::ZERO,
+        n => wait.0.saturating_mul(1 << (n - 1).min(16)).min(wait.1),
+    }
+}
+
 /// How long a restarted background task waits first, at least and at most.
 const RESTART_WAIT: (Duration, Duration) = (Duration::from_secs(1), Duration::from_secs(60));
 

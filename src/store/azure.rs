@@ -23,8 +23,10 @@ use http_body_util::Full;
 use hyper::{Method, Request, StatusCode};
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use serde_json::Value;
-use tokio::sync::Mutex;
-use tracing::{debug, info};
+use std::sync::PoisonError;
+use tokio::sync::watch;
+use tokio::time::Instant;
+use tracing::{debug, info, warn};
 use zeroize::Zeroizing;
 
 use super::{
@@ -36,8 +38,12 @@ use crate::http_client::{HttpClient, Response};
 const API_VERSION: &str = "2021-12-02";
 const STORAGE_RESOURCE: &str = "https://storage.azure.com/";
 const IMDS_TOKEN_URL: &str = "http://169.254.169.254/metadata/identity/oauth2/token";
-/// Tokens are refreshed this long before they expire.
+/// Tokens are refreshed from this long before they expire, and not used
+/// once they're this close.
 const TOKEN_REFRESH_MARGIN_SECS: i64 = 300;
+const TOKEN_EXPIRY_MARGIN_SECS: i64 = 60;
+/// The wait after a failed token fetch, at first and at most.
+const TOKEN_RETRY_WAIT: (Duration, Duration) = (Duration::from_secs(1), Duration::from_secs(60));
 /// The most objects one List Blobs page returns.
 const LIST_PAGE_SIZE: &str = "5000";
 /// The most List Blobs pages one listing reads: 200,000 objects.
@@ -117,11 +123,41 @@ struct CachedToken {
     expires_on: i64,
 }
 
+impl CachedToken {
+    fn header(&self) -> String {
+        format!("Bearer {}", self.token.as_str())
+    }
+}
+
+#[derive(Default)]
+struct TokenState {
+    token: Option<CachedToken>,
+    refreshing: bool,
+    /// When the last fetch started, how many in a row have failed, and why
+    /// the last one did.
+    attempted_at: Option<Instant>,
+    failures: u32,
+    error: Option<String>,
+}
+
+/// Storage tokens from the managed identity endpoint. A token is used until
+/// [`TOKEN_EXPIRY_MARGIN_SECS`] before it expires, and replaced from
+/// [`TOKEN_REFRESH_MARGIN_SECS`] before, in the background while it still
+/// works. One fetch runs at a time, in a task of its own, and every request
+/// that needs a token waits for that fetch, failed or not; after a failure
+/// the next fetch waits 1 second, doubling to a minute.
+struct Tokens {
+    http: HttpClient,
+    /// The token endpoint, and the identity to ask for, if not the only one.
+    endpoint: String,
+    client_id: Option<String>,
+    state: Arc<std::sync::Mutex<TokenState>>,
+    /// How many fetches have finished.
+    finished: watch::Sender<u64>,
+}
+
 enum Credential {
-    ManagedIdentity {
-        client_id: Option<String>,
-        cached: Mutex<Option<CachedToken>>,
-    },
+    ManagedIdentity(Tokens),
     #[cfg(feature = "dev")]
     SharedKey {
         account: String,
@@ -177,10 +213,9 @@ impl AzureBlob {
     /// The container `container` of the account in `config`.
     pub fn new(config: &AzureConfig, container: &str) -> Result<Self, String> {
         let credential = match &config.credential {
-            CredentialConfig::ManagedIdentity { client_id } => Credential::ManagedIdentity {
-                client_id: client_id.clone(),
-                cached: Mutex::new(None),
-            },
+            CredentialConfig::ManagedIdentity { client_id } => {
+                Credential::ManagedIdentity(Tokens::new(IMDS_TOKEN_URL, client_id.clone()))
+            }
             #[cfg(feature = "dev")]
             CredentialConfig::AzuriteDevAccount => Credential::SharedKey {
                 account: AZURITE_ACCOUNT.to_string(),
@@ -261,9 +296,7 @@ impl Account {
         req.headers
             .push(("content-length", req.body.len().to_string()));
         let authorization = match &self.credential {
-            Credential::ManagedIdentity { client_id, cached } => {
-                self.bearer(client_id.as_deref(), cached).await?
-            }
+            Credential::ManagedIdentity(tokens) => tokens.bearer().await?,
             #[cfg(feature = "dev")]
             Credential::SharedKey { account, key } => shared_key(account, key, &req),
         };
@@ -292,73 +325,165 @@ impl Account {
             .await
             .map_err(|e| StoreError::Unavailable(e.to_string()))
     }
+}
 
-    /// A bearer token for Storage, cached until shortly before it expires.
-    async fn bearer(
-        &self,
-        client_id: Option<&str>,
-        cached: &Mutex<Option<CachedToken>>,
-    ) -> Result<String, StoreError> {
-        let mut cached = cached.lock().await;
-        let now = Utc::now().timestamp();
-        if let Some(token) = cached.as_ref() {
-            if token.expires_on - TOKEN_REFRESH_MARGIN_SECS > now {
-                return Ok(format!("Bearer {}", token.token.as_str()));
-            }
+impl Tokens {
+    fn new(endpoint: &str, client_id: Option<String>) -> Self {
+        Self {
+            http: HttpClient::new()
+                .with_timeout(Duration::from_secs(10))
+                .with_max_body(64 << 10),
+            endpoint: endpoint.to_string(),
+            client_id,
+            state: Arc::default(),
+            finished: watch::Sender::new(0),
         }
-        let fresh = self.managed_identity_token(client_id).await?;
-        let header = format!("Bearer {}", fresh.token.as_str());
-        *cached = Some(fresh);
-        Ok(header)
     }
 
-    async fn managed_identity_token(
-        &self,
-        client_id: Option<&str>,
-    ) -> Result<CachedToken, StoreError> {
+    fn url(&self) -> String {
         let mut url = format!(
-            "{IMDS_TOKEN_URL}?api-version=2018-02-01&resource={}",
+            "{}?api-version=2018-02-01&resource={}",
+            self.endpoint,
             utf8_percent_encode(STORAGE_RESOURCE, VALUE)
         );
-        if let Some(id) = client_id {
+        if let Some(id) = &self.client_id {
             url.push_str("&client_id=");
             url.extend(utf8_percent_encode(id, VALUE));
         }
-        let request = Request::builder()
-            .method(Method::GET)
-            .uri(&url)
-            .header("metadata", "true")
-            .body(Full::new(Bytes::new()))
-            .map_err(|e| StoreError::Invalid(format!("building token request: {e}")))?;
-        let response = self
-            .http
-            .send(request)
-            .await
-            .map_err(|e| StoreError::Unavailable(format!("managed identity endpoint: {e}")))?;
-        if !response.is_success() {
-            return Err(StoreError::Unavailable(format!(
-                "managed identity endpoint returned {}",
-                response.status()
-            )));
-        }
-        let body: Value = serde_json::from_slice(&response.into_body())
-            .map_err(|_| StoreError::Unavailable("managed identity token isn't JSON".into()))?;
-        let token = body["access_token"].as_str().ok_or_else(|| {
-            StoreError::Unavailable("managed identity response has no token".into())
-        })?;
-        // `expires_on` is epoch seconds, sent as a string.
-        let expires_on = body["expires_on"]
-            .as_str()
-            .and_then(|s| s.parse().ok())
-            .or_else(|| body["expires_on"].as_i64())
-            .ok_or_else(|| {
-                StoreError::Unavailable("managed identity token has no expiry".into())
-            })?;
-        Ok(CachedToken {
-            token: Zeroizing::new(token.to_string()),
-            expires_on,
-        })
+        url
     }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, TokenState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// A bearer token for Storage: the cached one while it works, or the
+    /// one the current fetch brings.
+    async fn bearer(&self) -> Result<String, StoreError> {
+        let mut finished = self.finished.subscribe();
+        let seen = *finished.borrow_and_update();
+        let now = Utc::now().timestamp();
+        let (usable, waiting) = {
+            let mut state = self.lock();
+            let usable = state
+                .token
+                .as_ref()
+                .filter(|t| t.expires_on - TOKEN_EXPIRY_MARGIN_SECS > now)
+                .map(CachedToken::header);
+            let due = state
+                .token
+                .as_ref()
+                .is_none_or(|t| t.expires_on - TOKEN_REFRESH_MARGIN_SECS <= now);
+            if due {
+                self.start_fetch(&mut state);
+            }
+            (usable, state.refreshing)
+        };
+        if let Some(header) = usable {
+            return Ok(header);
+        }
+        if waiting {
+            let _ = finished.wait_for(|n| *n > seen).await;
+        }
+        let now = Utc::now().timestamp();
+        let state = self.lock();
+        match state
+            .token
+            .as_ref()
+            .filter(|t| t.expires_on - TOKEN_EXPIRY_MARGIN_SECS > now)
+        {
+            Some(token) => Ok(token.header()),
+            None => Err(StoreError::Unavailable(
+                state
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "no storage token yet".into()),
+            )),
+        }
+    }
+
+    /// Start a fetch in a task of its own, unless one is running or the
+    /// last one's failure hasn't been waited out.
+    fn start_fetch(&self, state: &mut TokenState) {
+        let now = Instant::now();
+        let waited = state.attempted_at.is_none_or(|at| {
+            now.duration_since(at) >= crate::work::backoff(state.failures, TOKEN_RETRY_WAIT)
+        });
+        if state.refreshing || !waited {
+            return;
+        }
+        state.refreshing = true;
+        state.attempted_at = Some(now);
+        let (http, url, shared, finished) = (
+            self.http.clone(),
+            self.url(),
+            self.state.clone(),
+            self.finished.clone(),
+        );
+        tokio::spawn(async move {
+            let fetched = managed_identity_token(&http, &url).await;
+            {
+                let mut state = shared.lock().unwrap_or_else(PoisonError::into_inner);
+                state.refreshing = false;
+                match fetched {
+                    Ok(token) => {
+                        info!(expires_on = token.expires_on, "Fetched a storage token");
+                        // Keep whichever lasts longer.
+                        if state
+                            .token
+                            .as_ref()
+                            .is_none_or(|held| token.expires_on >= held.expires_on)
+                        {
+                            state.token = Some(token);
+                        }
+                        state.failures = 0;
+                        state.error = None;
+                    }
+                    Err(e) => {
+                        state.failures = state.failures.saturating_add(1);
+                        warn!(error = %e, failures = state.failures,
+                            "Fetching a storage token failed");
+                        state.error = Some(e.to_string());
+                    }
+                }
+            }
+            finished.send_modify(|n| *n += 1);
+        });
+    }
+}
+
+async fn managed_identity_token(http: &HttpClient, url: &str) -> Result<CachedToken, StoreError> {
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri(url)
+        .header("metadata", "true")
+        .body(Full::new(Bytes::new()))
+        .map_err(|e| StoreError::Invalid(format!("building token request: {e}")))?;
+    let response = http
+        .send(request)
+        .await
+        .map_err(|e| StoreError::Unavailable(format!("managed identity endpoint: {e}")))?;
+    if !response.is_success() {
+        return Err(StoreError::Unavailable(format!(
+            "managed identity endpoint returned {}",
+            response.status()
+        )));
+    }
+    let body: Value = serde_json::from_slice(&response.into_body())
+        .map_err(|_| StoreError::Unavailable("managed identity token isn't JSON".into()))?;
+    let token = body["access_token"]
+        .as_str()
+        .ok_or_else(|| StoreError::Unavailable("managed identity response has no token".into()))?;
+    // `expires_on` is epoch seconds, sent as a string.
+    let expires_on = body["expires_on"]
+        .as_str()
+        .and_then(|s| s.parse().ok())
+        .or_else(|| body["expires_on"].as_i64())
+        .ok_or_else(|| StoreError::Unavailable("managed identity token has no expiry".into()))?;
+    Ok(CachedToken {
+        token: Zeroizing::new(token.to_string()),
+        expires_on,
+    })
 }
 
 /// RFC 1123 date for `x-ms-date`.
@@ -613,7 +738,104 @@ impl ObjectStore for AzureBlob {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering::SeqCst};
+
     use super::*;
+
+    /// A managed identity endpoint that counts its token requests, takes
+    /// 50 ms over each, and fails while `fail` is set.
+    #[derive(Default)]
+    struct Imds {
+        requests: AtomicUsize,
+        fail: AtomicBool,
+        /// Seconds each token lasts.
+        lifetime: AtomicI64,
+    }
+
+    fn serve(imds: Arc<Imds>) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}/token", listener.local_addr().unwrap());
+        let app = axum::Router::new().route(
+            "/token",
+            axum::routing::get(move || {
+                let imds = imds.clone();
+                async move {
+                    let n = imds.requests.fetch_add(1, SeqCst) + 1;
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    if imds.fail.load(SeqCst) {
+                        return (StatusCode::INTERNAL_SERVER_ERROR, String::new());
+                    }
+                    let expires_on = Utc::now().timestamp() + imds.lifetime.load(SeqCst);
+                    let body = serde_json::json!({
+                        "access_token": format!("t{n}"),
+                        "expires_on": expires_on.to_string(),
+                    });
+                    (StatusCode::OK, body.to_string())
+                }
+            }),
+        );
+        tokio::spawn(
+            axum_server::from_tcp(listener)
+                .unwrap()
+                .serve(app.into_make_service()),
+        );
+        url
+    }
+
+    #[tokio::test]
+    async fn one_token_fetch_serves_every_caller_and_failures_back_off() {
+        let imds = Arc::new(Imds::default());
+        imds.lifetime.store(3600, SeqCst);
+        imds.fail.store(true, SeqCst);
+        let tokens = Arc::new(Tokens::new(&serve(imds.clone()), None));
+        let requests = || imds.requests.load(SeqCst);
+        let callers = futures_util::future::join_all((0..100).map(|_| {
+            let tokens = tokens.clone();
+            async move { tokens.bearer().await }
+        }))
+        .await;
+        assert!(callers.iter().all(Result::is_err));
+        assert_eq!(requests(), 1, "one fetch answered all hundred");
+
+        // Its failure holds for a second.
+        let refused = tokens.bearer().await.unwrap_err();
+        assert!(refused.to_string().contains("500"), "{refused}");
+        assert_eq!(requests(), 1);
+        imds.fail.store(false, SeqCst);
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert_eq!(tokens.bearer().await.unwrap(), "Bearer t2");
+        for _ in 0..10 {
+            assert_eq!(tokens.bearer().await.unwrap(), "Bearer t2");
+        }
+        assert_eq!(requests(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_token_near_expiry_works_while_it_is_replaced() {
+        let imds = Arc::new(Imds::default());
+        // Inside the refresh margin, outside the expiry margin.
+        imds.lifetime.store(200, SeqCst);
+        let tokens = Tokens::new(&serve(imds.clone()), None);
+        assert_eq!(tokens.bearer().await.unwrap(), "Bearer t1");
+        imds.fail.store(true, SeqCst);
+        // Used at once, while a replacement is fetched; still used after
+        // that fails.
+        assert_eq!(tokens.bearer().await.unwrap(), "Bearer t1");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(imds.requests.load(SeqCst), 2);
+        assert_eq!(tokens.bearer().await.unwrap(), "Bearer t1");
+
+        // Once the failure is waited out, the next call fetches again, and
+        // the token that brings replaces the old one.
+        imds.fail.store(false, SeqCst);
+        imds.lifetime.store(3600, SeqCst);
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert_eq!(tokens.bearer().await.unwrap(), "Bearer t1");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(tokens.bearer().await.unwrap(), "Bearer t3");
+        assert_eq!(imds.requests.load(SeqCst), 3);
+    }
 
     #[test]
     fn endpoints_split_azurite_prefixes() {

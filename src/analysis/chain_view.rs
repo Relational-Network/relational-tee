@@ -10,9 +10,15 @@
 //!
 //! - a reading younger than `refresh` is used as it is;
 //! - an older one, within `grace`, is used while the pool is read again in
-//!   the background, one refresh at a time per pool;
+//!   the background;
 //! - a grant with no reading, not even a stored one, or one past `grace`,
 //!   is read before answering, and if the RPC fails the request fails.
+//!
+//! A pool is read once at a time, in a task of its own, and every request
+//! that needs the reading waits for that one read, failed or not. After a
+//! failure the next read waits 2 seconds, doubling to a minute, and
+//! requests that need one meanwhile fail at once. Pools no analyst has
+//! used for a day are forgotten, and read from storage again if they are.
 //!
 //! Only the pool's owner can close a Grant PDA, the owner's key never
 //! leaves the worker, and the worker records every revocation in the pool
@@ -29,6 +35,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use solana_pubkey::Pubkey;
+use tokio::sync::watch;
 use tracing::warn;
 
 use crate::api::credentials::decode_right_id;
@@ -60,11 +67,30 @@ impl Default for Timing {
     }
 }
 
-/// After a failed background read, how long a pool waits before another.
-const BACKOFF: Duration = Duration::from_secs(60);
+/// After a failed read, how long a pool waits before another, at first and
+/// at most.
+const RETRY_WAIT: (Duration, Duration) = (Duration::from_secs(2), Duration::from_secs(60));
 
 /// Seconds a client waits after the RPC's rate limit.
 const RATE_LIMITED_RETRY_SECS: u64 = 5;
+
+/// How long a pool no analyst uses stays in memory.
+const FORGET_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Why a pool's last read failed, as its waiters report it.
+#[derive(Clone)]
+struct Failure {
+    message: String,
+    retry_after: Option<u64>,
+}
+
+impl Failure {
+    fn error(&self) -> ApiError {
+        let mut error = ApiError::rpc_unavailable(self.message.clone());
+        error.retry_after = self.retry_after;
+        error
+    }
+}
 
 #[derive(Default)]
 struct PoolState {
@@ -72,7 +98,11 @@ struct PoolState {
     /// Whether the stored views have been read into `views`.
     loaded: bool,
     refreshing: bool,
-    failed_at: Option<DateTime<Utc>>,
+    /// How many reads have finished, how many in a row have failed, and
+    /// when and why the last one did.
+    reads: u64,
+    failures: u32,
+    failed: Option<(DateTime<Utc>, Failure)>,
     /// When an analyst last used the pool.
     used_at: Option<DateTime<Utc>>,
 }
@@ -81,6 +111,8 @@ struct PoolState {
 pub struct GrantChecks {
     timing: Timing,
     pools: Mutex<HashMap<String, PoolState>>,
+    /// Signals that a read finished.
+    finished: watch::Sender<u64>,
 }
 
 impl Default for GrantChecks {
@@ -142,6 +174,7 @@ impl GrantChecks {
         Self {
             timing,
             pools: Mutex::default(),
+            finished: watch::Sender::new(0),
         }
     }
 
@@ -193,23 +226,115 @@ impl GrantChecks {
         if let Some(pool) = self.lock().get_mut(&doc.pool_pda) {
             pool.used_at = Some(now);
         }
+        let usable = |seen: &Seen| age(Utc::now(), seen.at) < self.timing.grace;
         let seen = match self.reading(&doc.pool_pda, &want.pda, grant) {
             Some(seen) if age(now, seen.at) < self.timing.refresh => seen,
-            Some(seen) if age(now, seen.at) < self.timing.grace => {
-                self.refresh_in_background(storage, solana, doc);
+            Some(seen) if usable(&seen) => {
+                // In the background: a failure leaves the reading standing.
+                let _ = self.read(storage, solana, doc);
                 seen
             }
             _ => {
-                let read = self.refresh(storage, solana, doc).await?;
-                *read
-                    .get(&want.pda.to_string())
-                    .ok_or_else(|| ApiError::internal("the grant wasn't read"))?
+                // A read another request started may not cover this grant,
+                // if its pool document was older: then read again.
+                let mut found = None;
+                for _ in 0..2 {
+                    self.read_and_wait(storage, solana, doc).await?;
+                    found = self.reading(&doc.pool_pda, &want.pda, grant).filter(usable);
+                    if found.is_some() {
+                        break;
+                    }
+                }
+                found.ok_or_else(|| ApiError::internal("the grant wasn't read"))?
             }
         };
         if seen.live {
             Ok(seen)
         } else {
             Err(not_live())
+        }
+    }
+
+    /// Start reading `doc`'s pool, unless a read is running or the last one's
+    /// failure hasn't been waited out. Returns the reads finished before
+    /// this, or the failure that holds.
+    fn read(
+        self: &Arc<Self>,
+        storage: &Arc<Storage>,
+        solana: &Arc<SolanaClient>,
+        doc: &PoolDoc,
+    ) -> Result<u64, Failure> {
+        let now = Utc::now();
+        let mut pools = self.lock();
+        let forget = TimeDelta::from_std(FORGET_AFTER).unwrap_or(TimeDelta::MAX);
+        pools.retain(|pda, p| {
+            pda == &doc.pool_pda || p.refreshing || p.used_at.is_some_and(|at| now - at < forget)
+        });
+        let pool = pools.entry(doc.pool_pda.clone()).or_default();
+        if pool.refreshing {
+            return Ok(pool.reads);
+        }
+        if let Some((at, failure)) = &pool.failed {
+            if age(now, *at) < crate::work::backoff(pool.failures, RETRY_WAIT) {
+                return Err(failure.clone());
+            }
+        }
+        pool.refreshing = true;
+        let reads = pool.reads;
+        let (checks, storage, solana, doc) =
+            (self.clone(), storage.clone(), solana.clone(), doc.clone());
+        tokio::spawn(async move {
+            let result = checks.refresh(&storage, &solana, &doc).await;
+            {
+                let mut pools = checks.lock();
+                let pool = pools.entry(doc.pool_pda.clone()).or_default();
+                pool.refreshing = false;
+                pool.reads += 1;
+                match result {
+                    Ok(_) => {
+                        pool.failures = 0;
+                        pool.failed = None;
+                    }
+                    Err(e) => {
+                        pool.failures = pool.failures.saturating_add(1);
+                        warn!(pool = %doc.pool_pda, error = %e, failures = pool.failures,
+                            "Reading grants on-chain failed; the last reading stands");
+                        let failure = Failure {
+                            message: e.message,
+                            retry_after: e.retry_after,
+                        };
+                        pool.failed = Some((Utc::now(), failure));
+                    }
+                }
+            }
+            checks.finished.send_modify(|n| *n += 1);
+        });
+        Ok(reads)
+    }
+
+    /// [`Self::read`], then wait for the read to finish, and return its
+    /// failure if it failed.
+    async fn read_and_wait(
+        self: &Arc<Self>,
+        storage: &Arc<Storage>,
+        solana: &Arc<SolanaClient>,
+        doc: &PoolDoc,
+    ) -> Result<(), ApiError> {
+        let mut finished = self.finished.subscribe();
+        let before = self.read(storage, solana, doc).map_err(|f| f.error())?;
+        loop {
+            {
+                let pools = self.lock();
+                if let Some(pool) = pools.get(&doc.pool_pda).filter(|p| p.reads > before) {
+                    return match (&pool.failed, pool.failures) {
+                        (Some((_, failure)), 1..) => Err(failure.error()),
+                        _ => Ok(()),
+                    };
+                }
+            }
+            if finished.changed().await.is_err() {
+                return Err(ApiError::internal("the grant readings are gone"));
+            }
         }
     }
 
@@ -242,7 +367,6 @@ impl GrantChecks {
             let mut pools = self.lock();
             let pool = pools.entry(doc.pool_pda.clone()).or_default();
             merge(&mut pool.views, &read);
-            pool.failed_at = None;
         }
         if let Err(e) = storage.chain_views().merge(&doc.pool_pda, &read).await {
             warn!(pool = %doc.pool_pda, error = %e, "Couldn't store grant readings");
@@ -250,47 +374,13 @@ impl GrantChecks {
         Ok(read)
     }
 
-    /// [`Self::refresh`] in the background, unless one is running for the
-    /// pool or the last one failed within [`BACKOFF`].
-    fn refresh_in_background(
-        self: &Arc<Self>,
-        storage: &Arc<Storage>,
-        solana: &Arc<SolanaClient>,
-        doc: &PoolDoc,
-    ) {
-        {
-            let mut pools = self.lock();
-            let pool = pools.entry(doc.pool_pda.clone()).or_default();
-            let backing_off = pool
-                .failed_at
-                .is_some_and(|at| age(Utc::now(), at) < BACKOFF);
-            if pool.refreshing || backing_off {
-                return;
-            }
-            pool.refreshing = true;
-        }
-        let (checks, storage, solana, doc) =
-            (self.clone(), storage.clone(), solana.clone(), doc.clone());
-        tokio::spawn(async move {
-            let result = checks.refresh(&storage, &solana, &doc).await;
-            let mut pools = checks.lock();
-            let pool = pools.entry(doc.pool_pda.clone()).or_default();
-            pool.refreshing = false;
-            if let Err(e) = result {
-                pool.failed_at = Some(Utc::now());
-                warn!(pool = %doc.pool_pda, error = %e,
-                    "Reading grants on-chain failed; the last reading stands");
-            }
-        });
-    }
-
     /// What the chain showed of each of `doc`'s grants, by grant ID, for
     /// people to read: readings older than `refresh` are read again, and
     /// if that fails the older ones, or none, are returned.
     pub async fn statuses(
-        &self,
-        storage: &Storage,
-        solana: &SolanaClient,
+        self: &Arc<Self>,
+        storage: &Arc<Storage>,
+        solana: &Arc<SolanaClient>,
         doc: &PoolDoc,
     ) -> BTreeMap<String, (Pubkey, Option<Seen>)> {
         self.load(storage, &doc.pool_pda).await;
@@ -302,7 +392,7 @@ impl GrantChecks {
             })
         });
         if stale {
-            if let Err(e) = self.refresh(storage, solana, doc).await {
+            if let Err(e) = self.read_and_wait(storage, solana, doc).await {
                 warn!(pool = %doc.pool_pda, error = %e, "Reading grants on-chain failed");
             }
         }
@@ -521,6 +611,44 @@ mod tests {
         s.doc.grants = vec![s.grant.clone()];
         assert!(s.verify().await.unwrap().live);
         assert_eq!(s.chain.called(READ), 1);
+    }
+
+    #[tokio::test]
+    async fn a_burst_of_cold_requests_shares_one_read_and_its_failure() {
+        let s = setup(Timing::default());
+        *s.chain.refuse_reads.lock().unwrap() = Some(503);
+        let burst = futures_util::future::join_all((0..50).map(|_| s.verify())).await;
+        assert!(burst
+            .iter()
+            .all(|r| r.as_ref().is_err_and(|e| e.code == "rpc_unavailable")));
+        assert_eq!(s.chain.called(READ), 1, "one read answered all fifty");
+
+        // Its failure holds for two seconds, then the next request reads.
+        assert_eq!(s.verify().await.unwrap_err().code, "rpc_unavailable");
+        assert_eq!(s.chain.called(READ), 1);
+        *s.chain.refuse_reads.lock().unwrap() = None;
+        tokio::time::sleep(Duration::from_millis(2100)).await;
+        let burst = futures_util::future::join_all((0..50).map(|_| s.verify())).await;
+        assert!(burst.iter().all(|r| r.as_ref().is_ok_and(|seen| seen.live)));
+        assert_eq!(s.chain.called(READ), 2);
+    }
+
+    #[tokio::test]
+    async fn a_request_that_gives_up_leaves_the_read_running() {
+        let s = setup(Timing::default());
+        let impatient = tokio::time::timeout(Duration::from_micros(1), s.verify()).await;
+        assert!(impatient.is_err());
+        for _ in 0..100 {
+            if s.checks
+                .reading(&s.doc.pool_pda, &s.pda, &s.grant)
+                .is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(s.verify().await.unwrap().live);
+        assert_eq!(s.chain.called(READ), 1, "the abandoned read finished");
     }
 
     #[tokio::test]
