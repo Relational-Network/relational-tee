@@ -16,6 +16,7 @@ use sha2::{Digest, Sha256};
 use solana_pubkey::Pubkey;
 use std::str::FromStr;
 
+use crate::blockchain::drt::types::fixed_hex;
 use crate::error::ApiError;
 
 // ============================================================================
@@ -26,17 +27,13 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
-/// Decode a 32-char hex string into 16 raw bytes. Used for right_id and pool_uuid.
+/// Decode a stored 32-char hex string into 16 raw bytes. Used for right_id
+/// and pool_uuid.
 pub(crate) fn decode_right_id(hex: &str) -> Result<[u8; 16], ApiError> {
     if hex.len() != 32 {
         return Err(ApiError::internal("expected 32-char hex (16 bytes)"));
     }
-    let mut out = [0u8; 16];
-    for i in 0..16 {
-        out[i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
-            .map_err(|_| ApiError::internal("invalid hex in 16-byte id"))?;
-    }
-    Ok(out)
+    fixed_hex(hex).ok_or_else(|| ApiError::internal("invalid hex in 16-byte id"))
 }
 
 /// Count CSV rows (excluding header).
@@ -564,6 +561,45 @@ pub(crate) mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{err}");
+    }
+
+    #[test]
+    fn a_stored_id_that_isnt_32_hex_characters_is_an_error() {
+        assert_eq!(
+            decode_right_id(&"0aF1".repeat(8)).unwrap()[..2],
+            [0x0a, 0xf1]
+        );
+        for bad in [
+            format!("€{}", "0".repeat(29)),
+            "0".repeat(31),
+            format!("{}z", "0".repeat(31)),
+        ] {
+            let err = decode_right_id(&bad).unwrap_err();
+            assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR, "{bad:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_malformed_definition_hash_is_refused() {
+        use crate::analysis::fetch::tests::AWARDS_REPORT_URL;
+
+        let worker = worker();
+        let admin = worker.admin("oid-admin").await;
+        for hash in [
+            format!("€{}", "0".repeat(61)),
+            "0".repeat(63),
+            format!("0x{}", "g".repeat(64)),
+            "0x".to_string(),
+        ] {
+            let analysis =
+                json!({ "code_repo_url": AWARDS_REPORT_URL, "code_hash_hex": hash, "supply": 2 });
+            let (status, _, err) = send(&worker.app, create_pool(&admin, analysis)).await;
+            assert_eq!(
+                (status, err["code"].as_str()),
+                (StatusCode::BAD_REQUEST, Some("bad_request")),
+                "{hash:?}: {err}"
+            );
+        }
     }
 
     /// `admin`'s request to create a pool with `analysis`.

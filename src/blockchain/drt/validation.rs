@@ -61,7 +61,8 @@ pub fn validate_drt_name(name: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
-/// Parse a 64-char hex string into `[u8; 32]`. Empty → all zeros.
+/// Parse 64 hex characters, optionally after one `0x`, into `[u8; 32]`.
+/// Empty → all zeros.
 pub fn parse_code_hash(hex: &str) -> Result<[u8; 32], ApiError> {
     if hex.is_empty() {
         return Ok([0u8; 32]);
@@ -72,12 +73,7 @@ pub fn parse_code_hash(hex: &str) -> Result<[u8; 32], ApiError> {
             "code_hash must be exactly 64 hex characters",
         ));
     }
-    let mut out = [0u8; 32];
-    for i in 0..32 {
-        out[i] = u8::from_str_radix(&clean[i * 2..i * 2 + 2], 16)
-            .map_err(|_| ApiError::bad_request("code_hash contains invalid hex"))?;
-    }
-    Ok(out)
+    fixed_hex(clean).ok_or_else(|| ApiError::bad_request("code_hash contains invalid hex"))
 }
 
 /// Validate + resolve a list of DRT requests.
@@ -168,4 +164,30 @@ pub fn validate_drt_requests(drts: &[DrtRequest]) -> Result<Vec<ResolvedDrt>, Ap
     }
 
     Ok(resolved)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::StatusCode;
+
+    #[test]
+    fn code_hashes_are_64_hex_characters_after_an_optional_0x() {
+        let hash = "Ab".repeat(32);
+        assert_eq!(parse_code_hash(&hash).unwrap(), [0xab; 32]);
+        assert_eq!(parse_code_hash(&format!("0x{hash}")).unwrap(), [0xab; 32]);
+        assert_eq!(parse_code_hash("").unwrap(), [0; 32]);
+        for (bad, message) in [
+            ("0x".to_string(), "exactly 64"),
+            ("0".repeat(63), "exactly 64"),
+            (format!("0x0x{}", "0".repeat(62)), "invalid hex"),
+            (format!("0X{}", "0".repeat(64)), "exactly 64"),
+            (format!("€{}", "0".repeat(61)), "invalid hex"),
+            (format!("{}g", "0".repeat(63)), "invalid hex"),
+        ] {
+            let err = parse_code_hash(&bad).unwrap_err();
+            assert_eq!(err.status, StatusCode::BAD_REQUEST, "{bad:?}");
+            assert!(err.message.contains(message), "{bad:?}: {}", err.message);
+        }
+    }
 }
