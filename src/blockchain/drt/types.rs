@@ -50,6 +50,14 @@ pub const MAX_CODE_REPO_URL_LEN: usize = 200;
 pub const MAX_DRTS_PER_POOL: usize = 8;
 pub const MAX_SUPPLY: u64 = 1_000_000_000;
 
+/// `text` as exactly `N` bytes written in hex, in either case, or `None`
+/// for any other length or character.
+pub fn fixed_hex<const N: usize>(text: &str) -> Option<[u8; N]> {
+    let mut out = [0u8; N];
+    hex::decode_to_slice(text, &mut out).ok()?;
+    Some(out)
+}
+
 // ============================================================================
 // On-chain Borsh account types
 // ============================================================================
@@ -147,4 +155,88 @@ pub struct CreatePoolResponse {
     pub right_ids: BTreeMap<String, String>,
     /// Solana Explorer URL for the final signature.
     pub explorer_url: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fixed_hex_takes_exactly_n_bytes_of_ascii_hex() {
+        assert_eq!(fixed_hex::<2>("0aFf"), Some([0x0a, 0xff]));
+        for bad in [
+            "", "0", "0aF", "0aFf0", "0g00", " 0aF", "0x0a", "+0aF", "€0", "0a€",
+        ] {
+            assert_eq!(fixed_hex::<2>(bad), None, "{bad:?}");
+        }
+        // The right number of bytes, but not ASCII: `€` is three.
+        assert_eq!(fixed_hex::<32>(&format!("€{}", "0".repeat(61))), None);
+        assert_eq!(fixed_hex::<16>(&format!("€{}", "0".repeat(29))), None);
+    }
+
+    /// Random text at both widths the worker reads, from hex digits, other
+    /// ASCII and multi-byte characters: never a panic, a value exactly for
+    /// 2N hex digits, and that value written back is the text.
+    #[test]
+    fn fixed_hex_never_panics_and_round_trips() {
+        const CHARS: [&str; 14] = [
+            "0",
+            "7",
+            "9",
+            "a",
+            "F",
+            "f",
+            "g",
+            "x",
+            " ",
+            "-",
+            "€",
+            "é",
+            "\u{1F600}",
+            "\0",
+        ];
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            usize::try_from(state % 1_000_003).unwrap()
+        };
+        fn check<const N: usize>(text: &str) {
+            let valid = text.len() == 2 * N && text.bytes().all(|b| b.is_ascii_hexdigit());
+            match fixed_hex::<N>(text) {
+                Some(bytes) => {
+                    assert!(valid, "{text:?}");
+                    assert_eq!(hex::encode(bytes), text.to_ascii_lowercase());
+                }
+                None => assert!(!valid, "{text:?}"),
+            }
+        }
+        for round in 0..30_000 {
+            let width = if round % 2 == 0 { 32 } else { 64 };
+            let text: String = match round % 3 {
+                // Any length, any characters.
+                0 => (0..next() % 80)
+                    .map(|_| CHARS[next() % CHARS.len()])
+                    .collect(),
+                // Exactly the right number of hex digits.
+                1 => (0..width).map(|_| CHARS[next() % 6]).collect(),
+                // The right number of hex digits with one replaced.
+                _ => {
+                    let at = next() % width;
+                    (0..width)
+                        .map(|i| {
+                            CHARS[if i == at {
+                                next() % CHARS.len()
+                            } else {
+                                next() % 6
+                            }]
+                        })
+                        .collect()
+                }
+            };
+            check::<16>(&text);
+            check::<32>(&text);
+        }
+    }
 }
