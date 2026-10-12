@@ -1406,8 +1406,8 @@ pub(crate) mod tests {
         grant(&worker, &pool_pda, &broken_id, &[("region", "Region E")]).await;
         let query = format!("/v1/drt/pools/{pool_pda}/analyses/{ANALYSIS}/query");
         let set_scope = |analyst: &str, revision: usize, scope: Value| {
-            let body = json!({ "analyst_user_id": analyst, "analysis_id": ANALYSIS,
-                "revision": revision, "scope": scope });
+            let body = json!({ "grant_id": format!("g-{analyst}"), "analyst_user_id": analyst,
+                "analysis_id": ANALYSIS, "revision": revision, "scope": scope });
             Request::post(format!("/v1/drt/pools/{pool_pda}/grant-scope"))
                 .header(header::AUTHORIZATION, format!("Bearer {}", owner.token))
                 .header(
