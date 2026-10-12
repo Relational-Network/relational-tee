@@ -2,19 +2,30 @@
 // Copyright (C) 2026 Relational Network
 
 //! The analysis log: one sealed, create-only record per analysis request,
-//! `audit/analyses/{pool_pda}/{date}/{request_id}.json`. The operator events
+//! `audit/analyses/{pool_pda}/{date}/{event_id}.json`. The operator events
 //! leave the TEE through the host's logs, so they carry no filter values;
 //! this record holds what was asked, of which rows, and what went back.
+//!
+//! The worker names each record with an event ID of its own: a caller
+//! chooses its request ID, so a name taken from that could be reused to
+//! keep a later request out of the log.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{id, Storage, StoreError};
+use crate::store::Created;
 
 /// One analysis request.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct AnalysisRecord {
+    /// The worker's ID for this record, new for every request. Records
+    /// from before it existed have none.
+    #[serde(default)]
+    pub event_id: String,
+    /// The request's correlation ID: the caller's `X-Request-Id` if it sent
+    /// a UUID, otherwise one the worker chose. Requests may share it.
     pub request_id: String,
     pub at: DateTime<Utc>,
     /// The caller's `user_id`.
@@ -61,18 +72,27 @@ impl<'a> AnalysisLog<'a> {
         Self { s }
     }
 
-    /// Store `record`, once.
+    /// Store `record` under its event ID. Storing it again is harmless, but
+    /// another record under that ID is an error, never a success.
     pub async fn record(&self, record: &AnalysisRecord) -> Result<(), StoreError> {
-        let (Some(pool), Some(request)) = (id(&record.pool_pda), id(&record.request_id)) else {
+        let (Some(pool), Some(event)) = (id(&record.pool_pda), id(&record.event_id)) else {
             return Err(StoreError::Invalid(
-                "an analysis record needs a pool and request ID that can name it".into(),
+                "an analysis record needs a pool and event ID that can name it".into(),
             ));
         };
         let date = record.at.format("%Y-%m-%d").to_string();
-        let path = format!("{}{request}.json", dir(pool, &date));
+        let path = format!("{}{event}.json", dir(pool, &date));
         let plain = serde_json::to_vec(record)
             .map_err(|e| StoreError::Invalid(format!("serializing an analysis record: {e}")))?;
-        self.s.state().create_uncached(&path, &plain).await?;
+        let state = self.s.state();
+        if let Created::AlreadyExists = state.create_uncached(&path, &plain).await? {
+            let stored = state.read_uncached(&path).await?;
+            if stored.as_deref().map(Vec::as_slice) != Some(plain.as_slice()) {
+                return Err(StoreError::Integrity(format!(
+                    "{path} already holds another analysis record"
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -87,7 +107,7 @@ impl<'a> AnalysisLog<'a> {
             .state()
             .list_json(&dir(pool, date), |p| p.ends_with(".json"))
             .await?;
-        records.sort_by(|a, b| (a.at, &a.request_id).cmp(&(b.at, &b.request_id)));
+        records.sort_by(|a, b| (a.at, &a.event_id).cmp(&(b.at, &b.event_id)));
         Ok(records)
     }
 }
@@ -98,9 +118,10 @@ mod tests {
     use crate::storage::tests::files_storage;
 
     #[tokio::test]
-    async fn each_request_is_recorded_once_under_its_pool_and_day() {
+    async fn each_event_is_recorded_once_under_its_pool_and_day() {
         let storage = files_storage();
         let record = AnalysisRecord {
+            event_id: "9b2c1f4e-0d3a-4c5b-8e6f-7a8b9c0d1e2f".into(),
             request_id: "0f8fad5b-d9cb-469f-a165-70867728950e".into(),
             at: "2026-10-05T09:30:00Z".parse().unwrap(),
             user_id: "u-1".into(),
@@ -118,15 +139,30 @@ mod tests {
         };
         let log = storage.analysis_log();
         log.record(&record).await.unwrap();
-        let mut again = record.clone();
-        again.returned = Some(99);
-        log.record(&again).await.unwrap();
+        // The same record again, as a retried write would store it.
+        log.record(&record).await.unwrap();
+        // Another record under the same event ID is refused, never
+        // counted as stored.
+        let mut altered = record.clone();
+        altered.returned = Some(99);
+        assert!(matches!(
+            log.record(&altered).await,
+            Err(StoreError::Integrity(_))
+        ));
+        // Another event with the same request ID is a record of its own.
+        let mut second = record.clone();
+        second.event_id = "1f2e3d4c-5b6a-4978-8695-a4b3c2d1e0f9".into();
+        second.returned = Some(1);
+        log.record(&second).await.unwrap();
         let stored = log.on("P1", "2026-10-05").await.unwrap();
-        assert_eq!(stored, std::slice::from_ref(&record));
+        assert_eq!(stored, [second.clone(), record.clone()]);
         assert!(log.on("P1", "2026-10-06").await.unwrap().is_empty());
 
-        let mut stray = record;
+        let mut stray = record.clone();
         stray.pool_pda = "../wallets".into();
         assert!(log.record(&stray).await.is_err());
+        let mut unnamed = record;
+        unnamed.event_id = String::new();
+        assert!(log.record(&unnamed).await.is_err());
     }
 }

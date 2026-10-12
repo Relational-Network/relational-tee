@@ -13,7 +13,7 @@
 //! - `scripts/{sha256}`: analysis definitions, by hash ([`scripts`]).
 //! - `config/employer-scopes.json`: the rows each Entra group may see
 //!   ([`scopes`]).
-//! - `audit/analyses/{pool_pda}/{date}/{request_id}.json`: one record per
+//! - `audit/analyses/{pool_pda}/{date}/{event_id}.json`: one record per
 //!   analysis request ([`analysis_log`]).
 //! - `staged/{op_id}.json`: in-flight chain sagas ([`staged`]), and
 //!   `idempotency/…`, the idempotency records ([`crate::idempotency`]).

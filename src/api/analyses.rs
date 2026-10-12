@@ -279,6 +279,7 @@ impl Logged {
     ) -> Self {
         Self {
             record: AnalysisRecord {
+                event_id: uuid::Uuid::new_v4().to_string(),
                 request_id: crate::request_id::current().unwrap_or_default(),
                 at: Utc::now(),
                 user_id: caller.user_id.clone(),
@@ -1277,6 +1278,59 @@ pub(crate) mod tests {
             .find(|r| r.request.get("scope").is_some())
             .expect("the scope override is recorded as sent");
         assert_eq!(override_attempt.outcome, "invalid_query");
+    }
+
+    #[tokio::test]
+    async fn every_query_is_logged_under_an_id_of_the_workers() {
+        let worker = worker();
+        let owner = worker.admin("oid-owner").await;
+        let pool_pda = awards_pool(&worker, &owner).await;
+        let query = format!("/v1/drt/pools/{pool_pda}/analyses/{ANALYSIS}/query");
+        const CHOSEN: &str = "0f8fad5b-d9cb-469f-a165-70867728950e";
+
+        // Two queries under one request ID that the caller chose.
+        for offset in [0, 1] {
+            let page = json!({ "pagination": { "limit": 1, "offset": offset } });
+            let mut request = post(&query, &owner.token, &page);
+            request.headers_mut().insert(
+                crate::request_id::REQUEST_ID_HEADER,
+                CHOSEN.parse().unwrap(),
+            );
+            let (status, _, body) = send(&worker.app, request).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["offset"], offset);
+        }
+        let today = Utc::now().format("%Y-%m-%d").to_string();
+        let log = worker
+            .storage
+            .analysis_log()
+            .on(&pool_pda.to_string(), &today)
+            .await
+            .unwrap();
+        assert_eq!(log.len(), 2, "{log:?}");
+        assert!(log.iter().all(|r| r.request_id == CHOSEN));
+        assert_ne!(log[0].event_id, log[1].event_id);
+        let offsets: BTreeSet<String> = log
+            .iter()
+            .map(|r| r.request["pagination"]["offset"].to_string())
+            .collect();
+        assert_eq!(offsets, BTreeSet::from(["0".into(), "1".into()]));
+
+        // A record that can't be stored withholds the result: in another
+        // pool, an object stands where its log directory would go.
+        let blocked = awards_pool(&worker, &owner).await;
+        let in_the_way = worker
+            .storage
+            .state()
+            .create_uncached(&format!("audit/analyses/{blocked}"), b"in the way")
+            .await
+            .unwrap();
+        assert!(matches!(in_the_way, crate::store::Created::New(_)));
+        let query = format!("/v1/drt/pools/{blocked}/analyses/{ANALYSIS}/query");
+        let (status, _, body) = send(&worker.app, post(&query, &owner.token, &json!({}))).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["code"], "analysis_log_unavailable");
+        assert!(body.get("rows").is_none());
     }
 
     #[tokio::test]
