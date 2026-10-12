@@ -1,7 +1,18 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Relational Network
 
-//! Transfers, fee estimates and confirmation.
+//! Transfers, their receipts, fee estimates and confirmation.
+//!
+//! A transfer also creates a receipt: an account with no data, owned by the
+//! System program, at an address derived from the wallet and a seed that
+//! names the request. Creating an account fails where one exists, so a
+//! second copy of the transfer can never succeed, and a retry learns
+//! whether the transfer happened from whether its receipt exists, with no
+//! need for the RPC's history. The deposit goes back to the wallet once
+//! retries of the request are no longer accepted.
+
+use std::str::FromStr;
+use std::sync::OnceLock;
 
 use solana_instruction::Instruction;
 use solana_message::Message;
@@ -9,8 +20,54 @@ use solana_pubkey::Pubkey;
 use solana_system_interface::instruction as system_instruction;
 
 use super::client::SolanaClient;
-use super::rpc::SignatureStatus;
+use super::drt::types::SYSTEM_PROGRAM_ID_STR;
+use super::rpc::{Account, SignatureStatus};
 use crate::error::ApiError;
+
+fn system_program_id() -> &'static Pubkey {
+    static ID: OnceLock<Pubkey> = OnceLock::new();
+    ID.get_or_init(|| Pubkey::from_str(SYSTEM_PROGRAM_ID_STR).expect("valid system program ID"))
+}
+
+/// The receipt address of the transfer from `wallet` that `seed` names.
+pub fn receipt_address(wallet: &Pubkey, seed: &str) -> Result<Pubkey, ApiError> {
+    Pubkey::create_with_seed(wallet, seed, system_program_id())
+        .map_err(|e| ApiError::internal(format!("deriving a receipt address: {e}")))
+}
+
+/// The instruction that creates the receipt at `receipt`, holding
+/// `deposit` lamports from `wallet`.
+pub fn create_receipt(wallet: &Pubkey, receipt: &Pubkey, seed: &str, deposit: u64) -> Instruction {
+    system_instruction::create_account_with_seed(
+        wallet,
+        receipt,
+        wallet,
+        seed,
+        deposit,
+        0,
+        system_program_id(),
+    )
+}
+
+/// The instruction that returns all `lamports` of the receipt at `receipt`
+/// to `wallet`, which removes it.
+pub fn sweep_receipt(wallet: &Pubkey, receipt: &Pubkey, seed: &str, lamports: u64) -> Instruction {
+    system_instruction::transfer_with_seed(
+        receipt,
+        wallet,
+        seed.to_string(),
+        system_program_id(),
+        wallet,
+        lamports,
+    )
+}
+
+/// Whether `account` is a receipt: an account with no data that the System
+/// program owns. Lamports sent to the address make one too, which a
+/// transfer's own outcome tells apart.
+pub fn is_receipt(account: Option<&Account>) -> bool {
+    account.is_some_and(|a| &a.owner == system_program_id() && a.data.is_empty())
+}
 
 /// Whether `status` has reached `commitment` (`confirmed` or `finalized`).
 pub fn reached(status: &SignatureStatus, commitment: &str) -> bool {
@@ -89,5 +146,82 @@ impl SolanaClient {
             .get_fee_for_message(&message)
             .await
             .map_err(|e| ApiError::rpc_unavailable(format!("fee estimation failed: {e}")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use base64::engine::general_purpose::STANDARD as BASE64;
+    use base64::Engine;
+    use serde_json::json;
+    use solana_transaction::Transaction;
+
+    use super::*;
+    use crate::blockchain::drt::accounts::fetch_pool;
+    use crate::blockchain::rpc::JsonRpcClient;
+    use crate::config::DEFAULT_SOLANA_RPC_URL;
+
+    /// A devnet pool whose owner's wallet holds SOL; `GRANT_GUARD_POOL`
+    /// names another.
+    const DEVNET_POOL: &str = "3QhZF66CnE8prTFYwoETNuLdtya2mB8CtnJZ4EsML7XH";
+
+    #[test]
+    fn a_receipt_is_the_wallets_seeded_address_under_the_system_program() {
+        let wallet = Pubkey::new_from_array([7; 32]);
+        let seed = "133dfaefa5935294a19687842fc22601";
+        let receipt = receipt_address(&wallet, seed).unwrap();
+        assert_eq!(
+            receipt,
+            Pubkey::create_with_seed(&wallet, seed, system_program_id()).unwrap()
+        );
+        let create = create_receipt(&wallet, &receipt, seed, 890_880);
+        assert_eq!(create.program_id, *system_program_id());
+        assert_eq!(create.accounts[1].pubkey, receipt);
+        let sweep = sweep_receipt(&wallet, &receipt, seed, 890_880);
+        assert_eq!(
+            sweep.accounts.iter().map(|a| a.pubkey).collect::<Vec<_>>(),
+            [receipt, wallet, wallet]
+        );
+        assert!(receipt_address(&wallet, &"x".repeat(33)).is_err());
+    }
+
+    /// On devnet: a transaction that creates a receipt passes, and one that
+    /// creates the same receipt twice fails at the second with the System
+    /// program's "already in use" (error 0), which the worker reads as the
+    /// receipt being taken. Simulated without signature checks, paid by the
+    /// owner of `GRANT_GUARD_POOL`, so it needs no keys and spends nothing.
+    #[tokio::test]
+    #[ignore = "calls devnet: run with `just grant-guard`"]
+    async fn devnet_refuses_a_second_transfer_receipt() {
+        let url = std::env::var("SOLANA_RPC_URL").unwrap_or_else(|_| DEFAULT_SOLANA_RPC_URL.into());
+        let rpc = JsonRpcClient::new(&url, "confirmed");
+        let pool: Pubkey = std::env::var("GRANT_GUARD_POOL")
+            .unwrap_or_else(|_| DEVNET_POOL.into())
+            .parse()
+            .unwrap();
+        let wallet = fetch_pool(&rpc, &pool).await.unwrap().owner;
+        let deposit = rpc.get_minimum_balance_for_rent_exemption(0).await.unwrap();
+        let seed = uuid::Uuid::new_v4().simple().to_string();
+        let receipt = receipt_address(&wallet, &seed).unwrap();
+        let simulate = |instructions: Vec<Instruction>| {
+            let tx = Transaction::new_unsigned(Message::new(&instructions, Some(&wallet)));
+            let encoded = BASE64.encode(bincode::serialize(&tx).unwrap());
+            let rpc = &rpc;
+            async move { rpc.simulate_transaction(&encoded).await.unwrap() }
+        };
+
+        let create = create_receipt(&wallet, &receipt, &seed, deposit);
+        let (failed, logs) = simulate(vec![create.clone()]).await;
+        assert!(
+            failed.is_none(),
+            "creating a receipt failed: {failed:?} {logs:#?}"
+        );
+        let (failed, logs) = simulate(vec![create.clone(), create]).await;
+        assert_eq!(
+            failed,
+            Some(json!({ "InstructionError": [1, { "Custom": 0 }] })),
+            "{logs:#?}"
+        );
+        eprintln!("devnet: a receipt under {wallet} is created once and refused the second time");
     }
 }

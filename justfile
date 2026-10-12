@@ -107,8 +107,9 @@ scale:
     cargo nextest run --release --run-ignored only --no-capture -E 'test(pilot_sized)'
 
 # Check on devnet that the DRT program refuses a second grant under one
-# commitment: simulate a landed grant again, and the same grant under a fresh
-# commitment (no keys needed, nothing spent; GRANT_GUARD_POOL picks the pool).
+# commitment, by simulating a landed grant again and the same grant under a
+# fresh commitment, and that a transfer's receipt is refused the second time
+# (no keys needed, nothing spent; GRANT_GUARD_POOL picks the pool).
 grant-guard:
     cargo nextest run --run-ignored only --no-capture -E 'test(devnet_refuses)'
 

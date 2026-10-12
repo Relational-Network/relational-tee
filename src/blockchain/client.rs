@@ -19,6 +19,8 @@ use crate::error::ApiError;
 pub struct SolanaClient {
     pub(crate) rpc: JsonRpcClient,
     pub(crate) network: NetworkConfig,
+    /// What a transfer's receipt account holds, once asked.
+    receipt_deposit: tokio::sync::OnceCell<u64>,
 }
 
 impl SolanaClient {
@@ -29,7 +31,22 @@ impl SolanaClient {
         Self {
             rpc: JsonRpcClient::new(rpc_url, "confirmed"),
             network,
+            receipt_deposit: tokio::sync::OnceCell::new(),
         }
+    }
+
+    /// The lamports a transfer's receipt account holds: the rent-exempt
+    /// minimum for an account with no data, which the network sets.
+    pub async fn receipt_deposit(&self) -> Result<u64, ApiError> {
+        self.receipt_deposit
+            .get_or_try_init(|| async {
+                self.rpc
+                    .get_minimum_balance_for_rent_exemption(0)
+                    .await
+                    .map_err(|e| ApiError::rpc_unavailable(format!("rent lookup failed: {e}")))
+            })
+            .await
+            .copied()
     }
 
     /// Get the network configuration.

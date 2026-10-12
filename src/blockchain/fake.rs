@@ -32,6 +32,13 @@ const SYSTEM_PROGRAM: &str = "11111111111111111111111111111111";
 /// How many blocks a blockhash stays valid for.
 pub const VALID_FOR: u64 = 150;
 
+/// The rent-exempt minimum of an account with no data, as on devnet.
+pub const RECEIPT_DEPOSIT: u64 = 890_880;
+
+/// The System program's `CreateAccountWithSeed` and `TransferWithSeed`.
+const CREATE_ACCOUNT_WITH_SEED: [u8; 4] = 3u32.to_le_bytes();
+const TRANSFER_WITH_SEED: [u8; 4] = 11u32.to_le_bytes();
+
 #[derive(Default)]
 pub struct FakeChain {
     /// Accounts that hold only lamports, owned by the System program, as
@@ -53,6 +60,8 @@ pub struct FakeChain {
     /// `getSignaturesForAddress`'s answer, newest first.
     pub history: Mutex<Vec<Value>>,
     pub block_height: AtomicU64,
+    /// What `getBalance` answers for every address.
+    pub balance: AtomicU64,
     /// Every transaction sent, as sent.
     pub sent: Mutex<Vec<String>>,
     /// Whether a sent transaction lands, successfully, at once.
@@ -116,21 +125,45 @@ impl FakeChain {
             .count()
     }
 
-    /// What a landed transaction does to the DRT program's Grants, as the
-    /// program does it: `grant_right` opens one, `revoke_grant` closes it.
-    fn apply(&self, tx: &Transaction) {
+    /// Whether an account, with data or only lamports, is at `address`.
+    pub fn exists(&self, address: &Pubkey) -> bool {
+        self.data.lock().unwrap().iter().any(|(a, _)| a == address)
+            || self.accounts.lock().unwrap().contains(address)
+    }
+
+    /// What a landed transaction does, as the programs do it, and whether it
+    /// succeeded: `grant_right` opens a Grant and `revoke_grant` closes one;
+    /// `CreateAccountWithSeed` makes an account, and fails the whole
+    /// transaction where one exists; `TransferWithSeed` empties one.
+    fn apply(&self, tx: &Transaction) -> bool {
         let keys = &tx.message.account_keys;
+        let system = |program: u8, data: &[u8], op: [u8; 4]| {
+            keys[program as usize].to_string() == SYSTEM_PROGRAM && data.starts_with(&op)
+        };
+        let taken = tx.message.instructions.iter().any(|ix| {
+            system(ix.program_id_index, &ix.data, CREATE_ACCOUNT_WITH_SEED)
+                && self.exists(&keys[ix.accounts[1] as usize])
+        });
+        if taken {
+            return false;
+        }
         for ix in &tx.message.instructions {
+            let account = |i: usize| keys[ix.accounts[i] as usize];
+            if system(ix.program_id_index, &ix.data, CREATE_ACCOUNT_WITH_SEED) {
+                self.accounts.lock().unwrap().push(account(1));
+            } else if system(ix.program_id_index, &ix.data, TRANSFER_WITH_SEED) {
+                self.close(&account(0));
+            }
             if keys[ix.program_id_index as usize] != drt_program_id() || ix.data.len() < 8 {
                 continue;
             }
-            let account = |i: usize| keys[ix.accounts[i] as usize];
             if ix.data[..8] == DISC_GRANT_RIGHT {
                 self.grant(account(5), account(1));
             } else if ix.data[..8] == DISC_REVOKE_GRANT {
                 self.close(&account(3));
             }
         }
+        true
     }
 
     /// The account at `address` as `getAccountInfo` returns it, or null.
@@ -210,6 +243,9 @@ impl FakeChain {
             }
             "getSignaturesForAddress" => Value::Array(self.history.lock().unwrap().clone()),
             "getBlockHeight" => json!(self.block_height.load(Ordering::SeqCst)),
+            "getMinimumBalanceForRentExemption" => json!(RECEIPT_DEPOSIT),
+            "getBalance" => context(json!(self.balance.load(Ordering::SeqCst))),
+            "getFeeForMessage" => context(json!(5000)),
             "getLatestBlockhash" => {
                 let n = self.blockhashes.fetch_add(1, Ordering::SeqCst) + 1;
                 let height = self.block_height.load(Ordering::SeqCst);
@@ -231,9 +267,15 @@ impl FakeChain {
                 let bytes = BASE64.decode(encoded).unwrap();
                 let tx: Transaction = bincode::deserialize(&bytes).unwrap();
                 let signature = tx.signatures[0].to_string();
-                if self.lands.load(Ordering::SeqCst) {
-                    self.land(&signature, true);
-                    self.apply(&tx);
+                let processed = self
+                    .landed
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(s, _)| *s == signature);
+                if self.lands.load(Ordering::SeqCst) && !processed {
+                    let succeeded = self.apply(&tx);
+                    self.land(&signature, succeeded);
                 }
                 json!(signature)
             }

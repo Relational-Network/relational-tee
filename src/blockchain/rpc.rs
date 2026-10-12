@@ -251,6 +251,16 @@ impl JsonRpcClient {
             .await
     }
 
+    /// `getMinimumBalanceForRentExemption`: the lamports an account of
+    /// `data_len` bytes needs to hold to stay.
+    pub async fn get_minimum_balance_for_rent_exemption(
+        &self,
+        data_len: usize,
+    ) -> Result<u64, RpcError> {
+        self.call_typed("getMinimumBalanceForRentExemption", json!([data_len]))
+            .await
+    }
+
     /// `sendTransaction` of a signed transaction, bincode-serialized and
     /// base64-encoded, with preflight. Sending one Solana already processed
     /// again counts as sent: it deduplicates by signature.

@@ -14,6 +14,7 @@ const NS_UPLOAD: Uuid = Uuid::from_u128(0x55197cf0_95e9_4cc8_86f0_28002664cb46);
 const NS_WALLET: Uuid = Uuid::from_u128(0xba3ecd19_e66f_4fe6_9da7_dce668a690d6);
 const NS_GRANT: Uuid = Uuid::from_u128(0xf55912d4_1733_44d5_a63b_0d0bcc74475d);
 const NS_REVOCATION: Uuid = Uuid::from_u128(0xd37798d5_045e_44d7_9292_e56e6484fce2);
+const NS_RECEIPT: Uuid = Uuid::from_u128(0x97faf768_8e4b_44d4_afd4_1d62354656da);
 
 fn v5(namespace: &Uuid, parts: &[&str]) -> Uuid {
     Uuid::new_v5(namespace, parts.join("\n").as_bytes())
@@ -54,6 +55,15 @@ pub fn revocation_id(user_id: &str, pool_pda: &str, key: &str) -> String {
     v5(&NS_REVOCATION, &[user_id, pool_pda, key]).to_string()
 }
 
+/// The seed of a transfer's receipt address: 32 hex characters, the most a
+/// seed holds. A retry derives the same receipt, which is what makes a
+/// second copy of the transfer fail.
+pub fn receipt_seed(user_id: &str, wallet_id: &str, key: &str) -> String {
+    v5(&NS_RECEIPT, &[user_id, wallet_id, key])
+        .simple()
+        .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -87,6 +97,10 @@ mod tests {
         assert_eq!(
             revocation_id("user-1", "Pool1", KEY),
             "0a55b40d-2af3-56da-accb-43be45316292"
+        );
+        assert_eq!(
+            receipt_seed("user-1", "wallet-1", KEY),
+            "133dfaefa5935294a19687842fc22601"
         );
     }
 
