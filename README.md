@@ -30,7 +30,7 @@ just            # list the recipes
 | Recipe | What it does |
 |---|---|
 | `just dev` | Run the dev build natively on `127.0.0.1:8443`, with Swagger UI at `/docs` (creates missing dev keys first) |
-| `just dev-keys` | Create any missing dev keys in `dev/keys/`: one private JWK per key, the dev MAA signing key, the dev token signing key and the dev manifest key; existing keys are kept |
+| `just dev-keys` | Create any missing dev keys in `dev/keys/`: one private JWK per key, the dev MAA signing key, the dev token signing key, the dev manifest key and the fake SKR sidecar's credential; existing keys are kept |
 | `just dev-token` | Print a token signed with the dev token signing key: `Admin` by default; `--roles`, `--oid`, `--tid`, `--email`, `--name` and `--azp` change it, and `--bad expired\|not-yet-valid\|audience\|tenant\|client\|scope` makes one the worker must refuse |
 | `just dev-manifest` | Sign a dev reference-values manifest and store it where dev workers serve it (see [The dev manifest](#the-dev-manifest)); `--public-key` prints the key a dashboard pins, `--sequence` and `--days` change the manifest, and `--bad expired\|host-data\|transport-key\|signature` makes one a dashboard must refuse |
 | `just skr` | Run the fake SKR sidecar on `127.0.0.1:9000`; start the worker with `KEY_PROVIDER=skr` to use it |
@@ -55,13 +55,15 @@ just            # list the recipes
 
 Dev builds include `relational-tee fake-skr`, a stand-in for Microsoft's SKR sidecar. It serves `POST /key/release` and `POST /attest/maa` with the sidecar's request and response shapes, answering from the dev keys, so the production client code path runs unchanged. It signs attestation tokens RS256 with the dev MAA key, with MAA's claim names and a fixed dev host data value, and serves that key's public half at `GET /certs` (with `Access-Control-Allow-Origin: *`), as MAA does: a dashboard can use `http://localhost:9000` as its attestation authority. A key without a dev key file gets 403, like a release policy mismatch.
 
+Microsoft's sidecar is reachable only from its own container group, but any user on a machine can reach a loopback port. So the fake's two `POST` routes answer only a request with `Authorization: Bearer` and the credential in `skr-token` beside the dev keys, which `just dev-keys` creates readable by its owner only; others get `401`. Dev workers send it from `DEV_SKR_TOKEN`, by default `skr-token` in `DEV_KEYS_DIR` when that file exists. `GET /certs` and `GET /status` stay open.
+
 | Variable | Default | Purpose |
 |---|---|---|
 | `FAKE_SKR_ADDR` | `127.0.0.1:9000` | Listening address |
 | `FAKE_MAA_ISSUER` | `http://localhost:{port}` | The tokens' `iss`, and where `/certs` is served |
 | `FAKE_MAA_TOKEN_SECS` | `28800` (8 hours) | Token lifetime |
 | `FAKE_MAA_DEBUGGABLE` | `off` | `on` makes tokens say the workload is debuggable, which clients must refuse |
-| `DEV_KEYS_DIR` | `dev/keys` | Dev keys to release and sign with |
+| `DEV_KEYS_DIR` | `dev/keys` | Dev keys to release and sign with, and the credential callers must present (`skr-token`) |
 
 Not there yet: a debug-mode sandbox on Azure.
 
@@ -147,6 +149,7 @@ Never print, log or commit a real token.
 | `ENTRA_API_CLIENT_ID` | the dev API `aa827d93-…` | required | The API app registration: tokens' `aud` |
 | `ENTRA_ALLOWED_CLIENT_IDS` | the dev dashboard `e2d026c4-…` and the Azure CLI | required; the Azure CLI is refused | Comma-separated client IDs allowed as `azp` |
 | `DEV_TOKEN_KEY` | `{DEV_KEYS_DIR}/entra-signing-key.pem`, trusted if it exists | refused | The dev token signing key |
+| `DEV_SKR_TOKEN` | `{DEV_KEYS_DIR}/skr-token`, sent if it exists | refused | The fake SKR sidecar's credential, for `KEY_PROVIDER=skr` (see [The fake SKR sidecar](#the-fake-skr-sidecar)) |
 | `DASHBOARD_ORIGIN` | `http://localhost:5173` (Vite) | required, `https://` | The one origin CORS allows |
 | `RATE_LIMIT_IP_PER_SECOND`, `RATE_LIMIT_IP_BURST` | `20`, `40` | same | Requests per client IP, per worker |
 | `RATE_LIMIT_USER_MUTATIONS_PER_SECOND` | `10` | same | POST, PUT, PATCH and DELETE requests per user, per worker |

@@ -3,7 +3,8 @@
 
 //! Dev key files (dev builds only): one private JWK per worker key, in the
 //! format the SKR sidecar releases, the dev MAA signing key, the dev token
-//! signing key and the dev manifest key, under `dev/keys/` by default.
+//! signing key, the dev manifest key and the fake SKR sidecar's credential,
+//! under `dev/keys/` by default.
 //!
 //! These keys stand in for Key Vault. They are never used outside dev builds,
 //! and the directory is gitignored.
@@ -34,6 +35,27 @@ pub fn previous_key_path(dir: &Path, name: KeyName) -> PathBuf {
     dir.join(format!("{name}.previous.jwk"))
 }
 
+/// `{dir}/skr-token`: the credential the fake SKR sidecar asks of anyone who
+/// requests a key or a token from it.
+pub fn skr_token_path(dir: &Path) -> PathBuf {
+    dir.join("skr-token")
+}
+
+/// The fake SKR sidecar's credential, read from `path`.
+pub fn read_skr_token(path: &Path) -> Result<Zeroizing<String>, String> {
+    let text = Zeroizing::new(fs::read_to_string(path).map_err(|e| {
+        format!(
+            "the fake SKR sidecar's credential {} is unreadable ({e}); run `just dev-keys`",
+            path.display()
+        )
+    })?);
+    let token = Zeroizing::new(text.trim().to_string());
+    if token.is_empty() {
+        return Err(format!("{} is empty", path.display()));
+    }
+    Ok(token)
+}
+
 /// The private JWK of `key`, as the SKR sidecar releases it.
 pub fn private_jwk(key: &EcKey) -> Zeroizing<String> {
     let mut jwk = key.public_jwk();
@@ -54,9 +76,10 @@ pub fn read_key(path: &Path) -> Result<EcKey, KeyError> {
     EcKey::from_jwk(&jwk)
 }
 
-/// Create any missing dev key files in `dir`: the four worker keys, the dev
-/// MAA signing key, the dev token signing key and the dev manifest key.
-/// Existing files are never overwritten. Returns the paths it created.
+/// Create any missing dev key files in `dir`: the four worker keys, the fake
+/// SKR sidecar's credential, the dev MAA signing key, the dev token signing
+/// key and the dev manifest key. Existing files are never overwritten.
+/// Returns the paths it created.
 pub fn generate_missing(dir: &Path) -> io::Result<Vec<PathBuf>> {
     fs::create_dir_all(dir)?;
     let mut created = Vec::new();
@@ -68,6 +91,16 @@ pub fn generate_missing(dir: &Path) -> io::Result<Vec<PathBuf>> {
         let key = EcKey::new(SecretKey::random(&mut OsRng));
         write_private(&path, private_jwk(&key).as_bytes())?;
         created.push(path);
+    }
+    let token = skr_token_path(dir);
+    if !token.exists() {
+        let mut bytes = Zeroizing::new([0u8; 32]);
+        getrandom::fill(bytes.as_mut()).map_err(|e| io::Error::other(e.to_string()))?;
+        write_private(
+            &token,
+            Zeroizing::new(hex::encode(bytes.as_ref())).as_bytes(),
+        )?;
+        created.push(token);
     }
     created.extend(super::dev_maa::generate_missing(dir)?);
     created.extend(crate::auth::dev_token::generate_missing(dir)?);
@@ -105,21 +138,23 @@ mod tests {
     fn generates_each_key_once_and_reads_it_back() {
         let dir = temp_dir("dev-keys");
         let created = generate_missing(&dir).expect("generate");
-        assert_eq!(created.len(), KeyName::ALL.len() + 3);
+        assert_eq!(created.len(), KeyName::ALL.len() + 4);
         let first = read_key(&key_path(&dir, KeyName::Transport)).expect("read");
+        let token = read_skr_token(&skr_token_path(&dir)).expect("the credential");
+        assert_eq!(token.len(), 64);
 
         assert!(generate_missing(&dir).expect("second run").is_empty());
         let again = read_key(&key_path(&dir, KeyName::Transport)).expect("read");
         assert_eq!(first.public_key(), again.public_key());
+        assert!(read_skr_token(&skr_token_path(&dir)).unwrap() == token);
 
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = fs::metadata(key_path(&dir, KeyName::Tls))
-                .unwrap()
-                .permissions()
-                .mode();
-            assert_eq!(mode & 0o777, 0o600);
+            for path in [key_path(&dir, KeyName::Tls), skr_token_path(&dir)] {
+                let mode = fs::metadata(&path).unwrap().permissions().mode();
+                assert_eq!(mode & 0o777, 0o600, "{}", path.display());
+            }
         }
         let _ = fs::remove_dir_all(dir);
     }

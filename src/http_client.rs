@@ -83,7 +83,7 @@ impl HttpClient {
 
     /// GET `url`. The full response body is collected into [`Response`].
     pub async fn get(&self, url: &str) -> Result<Response, HttpError> {
-        self.send_json(Method::GET, url, None).await
+        self.send_json(Method::GET, url, None, None).await
     }
 
     /// POST `url` with `body` serialized as JSON.
@@ -94,7 +94,25 @@ impl HttpClient {
     ) -> Result<Response, HttpError> {
         let bytes = serde_json::to_vec(body)
             .map_err(|e| HttpError::new(format!("serialize request body: {e}")))?;
-        self.send_json(Method::POST, url, Some(bytes)).await
+        self.send_json(Method::POST, url, Some(bytes), None).await
+    }
+
+    /// POST `url` with `body` serialized as JSON, and `token` as a bearer
+    /// credential.
+    #[cfg(feature = "dev")]
+    pub async fn post_json_with_bearer<B: Serialize + ?Sized>(
+        &self,
+        url: &str,
+        body: &B,
+        token: &str,
+    ) -> Result<Response, HttpError> {
+        let mut bearer = header::HeaderValue::from_str(&format!("Bearer {token}"))
+            .map_err(|_| HttpError::new("the bearer credential isn't a valid header value"))?;
+        bearer.set_sensitive(true);
+        let bytes = serde_json::to_vec(body)
+            .map_err(|e| HttpError::new(format!("serialize request body: {e}")))?;
+        self.send_json(Method::POST, url, Some(bytes), Some(bearer))
+            .await
     }
 
     /// Send a prepared request and collect the whole response. Adds a
@@ -171,6 +189,7 @@ impl HttpClient {
         method: Method,
         url: &str,
         body: Option<Vec<u8>>,
+        authorization: Option<header::HeaderValue>,
     ) -> Result<Response, HttpError> {
         let uri: hyper::Uri = url
             .parse()
@@ -180,6 +199,9 @@ impl HttpClient {
             .method(&method)
             .uri(&uri)
             .header(header::ACCEPT, "application/json");
+        if let Some(value) = authorization {
+            builder = builder.header(header::AUTHORIZATION, value);
+        }
 
         let body_bytes = match body {
             Some(b) => {

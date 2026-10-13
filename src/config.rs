@@ -200,6 +200,14 @@ impl ServerConfig {
                 .into());
         }
         #[cfg(not(feature = "dev"))]
+        if lookup("DEV_SKR_TOKEN").is_some() {
+            return Err(
+                "DEV_SKR_TOKEN isn't available: release builds talk only to \
+                        Microsoft's SKR sidecar"
+                    .into(),
+            );
+        }
+        #[cfg(not(feature = "dev"))]
         if lookup("FAULT_INJECTION").is_some() {
             return Err(
                 "FAULT_INJECTION isn't available: release builds contain no \
@@ -624,7 +632,20 @@ fn skr_config_from_lookup(lookup: &impl Fn(&str) -> Option<String>) -> Result<Sk
         )?,
         akv_endpoint: host_only("KEY_VAULT_URL", &vault)?,
         key_names,
+        #[cfg(feature = "dev")]
+        dev_token: dev_skr_token_from_lookup(lookup),
     })
+}
+
+/// `DEV_SKR_TOKEN`, or else `skr-token` in `DEV_KEYS_DIR` if it exists: the
+/// fake SKR sidecar's credential.
+#[cfg(feature = "dev")]
+fn dev_skr_token_from_lookup(lookup: &impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    if let Some(path) = lookup("DEV_SKR_TOKEN") {
+        return Some(path.into());
+    }
+    let dir = lookup("DEV_KEYS_DIR").unwrap_or_else(|| crate::tee::dev_keys::DEFAULT_DIR.into());
+    Some(crate::tee::dev_keys::skr_token_path(dir.as_ref())).filter(|path| path.exists())
 }
 
 /// The sidecar takes bare hosts: strip `https://` and any trailing slash.
@@ -946,6 +967,9 @@ mod tests {
         let err = complete(&[("DEV_TOKEN_KEY", "dev/keys/entra-signing-key.pem")])
             .expect_err("no dev token key in release builds");
         assert!(err.contains("DEV_TOKEN_KEY"), "{err}");
+        let err = complete(&[("DEV_SKR_TOKEN", "dev/keys/skr-token")])
+            .expect_err("no fake sidecar credential in release builds");
+        assert!(err.contains("DEV_SKR_TOKEN"), "{err}");
     }
 
     /// `extra` followed by [`RELEASE_BASE`]; the first match wins, so `extra`
@@ -1096,6 +1120,28 @@ mod tests {
         assert_eq!(skr.maa_endpoint, "sharedweu.weu.attest.azure.net");
         assert_eq!(skr.akv_endpoint, "kv-example.vault.azure.net");
         assert_eq!(skr.key_names, ["t", "s", "tls", "c"].map(String::from));
+    }
+
+    #[cfg(feature = "dev")]
+    #[test]
+    fn dev_builds_send_the_fake_sidecars_credential_when_there_is_one() {
+        let token = |name: &str, value: &str| {
+            let config = config_from(&[("KEY_PROVIDER", "skr"), (name, value)]).unwrap();
+            match config.keys {
+                KeyProviderConfig::Skr(skr) => skr.dev_token,
+                KeyProviderConfig::Local { .. } => panic!("expected the skr provider"),
+            }
+        };
+        assert_eq!(
+            token("DEV_SKR_TOKEN", "/keys/skr-token"),
+            Some(PathBuf::from("/keys/skr-token"))
+        );
+        let dir = std::env::temp_dir().join(format!("relational-tee-skr-{}", uuid::Uuid::new_v4()));
+        let keys = dir.display().to_string();
+        assert_eq!(token("DEV_KEYS_DIR", &keys), None, "no file, no credential");
+        crate::tee::dev_keys::generate_missing(&dir).unwrap();
+        assert_eq!(token("DEV_KEYS_DIR", &keys), Some(dir.join("skr-token")));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
