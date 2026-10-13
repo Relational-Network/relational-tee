@@ -15,7 +15,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use utoipa::ToSchema;
 
 use super::dates;
-use super::definition::{Column, ColumnType, Definition, RECORD_ID};
+use super::definition::{quoted, Column, ColumnType, Definition, RECORD_ID};
 use super::query::{filter_options, FilterOptions, DEADLINE_STEPS};
 use crate::budget::Reservation;
 use crate::work::{Stop, Stopped};
@@ -204,17 +204,13 @@ impl Table {
             .iter()
             .map(|(key, column)| Ok((key.as_str(), position(column)?)))
             .collect::<Result<BTreeMap<&str, usize>, TableError>>()?;
-        let names: Vec<String> = def
-            .columns
-            .iter()
-            .map(|c| format!("\"{}\"", c.name))
-            .collect();
+        let names: Vec<String> = def.columns.iter().map(|c| quoted(&c.name)).collect();
         let slots: Vec<String> = (1..=def.columns.len() + 1)
             .map(|i| format!("?{i}"))
             .collect();
         let insert = format!(
-            "INSERT INTO \"{}\" ({RECORD_ID}, {}) VALUES ({})",
-            def.relation,
+            "INSERT INTO {} ({RECORD_ID}, {}) VALUES ({})",
+            quoted(&def.relation),
             names.join(", "),
             slots.join(", ")
         );

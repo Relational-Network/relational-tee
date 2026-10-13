@@ -174,6 +174,12 @@ pub(crate) fn is_sql_name(name: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
 }
 
+/// `name` as one SQL identifier: double-quoted, with any `"` in it doubled,
+/// so it can't end the identifier whatever it holds.
+pub(crate) fn quoted(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
 /// The parameters filter `name` binds: a date range its two ends, a select
 /// its values.
 fn filter_params(name: &str, kind: FilterKind) -> Vec<String> {
@@ -408,11 +414,11 @@ impl Definition {
         let columns: Vec<String> = self
             .columns
             .iter()
-            .map(|c| format!("\"{}\" TEXT", c.name))
+            .map(|c| format!("{} TEXT", quoted(&c.name)))
             .collect();
         format!(
-            "CREATE TABLE \"{}\" ({RECORD_ID} INTEGER PRIMARY KEY, {})",
-            self.relation,
+            "CREATE TABLE {} ({RECORD_ID} INTEGER PRIMARY KEY, {})",
+            quoted(&self.relation),
             columns.join(", ")
         )
     }
@@ -442,8 +448,10 @@ impl Definition {
                 ColumnType::Date => "",
             };
             statements.push(format!(
-                "CREATE INDEX \"_by_{name}\" ON \"{}\" (\"{name}\"{collate}, {RECORD_ID});",
-                self.relation
+                "CREATE INDEX {} ON {} ({}{collate}, {RECORD_ID});",
+                quoted(&format!("_by_{name}")),
+                quoted(&self.relation),
+                quoted(name)
             ));
         }
         for filter in &self.filters {
@@ -452,8 +460,10 @@ impl Definition {
                 FilterKind::MultiSelect | FilterKind::SearchSelect
             ) {
                 statements.push(format!(
-                    "CREATE INDEX \"_exact_{0}\" ON \"{1}\" (\"{0}\", {RECORD_ID});",
-                    filter.name, self.relation
+                    "CREATE INDEX {} ON {} ({}, {RECORD_ID});",
+                    quoted(&format!("_exact_{}", filter.name)),
+                    quoted(&self.relation),
+                    quoted(&filter.name)
                 ));
             }
         }
@@ -463,16 +473,17 @@ impl Definition {
     /// One page of the `rows` query: sorted by `sort` (case-insensitively for
     /// text), then `_record_id`, with `:_limit` and `:_offset` bound.
     pub(crate) fn page_sql(&self, sort: &str, direction: Direction) -> String {
-        let columns: Vec<String> = self.output.iter().map(|c| format!("\"{c}\"")).collect();
+        let columns: Vec<String> = self.output.iter().map(|c| quoted(c)).collect();
         let collate = match self.column(sort).map(|c| c.kind) {
             Some(ColumnType::Text) => " COLLATE NOCASE",
             _ => "",
         };
         format!(
-            "SELECT {} FROM ({}) ORDER BY \"{sort}\"{collate} {}, {RECORD_ID} ASC \
+            "SELECT {} FROM ({}) ORDER BY {}{collate} {}, {RECORD_ID} ASC \
              LIMIT :_limit OFFSET :_offset",
             columns.join(", "),
             self.rows_sql,
+            quoted(sort),
             direction.sql()
         )
     }
@@ -756,6 +767,26 @@ pub(crate) mod tests {
         assert!(refused(&toml).contains("default_sort"));
         let toml = AWARDS_REPORT.replace("header = \"Award\",", "header = \"Award Grade\",");
         assert!(refused(&toml).contains("two columns"));
+    }
+
+    #[test]
+    fn every_name_the_worker_writes_into_sql_is_a_plain_sql_name() {
+        let toml = AWARDS_REPORT.replace(
+            "relation     = \"awards\"",
+            "relation = 'awards\"; DROP TABLE awards; --'",
+        );
+        assert!(refused(&toml).contains("relation"), "{}", refused(&toml));
+        let toml = AWARDS_REPORT.replace(
+            "[columns]\n",
+            "[columns]\n\"award\\\" TEXT); --\" = { header = \"X\", type = \"text\" }\n",
+        );
+        assert!(
+            refused(&toml).contains("lowercase SQL name"),
+            "{}",
+            refused(&toml)
+        );
+        assert_eq!(quoted("awards"), "\"awards\"");
+        assert_eq!(quoted("a\"b"), "\"a\"\"b\"");
     }
 
     #[test]
