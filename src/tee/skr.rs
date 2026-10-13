@@ -24,7 +24,7 @@ use super::{
     valid_version, AttestError, AttestationProvider, BoxFuture, EcKey, KeyError, KeyName,
     KeyProvider, ReleasedKey,
 };
-use crate::http_client::HttpClient;
+use crate::http_client::{HttpClient, HttpError, Response};
 
 /// How to reach the sidecar and what to ask it for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,6 +37,10 @@ pub struct SkrConfig {
     pub akv_endpoint: String,
     /// Key Vault key names, indexed like [`KeyName::ALL`].
     pub key_names: [String; 4],
+    /// Dev builds: the file holding the fake sidecar's credential, sent as a
+    /// bearer token with every request. Microsoft's sidecar takes none.
+    #[cfg(feature = "dev")]
+    pub dev_token: Option<std::path::PathBuf>,
 }
 
 impl SkrConfig {
@@ -65,6 +69,26 @@ impl SkrSidecar {
 
     fn url(&self, path: &str) -> String {
         format!("{}{path}", self.config.endpoint.trim_end_matches('/'))
+    }
+
+    /// POST `body` to the sidecar's `path`, with the fake sidecar's
+    /// credential when one is configured.
+    async fn post(&self, path: &str, body: &Value) -> Result<Response, KeyError> {
+        let unreachable =
+            |e: HttpError| KeyError::retryable(format!("SKR sidecar unreachable: {e}"));
+        #[cfg(feature = "dev")]
+        if let Some(file) = &self.config.dev_token {
+            let token = super::dev_keys::read_skr_token(file).map_err(KeyError::fatal)?;
+            return self
+                .http
+                .post_json_with_bearer(&self.url(path), body, &token)
+                .await
+                .map_err(unreachable);
+        }
+        self.http
+            .post_json(&self.url(path), body)
+            .await
+            .map_err(unreachable)
     }
 }
 
@@ -112,11 +136,7 @@ impl SkrSidecar {
             "akv_endpoint": self.config.akv_endpoint,
             "kid": kid,
         });
-        let response = self
-            .http
-            .post_json(&self.url("/key/release"), &body)
-            .await
-            .map_err(|e| KeyError::retryable(format!("SKR sidecar unreachable: {e}")))?;
+        let response = self.post("/key/release", &body).await?;
         let status = response.status();
         let bytes = Zeroizing::new(
             response
@@ -173,10 +193,9 @@ impl AttestationProvider for SkrSidecar {
                 "runtime_data": STANDARD.encode(runtime_data.to_string()),
             });
             let response = self
-                .http
-                .post_json(&self.url("/attest/maa"), &body)
+                .post("/attest/maa", &body)
                 .await
-                .map_err(|e| AttestError(format!("SKR sidecar unreachable: {e}")))?;
+                .map_err(|e| AttestError(e.message))?;
             let status = response.status();
             let text = response.into_text().unwrap_or_default();
             if !status.is_success() {

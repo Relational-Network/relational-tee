@@ -13,6 +13,11 @@
 //!
 //! `kid` is a key name, or `name/previous` for the optional previous version.
 //! A key without a dev key file gets 403, like a release policy mismatch.
+//!
+//! Microsoft's sidecar is reachable only from its own container group, but
+//! any user on a machine can reach a loopback port. So both `POST` routes
+//! answer only a bearer of the credential in `skr-token` beside the dev
+//! keys, which only their owner can read; the public keys stay open.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -20,7 +25,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::State;
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -28,8 +33,11 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use serde_json::{json, Value};
 use tracing::{info, warn};
+use zeroize::Zeroizing;
 
-use super::dev_keys::{key_path, previous_key_path, private_jwk, read_key, DEFAULT_DIR};
+use super::dev_keys::{
+    key_path, previous_key_path, private_jwk, read_key, read_skr_token, skr_token_path, DEFAULT_DIR,
+};
 use super::dev_maa::{DevMaa, DEFAULT_TOKEN_LIFETIME};
 use super::KeyName;
 
@@ -83,10 +91,12 @@ impl FakeSkrConfig {
     }
 }
 
-/// The fake's state: the dev keys directory and the dev MAA signer.
+/// The fake's state: the dev keys directory, the dev MAA signer and the
+/// credential its callers present.
 pub struct FakeSkr {
     keys_dir: PathBuf,
     maa: DevMaa,
+    token: Zeroizing<String>,
 }
 
 impl FakeSkr {
@@ -96,7 +106,19 @@ impl FakeSkr {
             maa: DevMaa::load(&config.keys_dir, config.issuer.clone())?
                 .with_lifetime(config.token_lifetime)
                 .debuggable(config.debuggable),
+            token: read_skr_token(&skr_token_path(&config.keys_dir))?,
         })
+    }
+
+    /// Whether `headers` carry this fake's credential as a bearer token.
+    fn admits(&self, headers: &HeaderMap) -> bool {
+        let given = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .unwrap_or_default();
+        aws_lc_rs::constant_time::verify_slices_are_equal(given.as_bytes(), self.token.as_bytes())
+            .is_ok()
     }
 }
 
@@ -142,11 +164,28 @@ fn missing(name: &str) -> Response {
     )
 }
 
+/// 401 for a caller without the fake's credential.
+fn unauthorized() -> Response {
+    warn!("Fake SKR: refused a caller without its credential");
+    error(
+        StatusCode::UNAUTHORIZED,
+        "the fake SKR sidecar answers only a bearer of the credential in skr-token, \
+         beside the dev keys",
+    )
+}
+
 async fn status() -> Json<Value> {
     Json(json!({ "message": "Status OK" }))
 }
 
-async fn key_release(State(fake): State<Arc<FakeSkr>>, Json(body): Json<Value>) -> Response {
+async fn key_release(
+    State(fake): State<Arc<FakeSkr>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if !fake.admits(&headers) {
+        return unauthorized();
+    }
     for name in ["kid", "maa_endpoint", "akv_endpoint"] {
         if field(&body, name).is_none() {
             return missing(name);
@@ -185,7 +224,14 @@ async fn key_release(State(fake): State<Arc<FakeSkr>>, Json(body): Json<Value>) 
     }
 }
 
-async fn attest_maa(State(fake): State<Arc<FakeSkr>>, Json(body): Json<Value>) -> Response {
+async fn attest_maa(
+    State(fake): State<Arc<FakeSkr>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if !fake.admits(&headers) {
+        return unauthorized();
+    }
     for name in ["runtime_data", "maa_endpoint"] {
         if field(&body, name).is_none() {
             return missing(name);
@@ -251,19 +297,55 @@ pub(crate) mod tests {
         (format!("http://{addr}"), dir)
     }
 
-    pub(crate) fn skr_config(endpoint: &str) -> SkrConfig {
+    /// The production client's settings for the fake at `endpoint`, with the
+    /// credential in `dir`.
+    pub(crate) fn skr_config(endpoint: &str, dir: &std::path::Path) -> SkrConfig {
         SkrConfig {
             endpoint: endpoint.to_string(),
             maa_endpoint: "sharedweu.weu.attest.azure.net".into(),
             akv_endpoint: "kv-dev.vault.azure.net".into(),
             key_names: KeyName::ALL.map(|k| k.as_str().to_string()),
+            dev_token: Some(skr_token_path(dir)),
         }
+    }
+
+    #[tokio::test]
+    async fn only_a_bearer_of_the_credential_gets_keys_or_tokens() {
+        use crate::tee::AttestationProvider;
+        let (url, dir) = start_fake().await;
+        let wrong = dir.join("wrong-token");
+        std::fs::write(&wrong, "0".repeat(64)).unwrap();
+        for token in [None, Some(wrong)] {
+            let mut config = skr_config(&url, &dir);
+            config.dev_token = token;
+            let sidecar = SkrSidecar::new(config);
+            let Err(e) = sidecar.release(KeyName::StorageRoot).await else {
+                panic!("a key went to a caller without the credential");
+            };
+            assert!(e.message.contains("401"), "{e}");
+            let refused = sidecar.attest(&json!({ "keys": [] })).await.unwrap_err();
+            assert!(refused.0.contains("401"), "{refused}");
+        }
+
+        let mut unreadable = skr_config(&url, &dir);
+        unreadable.dev_token = Some(dir.join("no-such-file"));
+        let Err(e) = SkrSidecar::new(unreadable).release(KeyName::Tls).await else {
+            panic!("released without a credential file");
+        };
+        assert!(!e.retryable && e.message.contains("just dev-keys"), "{e}");
+
+        let http = HttpClient::new();
+        for open in ["/status", "/certs"] {
+            let response = http.get(&format!("{url}{open}")).await.unwrap();
+            assert!(response.is_success(), "{open}");
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
     async fn the_production_client_releases_dev_keys_from_the_fake() {
         let (url, dir) = start_fake().await;
-        let sidecar = SkrSidecar::new(skr_config(&url));
+        let sidecar = SkrSidecar::new(skr_config(&url, &dir));
         for name in KeyName::ALL {
             let released = sidecar.release(name).await.expect("released");
             let expected = read_key(&key_path(&dir, name)).unwrap();
@@ -291,7 +373,7 @@ pub(crate) mod tests {
             .await
             .is_err());
 
-        let mut unknown = skr_config(&url);
+        let mut unknown = skr_config(&url, &dir);
         unknown.key_names[0] = "no-such-key".into();
         let err = match SkrSidecar::new(unknown).release(KeyName::Transport).await {
             Err(e) => e,
@@ -305,14 +387,16 @@ pub(crate) mod tests {
     async fn attest_maa_returns_a_token_that_verifies_against_certs() {
         let (url, dir) = start_fake().await;
         let http = HttpClient::new();
+        let credential = read_skr_token(&skr_token_path(&dir)).unwrap();
         let runtime = json!({ "keys": [{ "kty": "EC", "kid": "k1" }] });
         let response = http
-            .post_json(
+            .post_json_with_bearer(
                 &format!("{url}/attest/maa"),
                 &json!({
                     "maa_endpoint": "sharedweu.weu.attest.azure.net",
                     "runtime_data": STANDARD.encode(runtime.to_string()),
                 }),
+                &credential,
             )
             .await
             .expect("attest");
@@ -332,9 +416,10 @@ pub(crate) mod tests {
         assert_eq!(claims["x-ms-runtime"], runtime);
 
         let missing = http
-            .post_json(
+            .post_json_with_bearer(
                 &format!("{url}/attest/maa"),
                 &json!({ "runtime_data": "e30=" }),
+                &credential,
             )
             .await
             .unwrap();
