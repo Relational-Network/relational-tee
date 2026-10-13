@@ -11,6 +11,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 #[cfg(feature = "dev")]
 use std::path::PathBuf;
 
+use crate::blockchain::types::{devnet_config, mainnet_config, NetworkConfig};
 use crate::store::azure::{AzureConfig, CredentialConfig};
 use crate::tee::skr::SkrConfig;
 
@@ -150,6 +151,8 @@ pub struct ServerConfig {
     pub transport: Transport,
     pub keys: KeyProviderConfig,
     pub storage: StorageConfig,
+    /// The Solana RPC and network (see [`solana_from_lookup`]).
+    pub solana: NetworkConfig,
     pub entra: EntraConfig,
     /// The one origin CORS allows: the environment's dashboard.
     pub dashboard_origin: String,
@@ -211,6 +214,7 @@ impl ServerConfig {
             transport,
             keys: key_provider_from_lookup(&lookup)?,
             storage: storage_from_lookup(&lookup)?,
+            solana: solana_from_lookup(&lookup)?,
             entra: entra_from_lookup(&lookup)?,
             dashboard_origin: dashboard_origin_from_lookup(&lookup)?,
             rate_limits: RateLimits::from_lookup(&lookup)?,
@@ -659,20 +663,30 @@ pub const PUBLIC_SOLANA_RPC_URLS: &[&str] = &[
 /// `mainnet`).
 pub const DEFAULT_SOLANA_NETWORK: &str = "devnet";
 
-/// Solana RPC endpoint from `SOLANA_RPC_URL`, or the devnet default.
-pub fn solana_rpc_url() -> String {
-    env::var("SOLANA_RPC_URL")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| DEFAULT_SOLANA_RPC_URL.to_string())
-}
-
-/// Solana network name from `SOLANA_NETWORK`, or the devnet default.
-pub fn solana_network() -> String {
-    env::var("SOLANA_NETWORK")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| DEFAULT_SOLANA_NETWORK.to_string())
+/// Read `SOLANA_RPC_URL` (default: Solana's public devnet RPC) and
+/// `SOLANA_NETWORK`. What the RPC answers decides whether a transaction is
+/// signed again and who owns a pool, so it must be an `https://` URL; dev
+/// builds also take `http://` on loopback, for a local network such as
+/// Surfpool. The URL isn't echoed back, in case it carries a key.
+pub(crate) fn solana_from_lookup(
+    lookup: &impl Fn(&str) -> Option<String>,
+) -> Result<NetworkConfig, String> {
+    let url = lookup("SOLANA_RPC_URL").unwrap_or_else(|| DEFAULT_SOLANA_RPC_URL.into());
+    let https = url.parse::<hyper::Uri>().is_ok_and(|uri| {
+        uri.scheme_str() == Some("https") && uri.host().is_some_and(|host| !host.is_empty())
+    });
+    if !https && !(cfg!(feature = "dev") && is_loopback_http_url(&url)) {
+        return Err(if cfg!(feature = "dev") {
+            "SOLANA_RPC_URL must be an https:// URL, or http:// on localhost".into()
+        } else {
+            "SOLANA_RPC_URL must be an https:// URL".into()
+        });
+    }
+    let network = lookup("SOLANA_NETWORK").unwrap_or_else(|| DEFAULT_SOLANA_NETWORK.into());
+    Ok(match network.as_str() {
+        "mainnet" | "mainnet-beta" => mainnet_config(&url),
+        _ => devnet_config(&url),
+    })
 }
 
 // ============================================================================
@@ -711,8 +725,9 @@ pub fn drt_program_id() -> solana_pubkey::Pubkey {
 /// Returns `true` when `url` is an `http://` URL whose host is the loopback
 /// interface (`localhost`, `127.0.0.1`, or `::1`).
 ///
-/// Keeps release builds' SKR sidecar traffic on loopback.
-#[cfg(any(test, not(feature = "dev")))]
+/// Keeps release builds' SKR sidecar traffic on loopback, and dev builds'
+/// plain-HTTP Solana RPC.
+///
 /// Substring matching (e.g. `url.contains("localhost")`) is unsafe — a host
 /// like `attacker.example.com/localhost/...` would have falsely passed.
 /// This parser extracts the authority and matches the host exactly.
@@ -997,6 +1012,32 @@ mod tests {
         );
         let config = complete(&[("RATE_LIMIT_USER_MUTATIONS_PER_SECOND", "3")]).unwrap();
         assert_eq!(config.rate_limits.user_mutations_per_second, 3);
+    }
+
+    #[test]
+    fn the_solana_rpc_is_https_and_only_dev_builds_take_http_on_loopback() {
+        let rpc = |url: &'static str| complete(&[("SOLANA_RPC_URL", url)]).map(|c| c.solana);
+        let default = complete(&[]).unwrap().solana;
+        assert_eq!(default.rpc_url, DEFAULT_SOLANA_RPC_URL);
+        assert_eq!(default.name, "Solana Devnet");
+        let paid = rpc("https://rpc.example/v1").unwrap();
+        assert_eq!(paid.rpc_url, "https://rpc.example/v1");
+        for refused in [
+            "http://rpc.example/v1/key-1234",
+            "http://localhost.rpc.example",
+            "ws://rpc.example",
+            "rpc.example",
+            "https://",
+        ] {
+            let err = rpc(refused).expect_err(refused);
+            assert!(err.starts_with("SOLANA_RPC_URL must be an https:// URL"));
+            assert!(!err.contains("key-1234"));
+        }
+        for local in ["http://127.0.0.1:18899", "http://localhost:8899"] {
+            assert_eq!(rpc(local).is_ok(), cfg!(feature = "dev"), "{local}");
+        }
+        let mainnet = complete(&[("SOLANA_NETWORK", "mainnet")]).unwrap().solana;
+        assert_eq!(mainnet.name, "Solana Mainnet");
     }
 
     #[test]

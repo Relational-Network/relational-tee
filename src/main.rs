@@ -605,7 +605,7 @@ async fn serve() {
     info!(drt_program_id = %config::DRT_PROGRAM_ID_STR, "DRT program ID");
 
     // Initialize Solana client.
-    let network_config = blockchain::types::network_config_from_env();
+    let network_config = server_config.solana.clone();
     info!(network = %network_config.name, rpc = %network_config.rpc_url, "Solana client initialized");
     if config::PUBLIC_SOLANA_RPC_URLS.contains(&network_config.rpc_url.as_str()) {
         warn!(
