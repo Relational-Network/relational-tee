@@ -12,7 +12,7 @@ Deployments differ in data, not in code. A deployment's analyses are definitions
 
 ## Status
 
-Every commit to `main` is published as a reproducible image. Analysis requests and responses travel over the worker's TLS like the rest of the API, but aren't yet sealed end to end.
+Every commit to `main` that changes more than documentation is published as a reproducible image. Analysis requests and responses travel over the worker's TLS like the rest of the API, but aren't yet sealed end to end.
 
 ## Quick start
 
