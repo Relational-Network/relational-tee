@@ -6,6 +6,9 @@
 //! statement over the definition's table that names only the filters the
 //! request sets, so SQLite can read it from the table's indexes, sorted by
 //! one of the definition's output columns.
+//!
+//! A request never adds text to a statement: it only chooses among the
+//! definition's names, and everything else it sends is bound.
 
 use std::collections::BTreeMap;
 
@@ -15,7 +18,7 @@ use serde_json::{Map, Value};
 use utoipa::ToSchema;
 
 use super::dates;
-use super::definition::{ColumnType, Definition, Direction, FilterKind, RECORD_ID};
+use super::definition::{quoted, ColumnType, Definition, Direction, FilterKind, RECORD_ID};
 use super::table::Table;
 use crate::work::Stop;
 
@@ -98,7 +101,8 @@ enum Bound {
     Values(String),
 }
 
-/// A request that fits its definition, ready to bind.
+/// A request that fits its definition, ready to bind. The names it holds
+/// are the definition's own copies.
 #[derive(Debug, Clone)]
 pub struct Query {
     /// The filters the request sets, by name, in the definition's order. An
@@ -225,13 +229,15 @@ impl Query {
 
         let (sort, direction) = match &request.sort {
             None => def.default_sort.clone(),
-            Some(s) if def.output.contains(&s.field) => (s.field.clone(), s.direction),
-            Some(s) => {
-                return invalid(format!(
-                    "{} can't be sorted on {}",
-                    def.analysis_id, s.field
-                ))
-            }
+            Some(s) => match def.output.iter().find(|column| **column == s.field) {
+                Some(column) => (column.clone(), s.direction),
+                None => {
+                    return invalid(format!(
+                        "{} can't be sorted on {}",
+                        def.analysis_id, s.field
+                    ))
+                }
+            },
         };
         let page = request.pagination.clone().unwrap_or_default();
         let limit = page.limit.unwrap_or(def.page_default);
@@ -278,14 +284,15 @@ impl Query {
                 Bound::Range { from, to } => {
                     for (end, op, value) in [("from", ">=", from), ("to", "<=", to)] {
                         if let Some(value) = value {
-                            terms.push(format!("\"{name}\" {op} :{name}_{end}"));
+                            terms.push(format!("{} {op} :{name}_{end}", quoted(name)));
                             binds.push((format!(":{name}_{end}"), value.clone()));
                         }
                     }
                 }
                 Bound::Values(values) => {
                     terms.push(format!(
-                        "\"{name}\" IN (SELECT value FROM json_each(:{name}))"
+                        "{} IN (SELECT value FROM json_each(:{name}))",
+                        quoted(name)
                     ));
                     binds.push((format!(":{name}"), values.clone()));
                 }
@@ -304,19 +311,24 @@ impl Query {
     /// then `_record_id`, which its index holds in that order, with
     /// `:_limit` and `:_offset` to bind.
     fn page_sql(&self, def: &Definition, conditions: &str) -> String {
-        let columns: Vec<String> = def.output.iter().map(|c| format!("\"{c}\"")).collect();
+        let columns: Vec<String> = def.output.iter().map(|c| quoted(c)).collect();
         let collate = match def.column(&self.sort).map(|c| c.kind) {
             Some(ColumnType::Text) => " COLLATE NOCASE",
             _ => "",
         };
         format!(
-            "SELECT {} FROM \"{}\"{conditions} ORDER BY \"{}\"{collate} {}, {RECORD_ID} ASC \
+            "SELECT {} FROM {}{conditions} ORDER BY {}{collate} {}, {RECORD_ID} ASC \
              LIMIT :_limit OFFSET :_offset",
             columns.join(", "),
-            def.relation,
-            self.sort,
+            quoted(&def.relation),
+            quoted(&self.sort),
             self.direction.sql()
         )
+    }
+
+    /// How many rows of `def`'s table `conditions` match.
+    fn count_sql(def: &Definition, conditions: &str) -> String {
+        format!("SELECT count(*) FROM {}{conditions}", quoted(&def.relation))
     }
 }
 
@@ -413,8 +425,8 @@ fn narrowed(def: &Definition, conditions: &str, sql: &str) -> String {
     if conditions.is_empty() {
         return sql.to_string();
     }
-    let relation = &def.relation;
-    format!("WITH \"{relation}\" AS (SELECT * FROM main.\"{relation}\"{conditions}) {sql}")
+    let relation = quoted(&def.relation);
+    format!("WITH {relation} AS (SELECT * FROM main.{relation}{conditions}) {sql}")
 }
 
 /// A date range's or multi-select's options, by its option query `sql`.
@@ -514,8 +526,7 @@ impl Table {
             let total = if query.filters.is_empty() {
                 self.rows as u64
             } else {
-                let sql = format!("SELECT count(*) FROM \"{}\"{conditions}", def.relation);
-                let mut count = conn.prepare(&sql)?;
+                let mut count = conn.prepare(&Query::count_sql(def, &conditions))?;
                 bind_all(&mut count, &binds)?;
                 let total: i64 = match count.raw_query().next()? {
                     Some(row) => row.get(0)?,
@@ -1110,6 +1121,47 @@ mod tests {
     }
 
     #[test]
+    fn request_text_never_reaches_a_statement() {
+        let def = awards_report();
+        let all = table(&Scope::All);
+        let hostile = "x' OR '1'='1\"; DROP TABLE awards; --";
+        // A name is one of the definition's, or the request is refused.
+        for json in [
+            serde_json::json!({ "filters": { hostile: { "mode": "all" } } }),
+            serde_json::json!({ "sort": { "field": hostile, "direction": "asc" } }),
+            serde_json::json!({ "filters": { "exam_board_date": { "from": hostile } } }),
+        ] {
+            assert!(
+                matches!(
+                    Query::check(&def, &request(json.clone())),
+                    Err(QueryError::Invalid(_))
+                ),
+                "{json}"
+            );
+        }
+        // A value is bound, so it matches only a cell that holds it.
+        let query = Query::check(
+            &def,
+            &request(serde_json::json!({
+                "filters": { "award": { "mode": "selected", "values": [hostile, "Diploma"] } },
+                "sort": { "field": "surname", "direction": "desc" },
+            })),
+        )
+        .unwrap();
+        let (conditions, _) = query.conditions();
+        for sql in [
+            query.page_sql(&def, &conditions),
+            Query::count_sql(&def, &conditions),
+        ] {
+            assert!(!sql.contains(hostile) && !sql.contains("DROP"), "{sql}");
+        }
+        assert_eq!(all.page(&def, &query, &soon()).unwrap().total_matched, 3);
+        let found = all.search(&def, "staff_number", hostile, 10, &query, &soon());
+        assert_eq!(found.unwrap(), Vec::<String>::new());
+        assert_eq!(run(&all, serde_json::json!({})).total_matched, 10);
+    }
+
+    #[test]
     fn a_query_stops_at_its_deadline() {
         let def = awards_report();
         // Enough rows that a query takes more steps than one deadline check.
@@ -1322,10 +1374,7 @@ mod tests {
         )
         .unwrap();
         let (conditions, _) = query.conditions();
-        let steps = plan(
-            &all,
-            &format!("SELECT count(*) FROM \"awards\"{conditions}"),
-        );
+        let steps = plan(&all, &Query::count_sql(&def, &conditions));
         assert!(
             steps.contains("SEARCH") && steps.contains("INDEX _exact_staff_number"),
             "{steps}"
