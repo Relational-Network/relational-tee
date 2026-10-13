@@ -27,7 +27,7 @@ use utoipa::{IntoParams, ToSchema};
 use crate::audit;
 use crate::auth::{Caller, Permission};
 use crate::blockchain::signing::keypair_from_bytes_verified;
-use crate::blockchain::spl_token::spl_transfer;
+use crate::blockchain::spl_token::{spl_token_program_id, spl_transfer};
 use crate::blockchain::transactions::{create_receipt, native_transfer, receipt_address};
 use crate::chain;
 use crate::error::ApiError;
@@ -35,6 +35,7 @@ use crate::history::{WalletRef, WalletTransaction};
 use crate::idempotency::{Idempotent, JsonBody};
 use crate::ids;
 use crate::state::AppState;
+use crate::storage::pools::PoolDoc;
 use crate::storage::receipts::Receipt;
 
 use super::pools::signed;
@@ -183,22 +184,39 @@ pub async fn estimate_fee(
     }))
 }
 
-/// 400 `drt_not_transferable` if `mint` is any pool's Execute DRT. Analysis
+/// 400 `drt_not_transferable` if `mint` is any pool's Execute DRT, whether
+/// its pool's document is written or its creation only staged. Analysis
 /// grants are burns of those DRTs, and the program lets whoever holds one
 /// burn it into a Grant, so they stay in their pool owner's wallet, whose
 /// key only the worker holds: then every analysis Grant on-chain is one the
 /// worker made.
+///
+/// A pool's creation stages its document before it sends the transaction
+/// that creates its mints, so the mint is read first: once it exists, its
+/// pool is in storage. A mint that doesn't exist yet is refused.
 async fn refuse_execute_drts(state: &AppState, mint: &str) -> Result<(), ApiError> {
-    let Ok(mint) = Pubkey::from_str(mint) else {
-        return Ok(());
-    };
-    let execute = state.storage.pools().all().await?.into_iter().any(|doc| {
+    let mint =
+        Pubkey::from_str(mint).map_err(|_| ApiError::unprocessable("invalid mint address"))?;
+    let account = state
+        .solana_client
+        .rpc()
+        .get_account(&mint, "confirmed")
+        .await
+        .map_err(|e| ApiError::rpc_unavailable(format!("reading the token's mint: {e}")))?;
+    if account.is_none_or(|a| a.owner != *spl_token_program_id()) {
+        return Err(ApiError::bad_request(format!(
+            "no SPL Token mint exists at {mint}"
+        )));
+    }
+    let is_execute = |doc: &PoolDoc| {
         doc.analysis
             .as_ref()
             .and_then(|a| doc.drts.get(&a.analysis_id))
             .is_some_and(|drt| Pubkey::from_str(&drt.mint).ok() == Some(mint))
-    });
-    if execute {
+    };
+    let published = state.storage.pools().all().await?;
+    let staged = state.storage.sagas().pools().await?;
+    if published.iter().chain(&staged).any(is_execute) {
         return Err(ApiError::bad_request(
             "a pool's Execute DRTs stay in its owner's wallet: grant analysts instead",
         )
@@ -226,11 +244,11 @@ async fn refuse_execute_drts(state: &AppState, mint: &str) -> Result<(), ApiErro
     request_body = SendTransactionRequest,
     responses(
         (status = 200, description = "Transaction sent", body = SendTransactionResponse),
-        (status = 400, description = "An amount of zero, an invalid token, a pool's Execute DRT (`drt_not_transferable`), no Idempotency-Key, Solana refused the transaction (`transaction_rejected`), or another transaction holds the receipt address, so the transfer didn't happen (`receipt_taken`)"),
+        (status = 400, description = "An amount of zero, an invalid token or one whose mint doesn't exist yet, a pool's Execute DRT, even while its pool is being created (`drt_not_transferable`), no Idempotency-Key, Solana refused the transaction (`transaction_rejected`), or another transaction holds the receipt address, so the transfer didn't happen (`receipt_taken`)"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden"),
         (status = 404, description = "Wallet not found"),
-        (status = 422, description = "An invalid recipient address, or the Idempotency-Key was used for a different request"),
+        (status = 422, description = "An invalid recipient or mint address, or the Idempotency-Key was used for a different request"),
         (status = 502, description = "The receipt exists, but no Solana node reports the transaction that made it (`transfer_outcome_unknown`): check the signature in the message on an explorer before sending again"),
         (status = 503, description = "RPC unavailable"),
     )
@@ -437,11 +455,43 @@ mod tests {
     use axum::http::{header, Request, StatusCode};
     use serde_json::json;
 
-    use crate::api::credentials::tests::{send, worker};
+    use std::str::FromStr;
+
+    use solana_pubkey::Pubkey;
+
+    use crate::api::credentials::tests::{send, worker, Admin, Worker};
     use crate::api::grants::tests::{analysis_pool, ANALYSIS};
     use crate::blockchain::drt::types::APPEND_DRT_NAME;
     use crate::idempotency::KEY_HEADER;
+    use crate::storage::pools::tests::pool;
+    use crate::storage::pools::{AnalysisRef, DrtMetadata, PoolDoc};
     use crate::storage::receipts::Receipt;
+    use crate::storage::staged::{Saga, Staged};
+
+    /// A request sending one token of `mint` from `owner`'s wallet.
+    fn send_token(owner: &Admin, mint: &str) -> Request<Body> {
+        let body = json!({
+            "recipient": Pubkey::new_unique().to_string(),
+            "amount": 1,
+            "token": format!("spl:{mint}"),
+            "decimals": 0,
+        });
+        Request::post(format!("/v1/wallets/{}/send", owner.wallet_id))
+            .header(header::AUTHORIZATION, format!("Bearer {}", owner.token))
+            .header(&KEY_HEADER, uuid::Uuid::new_v4().to_string())
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    /// Put `doc`'s DRT mints on `worker`'s chain, as its creation does.
+    fn create_mints(worker: &Worker, doc: &PoolDoc) {
+        for drt in doc.drts.values() {
+            let mint = Pubkey::from_str(&drt.mint).unwrap();
+            let data = crate::blockchain::counter::tests::mint(&Pubkey::default(), drt.supply);
+            worker.chain.tokens.lock().unwrap().push((mint, data));
+        }
+    }
 
     #[tokio::test]
     async fn a_pools_execute_drts_stay_in_its_owners_wallet() {
@@ -456,28 +506,74 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let send_drt = |name: &str| {
-            let body = json!({
-                "recipient": solana_pubkey::Pubkey::new_unique().to_string(),
-                "amount": 1,
-                "token": format!("spl:{}", doc.drts[name].mint),
-                "decimals": 0,
-            });
-            Request::post(format!("/v1/wallets/{}/send", owner.wallet_id))
-                .header(header::AUTHORIZATION, format!("Bearer {}", owner.token))
-                .header(&KEY_HEADER, uuid::Uuid::new_v4().to_string())
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(body.to_string()))
-                .unwrap()
-        };
+        create_mints(&worker, &doc);
 
-        let (status, _, refused) = send(&worker.app, send_drt(ANALYSIS)).await;
+        let (status, _, refused) =
+            send(&worker.app, send_token(&owner, &doc.drts[ANALYSIS].mint)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
         assert_eq!(refused["code"], "drt_not_transferable");
         assert!(worker.chain.sent().is_empty());
 
-        let (status, _, sent) = send(&worker.app, send_drt(APPEND_DRT_NAME)).await;
+        let append = &doc.drts[APPEND_DRT_NAME].mint;
+        let (status, _, sent) = send(&worker.app, send_token(&owner, append)).await;
         assert_eq!(status, StatusCode::OK, "append DRTs still send: {sent}");
+        assert_eq!(worker.chain.sent().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn execute_drts_stay_while_their_pool_is_created_and_sends_wait_for_mints() {
+        let worker = worker();
+        let owner = worker.admin("oid-owner").await;
+        worker.chain.lands.store(true, SeqCst);
+        // A creation that has staged its document and is sending the
+        // transaction that creates its mints; no document is written yet.
+        let mut doc = pool("PendingPool", &owner.wallet_id);
+        doc.analysis = Some(AnalysisRef {
+            analysis_id: ANALYSIS.into(),
+            display_name: "Awards Report".into(),
+            code_repo_url: String::new(),
+            code_hash_hex: String::new(),
+        });
+        for name in [APPEND_DRT_NAME, ANALYSIS] {
+            let drt = DrtMetadata {
+                right_id_hex: String::new(),
+                mint: Pubkey::new_unique().to_string(),
+                supply: 2,
+                code_repo_url: String::new(),
+                code_hash_hex: String::new(),
+            };
+            doc.drts.insert(name.into(), drt);
+        }
+        let staged = Staged {
+            record: "idempotency/u/pool.json".into(),
+            staged_at: chrono::Utc::now(),
+            saga: Saga::Pool {
+                pool: Box::new(doc.clone()),
+            },
+        };
+        worker
+            .storage
+            .sagas()
+            .stage("pool-PendingPool", staged)
+            .await
+            .unwrap();
+        let execute = &doc.drts[ANALYSIS].mint;
+
+        // Until the transaction lands, its mints don't exist to be sent.
+        let (status, _, early) = send(&worker.app, send_token(&owner, execute)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{early}");
+        assert_eq!(early["code"], "bad_request");
+        assert!(worker.chain.sent().is_empty());
+
+        // Once they exist, the staged document says which is the Execute DRT.
+        create_mints(&worker, &doc);
+        let (status, _, refused) = send(&worker.app, send_token(&owner, execute)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+        assert_eq!(refused["code"], "drt_not_transferable");
+        assert!(worker.chain.sent().is_empty());
+        let append = &doc.drts[APPEND_DRT_NAME].mint;
+        let (status, _, sent) = send(&worker.app, send_token(&owner, append)).await;
+        assert_eq!(status, StatusCode::OK, "{sent}");
         assert_eq!(worker.chain.sent().len(), 1);
     }
 
