@@ -5,8 +5,9 @@
 //! saga sends anything. Each holds what the saga's commit will write and the
 //! path of its idempotency record, which holds the signed transaction, so
 //! the reconciler ([`crate::reconciler`]) can finish a saga whose request
-//! died after the chain step. A lifecycle rule deletes them after 7 days;
-//! nothing else does.
+//! died after the chain step. A lifecycle rule deletes them after 8 days, a
+//! day after their requests' idempotency records, so every retry the worker
+//! accepts finds what its first attempt staged; nothing else does.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
