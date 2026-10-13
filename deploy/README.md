@@ -12,6 +12,8 @@ anyone needs to check that it runs this code.
   template functions.
 - `reference-values.schema.json`: the schema of the signed manifest a
   deployment publishes, which lists the host data, keys and images it approves.
+  Workers serve the manifest at `GET /v1/reference-values`; see
+  [the API](../docs/api.md#reference-values).
 
 ## Checking a deployment
 
