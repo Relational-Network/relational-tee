@@ -72,6 +72,24 @@ impl<'a> Sagas<'a> {
             .list_json("staged/", |p| p.ends_with(".json"))
             .await
     }
+
+    /// The document of every staged pool creation, finished or not.
+    pub async fn pools(&self) -> Result<Vec<PoolDoc>, StoreError> {
+        let staged: Vec<Staged> = self
+            .s
+            .state()
+            .list_json("staged/", |p| {
+                p.starts_with("staged/pool-") && p.ends_with(".json")
+            })
+            .await?;
+        Ok(staged
+            .into_iter()
+            .filter_map(|staged| match staged.saga {
+                Saga::Pool { pool } => Some(*pool),
+                Saga::Issue { .. } | Saga::Grant { .. } => None,
+            })
+            .collect())
+    }
 }
 
 #[cfg(test)]
