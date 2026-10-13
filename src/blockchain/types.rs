@@ -52,15 +52,6 @@ pub fn mainnet_config(rpc_url: &str) -> NetworkConfig {
     }
 }
 
-/// Build a NetworkConfig from `SOLANA_RPC_URL` and `SOLANA_NETWORK`.
-pub fn network_config_from_env() -> NetworkConfig {
-    let rpc_url = crate::config::solana_rpc_url();
-    match crate::config::solana_network().as_str() {
-        "mainnet" | "mainnet-beta" => mainnet_config(&rpc_url),
-        _ => devnet_config(&rpc_url),
-    }
-}
-
 /// Token balance response.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct TokenBalance {

@@ -141,7 +141,7 @@ Never print, log or commit a real token.
 | `STORAGE_BLOB_URL` | Azurite's, for `azurite` | required, `https://` | Blob endpoint |
 | `DATA_DIR` | `./data` | n/a | Where `files` keeps its containers |
 | `MANAGED_IDENTITY_CLIENT_ID` | unset | the worker identity | Which managed identity to request storage tokens for |
-| `SOLANA_RPC_URL` | `https://api.devnet.solana.com` | same | Solana RPC endpoint |
+| `SOLANA_RPC_URL` | `https://api.devnet.solana.com`; `https://`, or `http://` on loopback | same, `https://` only | Solana RPC endpoint. Its answers decide whether a transaction is signed again and who owns a pool, so it is never read in the clear over a network |
 | `SOLANA_NETWORK` | `devnet` | same | `devnet` or `mainnet`, for explorer links |
 | `ENTRA_TENANT_ID` | the dev tenant `7e3e38e3-…` | required | The tenant whose tokens are accepted |
 | `ENTRA_API_CLIENT_ID` | the dev API `aa827d93-…` | required | The API app registration: tokens' `aud` |

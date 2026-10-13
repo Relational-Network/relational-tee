@@ -801,7 +801,7 @@ async fn setup(base: String) -> Result<Suite, String> {
             .with_max_body(64 << 20),
         base,
     };
-    let network = crate::blockchain::types::network_config_from_env();
+    let network = crate::config::solana_from_lookup(&lookup)?;
     let attestation = api.get("/v1/attestation", "").await?;
     let jwk = &attestation["transport_jwk"];
     let coordinate = |name: &str| {
