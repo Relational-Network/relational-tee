@@ -28,9 +28,10 @@ drt-examples/
 3. The definition's columns are the pool's schema: every upload must have
    exactly its headers, with dates as DD/MM/YYYY.
 4. The SQL reads one table, which holds only the rows the caller may see:
-   the worker builds it for the caller's employer scope, so no statement can
-   reach other employers' rows. Every statement must be read-only and may use
-   only the parameters its filters define.
+   the worker builds it from the targets of the caller's grant, each a scope
+   key the definition declares and a value, so no statement can reach other
+   rows. Every statement must be read-only and may use only the parameters
+   its filters define.
 
 ## Hash and URL
 
@@ -73,4 +74,5 @@ dashboard's registry takes its URL at that commit and its hash.
 The worker needs a change only when a definition needs something the format
 can't express, such as a new filter kind, or a rows query that does more
 than select its columns under its filters. Such a change extends the format
-for every definition, with tests of its own.
+for every definition, with tests of its own. How the worker grants and runs
+an analysis is in [docs/analyses.md](../docs/analyses.md).

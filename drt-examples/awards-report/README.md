@@ -3,7 +3,8 @@
 Lists award records with eleven fields, from Staff Number to Exam Board
 Date, filtered by exam board date range, award, staff number and membership
 number, sorted on any field and paged (100 rows by default, 500 at most).
-Analysts see only the rows their employer scope allows; admins see every row.
+Its scope keys are `employer` and `employer_group`: an analyst sees only the
+rows their grant's targets name, and admins see every row.
 
 The columns match the awards export's header exactly:
 
