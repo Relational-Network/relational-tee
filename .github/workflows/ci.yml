@@ -6,10 +6,20 @@
 
 name: CI
 
+# Documentation-only changes skip CI, and so on main publish no image and
+# start no deployment.
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "LICENSE"
   pull_request:
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "LICENSE"
 
 permissions:
   contents: read
