@@ -105,7 +105,8 @@ test-azurite: azurite
 
 # Upload a pilot-sized dataset (100,000 rows of 30 fields) to a pool's initial
 # upload and issuance routes in an optimised build, and print its size against
-# the upload limit and how long each upload took.
+# the upload limit and how long each upload took; then time pages that count
+# distinct values over a pilot-sized analysis table.
 scale:
     cargo nextest run --release --run-ignored only --no-capture -E 'test(pilot_sized)'
 

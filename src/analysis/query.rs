@@ -878,6 +878,55 @@ mod tests {
             .is_none());
     }
 
+    /// Counting distinct values reads every matching row, so time it on a
+    /// pilot-sized table where every staff and membership number differs,
+    /// the most a count can hold. Run by `just scale`.
+    #[test]
+    #[ignore = "slow; times pilot-sized pages, run by `just scale`"]
+    fn a_pilot_sized_table_counts_distinct_values_well_within_the_deadline() {
+        const ROWS: usize = 100_000;
+        let mut csv = format!("{HEADER}\n");
+        for i in 0..ROWS {
+            csv.push_str(&format!(
+                "{i:06},M{i:06},Mx,Sam,Surname {},01/01/1990,Bank {},Group {},Award {},Pass,{:02}/{:02}/2026\n",
+                i % 5000,
+                i % 40,
+                i % 8,
+                i % 30,
+                1 + i % 28,
+                1 + i % 12,
+            ));
+        }
+        let def = awards_report();
+        let stop = Stop::after(Duration::from_secs(120));
+        let all = Table::build(&def, &[csv.as_bytes()], &Scope::All, &stop).unwrap();
+        let distinct = ["staff_number", "membership_number", "surname", "employer"];
+        let budget = crate::analysis::runner::DEADLINE / 10;
+        for (name, json) in [
+            ("no filter", serde_json::json!({})),
+            (
+                "no filter, 4 counts",
+                serde_json::json!({ "distinct": distinct }),
+            ),
+            (
+                "one award, 4 counts",
+                serde_json::json!({
+                    "filters": { "award": { "mode": "selected", "values": ["Award 7"] } },
+                    "distinct": distinct,
+                }),
+            ),
+        ] {
+            let started = std::time::Instant::now();
+            let page = run(&all, json);
+            let took = started.elapsed();
+            println!(
+                "{ROWS} rows, {name}: {} matched, distinct {:?} in {took:?}",
+                page.total_matched, page.distinct
+            );
+            assert!(took < budget, "{name} took {took:?}");
+        }
+    }
+
     #[test]
     fn distinct_names_output_columns_once_each() {
         let def = awards_report();
