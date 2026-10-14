@@ -141,6 +141,7 @@ An analysis shows admins every row. An analyst sees only the rows of their grant
         api::admin::get_analysis_log,
         // DRT Pool API (new contract)
         api::pools::create_malta_pool,
+        api::pools::preview_analysis,
         // Credential / Pool discovery API
         api::credentials::schema::get_schema,
         api::credentials::initialize::initialize_pool,
@@ -1063,6 +1064,7 @@ mod tests {
             "/v1/drt/me/analyses",
             "/v1/drt/pools/list",
             "/v1/drt/pools/malta",
+            "/v1/drt/analyses/preview",
             "/v1/drt/pools/{pool_pda}/analyses/{analysis_id}",
             "/v1/drt/pools/{pool_pda}/analyses/{analysis_id}/options",
             "/v1/drt/pools/{pool_pda}/analyses/{analysis_id}/options/{filter}",

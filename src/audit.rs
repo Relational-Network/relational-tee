@@ -28,6 +28,7 @@ use crate::error::{code_for_status, ErrorInfo};
 fn event_for(method: &Method, route: &str) -> Option<&'static str> {
     Some(match (method.as_str(), route) {
         ("POST", "/v1/drt/pools/malta") => "pool_created",
+        ("POST", "/v1/drt/analyses/preview") => "analysis_definition_previewed",
         ("POST", "/v1/drt/pools/{pool_pda}/initialize") => "dataset_initialized",
         ("POST", "/v1/drt/pools/{pool_pda}/issue") => "credential_issued",
         ("POST", "/v1/drt/pools/{pool_pda}/revoke") => "credential_revoked",
