@@ -18,8 +18,9 @@
 use std::collections::BTreeMap;
 
 use axum::body::Bytes;
-use axum::extract::{Path, State};
-use axum::http::{header, HeaderMap};
+use axum::extract::rejection::QueryRejection;
+use axum::extract::{Path, Query, State};
+use axum::http::{header, HeaderMap, Method};
 use axum::Json;
 use chrono::Utc;
 use serde::de::DeserializeOwned;
@@ -106,6 +107,20 @@ pub struct AnalysisSummary {
     pub default_sort: SortRequest,
     pub page_size: PageSize,
     pub scope: ScopeSummary,
+    /// How many output columns a query's `distinct` may name.
+    pub max_distinct: usize,
+    /// With `include=page`: each filter's options but the searches', from
+    /// all the caller's rows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub options: Option<BTreeMap<String, FilterOptions>>,
+    /// With `include=page`: the page a query with no filters returns, in the
+    /// default sort, at the default page size.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page: Option<Page>,
+    /// With `include=page`: each search filter's first values, as a search
+    /// with no prefix and no filters returns them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub searches: Option<BTreeMap<String, Vec<String>>>,
 }
 
 /// Each filter's options but the searches', from the caller's rows.
@@ -427,6 +442,10 @@ fn summary(
             max: def.page_max,
         },
         scope: scope_summary(scope, def),
+        max_distinct: query::MAX_DISTINCT,
+        options: None,
+        page: None,
+        searches: None,
     }
 }
 
@@ -441,26 +460,44 @@ fn summary(
     path = "/v1/drt/pools/{pool_pda}/analyses/{analysis_id}",
     tag = "Analyses",
     summary = "Get an analysis",
-    description = "The pool's analysis as the caller may run it: the columns a page returns, the filters a query may use, the default sort and page sizes, the definition's URL and hash, and the rows the caller sees (every row for an admin; for an analyst, their employer scope). Needs `analyses:run`, and for an analyst an active grant.",
+    description = "The pool's analysis as the caller may run it: the columns a page returns, the filters a query may use, the default sort and page sizes, the definition's URL and hash, and the rows the caller sees (every row for an admin; for an analyst, their employer scope). With `include=page` it opens the analysis: it also returns each filter's options but the searches' from all the caller's rows, the page a query with no filters returns in the default sort at the default page size, with the distinct counts `distinct` asks for, and each search filter's first values, as a search with no prefix returns them. An open counts against the per-user limit on non-`GET` requests and is recorded in the analysis log as one `open`; a description alone isn't. Needs `analyses:run`, and for an analyst an active grant.",
     security(("bearer_auth" = [])),
     params(
         ("pool_pda" = String, Path, description = "Pool PDA address (base58)"),
         ("analysis_id" = String, Path, description = "The pool's analysis"),
+        ("include" = Option<String>, Query, description = "`page` opens the analysis with its options and first page"),
+        ("distinct" = Option<Vec<String>>, Query, description = "With `include=page`, repeated: output columns to count the distinct values of in every row, at most `max_distinct`"),
     ),
     responses(
         (status = 200, description = "The analysis", body = AnalysisSummary),
+        (status = 400, description = "A parameter other than `include=page` and its `distinct`, or a `distinct` that doesn't fit the analysis (`invalid_query`)"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "No active grant (`no_grant`), a grant the chain doesn't show (`grant_not_live`), or no employer scope (`no_employer_scope`, `groups_overage`)"),
         (status = 404, description = "Pool or analysis not found"),
-        (status = 503, description = "The chain can't be read to check the grant (`rpc_unavailable`), the pool's last change is still being anchored or was made while the request ran (`pool_settling`, with Retry-After), or the pool's records are older than its on-chain generation (`pool_records_stale`)"),
+        (status = 422, description = "The open ran out of time (`analysis_timeout`)"),
+        (status = 429, description = "An open over the per-user limit (`rate_limited`, with Retry-After)"),
+        (status = 503, description = "The worker is busy (`analysis_busy`, with Retry-After), an open couldn't be recorded in the analysis log (`analysis_log_unavailable`), the chain can't be read to check the grant (`rpc_unavailable`), the pool's last change is still being anchored or was made while the request ran (`pool_settling`, with Retry-After), or the pool's records are older than its on-chain generation (`pool_records_stale`)"),
     )
 )]
 pub async fn get_analysis(
     caller: Caller,
     State(state): State<AppState>,
     Path((pool_pda, analysis_id)): Path<(String, String)>,
+    params: Result<Query<Vec<(String, String)>>, QueryRejection>,
 ) -> Result<Json<AnalysisSummary>, ApiError> {
     caller.require(Permission::AnalysesRun)?;
+    let params = params
+        .map(|Query(p)| p)
+        .map_err(|e| invalid_query(e.body_text()))?;
+    if let Some(distinct) = open_request(&params)? {
+        audit::emit();
+        // It runs a page, as a query does, so it counts as one does.
+        state.limiter.check_user(&Method::POST, &caller.user_id)?;
+        let (doc, analysis) = load(&state, &pool_pda, &analysis_id).await?;
+        return open(&caller, &state, &doc, &analysis, distinct)
+            .await
+            .map(Json);
+    }
     let (doc, analysis) = load(&state, &pool_pda, &analysis_id).await?;
     let def = state
         .analyses
@@ -471,6 +508,112 @@ pub async fn get_analysis(
     if_current(&state, &doc, through.is_some(), answer)
         .await
         .map(Json)
+}
+
+fn invalid_query(message: impl Into<String>) -> ApiError {
+    ApiError::bad_request(message).with_code("invalid_query")
+}
+
+/// The open a description `GET` asks for: none without parameters, or the
+/// `distinct` columns with `include=page`. Anything else is refused.
+fn open_request(params: &[(String, String)]) -> Result<Option<Vec<String>>, ApiError> {
+    if params.is_empty() {
+        return Ok(None);
+    }
+    let mut include = false;
+    let mut distinct = Vec::new();
+    for (key, value) in params {
+        match key.as_str() {
+            "include" if !include && value == "page" => include = true,
+            "include" => return Err(invalid_query("include takes page, once")),
+            "distinct" => distinct.push(value.clone()),
+            _ => {
+                return Err(invalid_query(format!(
+                    "the analysis takes no parameter {key}"
+                )))
+            }
+        }
+    }
+    if !include {
+        return Err(invalid_query("distinct needs include=page"));
+    }
+    Ok(Some(distinct))
+}
+
+/// Open the analysis: its description, the options of all the caller's
+/// rows, the page a query with no filters returns and each search filter's
+/// first values, all from one table, recorded in the analysis log once.
+async fn open(
+    caller: &Caller,
+    state: &AppState,
+    doc: &PoolDoc,
+    analysis: &AnalysisRef,
+    distinct: Vec<String>,
+) -> Result<AnalysisSummary, ApiError> {
+    let asked = json!({ "include": "page", "distinct": distinct });
+    let mut logged = Logged::new(caller, doc, analysis, "open", asked);
+    let result = async {
+        let def = state
+            .analyses
+            .definition(&state.storage, &analysis.code_hash_hex)
+            .await?;
+        let (grant, scope) = authorize(state, caller, doc, analysis, &def).await?;
+        let analyst = grant.is_some();
+        logged.through(grant);
+        let request = QueryRequest {
+            distinct,
+            ..Default::default()
+        };
+        let query = query::Query::check(&def, &request).map_err(query_error)?;
+        // The record holds the query that ran, as a query's does.
+        let mut ran = json!({
+            "filters": {},
+            "sort": { "field": query.sort, "direction": query.direction },
+            "pagination": { "limit": query.limit, "offset": query.offset },
+        });
+        if !query.distinct.is_empty() {
+            ran["distinct"] = json!(query.distinct);
+        }
+        logged.record.request = ran;
+        let mut answer = summary(doc, analysis, &def, &scope);
+        let table = state
+            .analyses
+            .table(&state.storage, doc, &def, &scope)
+            .await?;
+        answer.options = Some(table.options().clone());
+        let (page, searches) = state
+            .analyses
+            .on_table(table, move |table, stop| {
+                let page = table.page(&def, &query, stop).map_err(query_error)?;
+                let mut searches = BTreeMap::new();
+                for filter in def
+                    .filters
+                    .iter()
+                    .filter(|f| f.kind == FilterKind::SearchSelect)
+                {
+                    let values = table
+                        .search(&def, &filter.name, "", DEFAULT_SEARCH_LIMIT, &query, stop)
+                        .map_err(query_error)?;
+                    searches.insert(filter.name.clone(), values);
+                }
+                Ok((page, searches))
+            })
+            .await?;
+        answer.page = Some(page);
+        answer.searches = Some(searches);
+        if_current(state, doc, analyst, answer).await
+    }
+    .await;
+    let opened = logged
+        .finish(state, result, |answer| match &answer.page {
+            Some(page) => (page.rows.len() as u64, Some(page.total_matched)),
+            None => (0, None),
+        })
+        .await?;
+    if let Some(page) = &opened.page {
+        audit::rows(page.rows.len() as u64);
+    }
+    Ok(opened)
 }
 
 /// Each filter's options, from the caller's rows the other filters match.
@@ -1547,5 +1690,198 @@ pub(crate) mod tests {
             StatusCode::FORBIDDEN,
             "analysts don't see other employers' values"
         );
+    }
+
+    /// The analysis log's records of `pool_pda` today.
+    async fn logged_today(worker: &Worker, pool_pda: &Pubkey) -> Vec<AnalysisRecord> {
+        let today = Utc::now().format("%Y-%m-%d").to_string();
+        worker
+            .storage
+            .analysis_log()
+            .on(&pool_pda.to_string(), &today)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_open_returns_the_options_and_first_page_and_is_logged_once() {
+        let worker = worker();
+        let owner = worker.admin("oid-owner").await;
+        let pool_pda = awards_pool(&worker, &owner).await;
+        let path = format!("/v1/drt/pools/{pool_pda}/analyses/{ANALYSIS}");
+
+        // A description alone runs no page and records nothing.
+        let (status, _, described) = send(&worker.app, get(&path, &owner.token)).await;
+        assert_eq!(status, StatusCode::OK, "{described}");
+        assert!(described.get("page").is_none() && described.get("options").is_none());
+        assert!(logged_today(&worker, &pool_pda).await.is_empty());
+
+        let open = format!("{path}?include=page&distinct=membership_number");
+        let (status, _, opened) = send(&worker.app, get(&open, &owner.token)).await;
+        assert_eq!(status, StatusCode::OK, "{opened}");
+        assert_eq!(opened["columns"], described["columns"]);
+        assert_eq!(
+            opened["options"]["exam_board_date"],
+            json!({ "min": "01/01/2026", "max": "30/09/2026" })
+        );
+        assert!(
+            opened["options"].get("staff_number").is_none(),
+            "searches stay out"
+        );
+        assert_eq!(opened["page"]["total_matched"], 5);
+        assert_eq!(
+            opened["searches"]["staff_number"],
+            json!(["000123", "000124", "020001", "030001", "040001"])
+        );
+        assert_eq!(
+            opened["searches"]["membership_number"],
+            json!(["M0", "M1", "M2", "M3", "M4"])
+        );
+        assert_eq!(
+            opened["page"]["distinct"],
+            json!({ "membership_number": 5 })
+        );
+
+        // The page is the one a query with no filters returns.
+        let query = format!("{path}/query");
+        let asked = json!({ "distinct": ["membership_number"] });
+        let (_, _, page) = send(&worker.app, post(&query, &owner.token, &asked)).await;
+        assert_eq!(opened["page"], page);
+
+        let log = logged_today(&worker, &pool_pda).await;
+        let opens: Vec<_> = log.iter().filter(|r| r.action == "open").collect();
+        assert_eq!(opens.len(), 1, "{log:?}");
+        let open = opens[0];
+        assert_eq!(open.outcome, "success");
+        assert_eq!(open.request["filters"], json!({}));
+        assert_eq!(
+            open.request["sort"],
+            json!({ "field": "exam_board_date", "direction": "desc" })
+        );
+        assert_eq!(
+            open.request["pagination"],
+            json!({ "limit": 100, "offset": 0 })
+        );
+        assert_eq!(open.request["distinct"], json!(["membership_number"]));
+        assert_eq!((open.returned, open.total_matched), (Some(5), Some(5)));
+    }
+
+    #[tokio::test]
+    async fn an_open_takes_include_page_and_its_distinct_only() {
+        let worker = worker();
+        let owner = worker.admin("oid-owner").await;
+        let pool_pda = awards_pool(&worker, &owner).await;
+        let path = format!("/v1/drt/pools/{pool_pda}/analyses/{ANALYSIS}");
+        for (query, message) in [
+            ("distinct=award", "distinct needs include=page"),
+            ("include=rows", "include takes page, once"),
+            ("include=page&include=page", "include takes page, once"),
+            (
+                "include=page&limit=5",
+                "the analysis takes no parameter limit",
+            ),
+            (
+                "include=page&distinct=_record_id",
+                "awards-report-v1 can't count the distinct values of _record_id",
+            ),
+        ] {
+            let (status, _, body) =
+                send(&worker.app, get(&format!("{path}?{query}"), &owner.token)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {body}");
+            assert_eq!(body["code"], "invalid_query", "{query}");
+            assert_eq!(body["error"], message, "{query}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_open_follows_the_analysts_grant() {
+        let worker = worker();
+        let owner = worker.admin("oid-owner").await;
+        let pool_pda = awards_pool(&worker, &owner).await;
+        let (group_a, group_a_id) = analyst(&worker.app, "oid-group-a").await;
+        let (ungranted, _) = analyst(&worker.app, "oid-ungranted").await;
+        grant(&worker, &pool_pda, &group_a_id, GROUP_A).await;
+        let open = format!("/v1/drt/pools/{pool_pda}/analyses/{ANALYSIS}?include=page");
+
+        let (status, _, opened) = send(&worker.app, get(&open, &group_a)).await;
+        assert_eq!(status, StatusCode::OK, "{opened}");
+        assert_eq!(opened["page"]["total_matched"], 3);
+        assert_eq!(
+            opened["searches"]["staff_number"],
+            json!(["000123", "000124", "020001"]),
+            "the grant's rows only"
+        );
+        assert!(column(&opened["page"], "employer_group")
+            .iter()
+            .all(|g| g == "Group A"));
+        assert_eq!(
+            opened["options"]["award"],
+            json!([
+                { "value": "Certificate", "count": 2 },
+                { "value": "Diploma", "count": 1 }
+            ])
+        );
+
+        let (status, _, refused) = send(&worker.app, get(&open, &ungranted)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{refused}");
+        assert_eq!(refused["code"], "no_grant");
+        assert!(refused.get("page").is_none());
+    }
+
+    #[tokio::test]
+    async fn an_open_that_cant_be_logged_returns_nothing() {
+        let worker = worker();
+        let owner = worker.admin("oid-owner").await;
+        let blocked = awards_pool(&worker, &owner).await;
+        worker
+            .storage
+            .state()
+            .create_uncached(&format!("audit/analyses/{blocked}"), b"in the way")
+            .await
+            .unwrap();
+        let path = format!("/v1/drt/pools/{blocked}/analyses/{ANALYSIS}");
+        let (status, _, body) = send(
+            &worker.app,
+            get(&format!("{path}?include=page"), &owner.token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["code"], "analysis_log_unavailable");
+        assert!(body.get("page").is_none());
+
+        // A description isn't logged, so it still answers.
+        let (status, _, body) = send(&worker.app, get(&path, &owner.token)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    #[tokio::test]
+    async fn an_open_counts_against_the_per_user_limit_and_a_description_does_not() {
+        let worker = crate::api::credentials::tests::worker_with(|state| {
+            state.limiter =
+                std::sync::Arc::new(crate::edge::Limiter::new(&crate::config::RateLimits {
+                    ip_per_second: 1000,
+                    ip_burst: 1000,
+                    user_mutations_per_second: 1,
+                }));
+        });
+        let owner = worker.admin("oid-owner").await;
+        let pool_pda = awards_pool(&worker, &owner).await;
+        let mut spec = Spec::valid(&config());
+        spec.oid = "oid-reader".into();
+        spec.roles = vec!["Admin".into()];
+        let reader = spec.sign(entra_key()).unwrap();
+        sign_in(&worker.app, &reader).await;
+
+        let path = format!("/v1/drt/pools/{pool_pda}/analyses/{ANALYSIS}");
+        for _ in 0..3 {
+            let (status, _, body) = send(&worker.app, get(&path, &reader)).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+        let open = format!("{path}?include=page");
+        let (status, _, body) = send(&worker.app, get(&open, &reader)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, _, body) = send(&worker.app, get(&open, &reader)).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+        assert_eq!(body["code"], "rate_limited");
     }
 }

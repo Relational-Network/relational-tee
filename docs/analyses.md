@@ -54,7 +54,9 @@ For each pool version (the uploads that count; revoked ones don't) and scope, th
 
 A filter's options under the other filters a request sets, and a search, run the definition's own option query on the rows those filters match, by naming them like the table in a `WITH`; a filter's own selection never narrows its own options. The definition's SQL was checked read-only when the pool was created, and the table is read-only once built.
 
-A request names only the definition's filters, whose values are bound as parameters, sorts on one output column and then a stable row key, and pages within the definition's limits; anything else, such as a scope, is refused. A page's statement holds only the filters the request sets, so SQLite reads it from the indexes, and with no filter set the total is the table's row count; a test holds these statements to the Awards Report's own `rows` query.
+A request names only the definition's filters, whose values are bound as parameters, sorts on one output column and then a stable row key, and pages within the definition's limits; anything else, such as a scope, is refused. A page's statement holds only the filters the request sets, so SQLite reads it from the indexes, and with no filter set the total is the table's row count; a test holds these statements to the Awards Report's own `rows` query. A request may also name up to four output columns in `distinct`; the page then says how many distinct non-empty values each holds in every matching row, such as people by an ID column, counted under the same filters and scope.
+
+Opening an analysis is one request: `GET …/analyses/{analysis_id}?include=page` returns its description, every filter's options but the searches' from all the caller's rows (the options the table was built with, so nothing is computed), the page a query with no filters returns, in the default sort at the default page size, with the counts its `distinct` names, and each search filter's first values, as a search with no prefix returns them. All of it comes from one table, so it can't mix two versions of the pool, and it succeeds or fails as a whole. It is authorised as a query is, counts against the per-user limit as a non-`GET` request does, and is recorded once, as an `open` holding the query it ran. A plain `GET` is the description alone, which runs no page and records nothing. Filter changes, sorting, paging and searches keep their own requests.
 
 ### Limits and timeouts
 
@@ -74,6 +76,6 @@ DD/MM/YYYY in the CSV and the API, in filters, options and rows; `YYYY-MM-DD` on
 
 ## The analysis log
 
-Every options, search and query request is recorded, sealed and create-only, at `audit/analyses/{pda}/{date}/{event_id}.json`, under an ID the worker generates for the request (its `X-Request-Id`, which a caller may choose, is kept in the record): who asked, through which grant, the filters, the sort and page it ran with, how many rows went back, and the outcome. A success whose record can't be stored returns `503 analysis_log_unavailable` instead of its rows. Admins read it with `GET /v1/admin/analysis-log`.
+Every open, options, search and query request is recorded, sealed and create-only, at `audit/analyses/{pda}/{date}/{event_id}.json`, under an ID the worker generates for the request (its `X-Request-Id`, which a caller may choose, is kept in the record): who asked, through which grant, the filters, the sort and page it ran with, how many rows went back, and the outcome. A success whose record can't be stored returns `503 analysis_log_unavailable` instead of its rows. Admins read it with `GET /v1/admin/analysis-log`.
 
 Analysis requests and responses travel over the worker's TLS like the rest of the API; they aren't sealed end to end yet.

@@ -34,7 +34,7 @@ With `LOG_FORMAT=json` (release builds' default) each line is one JSON object: `
 
 ### Audit events
 
-Every mutation, failed mutation, admin read, definition preview and analysis request (options, search or query) logs exactly one event with target `audit` when it completes, for operators to query in Azure Monitor. An event carries only `event` (for example `credential_issued`), `outcome` (`success` or `failure`), `code` on failure, `request_id`, `user_id`, and where relevant `pool`, `record_id`, `wallet_id`, `rows` and `signature`; never CSV content, emails, free-text reasons, keys or client IP addresses. The output leaves the TEE through the host, so these events are diagnostics: the pool's own records, the sealed analysis log and the chain are the audit trail users rely on.
+Every mutation, failed mutation, admin read, definition preview and analysis request (an open, options, search or query) logs exactly one event with target `audit` when it completes, for operators to query in Azure Monitor. An event carries only `event` (for example `credential_issued`), `outcome` (`success` or `failure`), `code` on failure, `request_id`, `user_id`, and where relevant `pool`, `record_id`, `wallet_id`, `rows` and `signature`; never CSV content, emails, free-text reasons, keys or client IP addresses. The output leaves the TEE through the host, so these events are diagnostics: the pool's own records, the sealed analysis log and the chain are the audit trail users rely on.
 
 ### Errors
 
@@ -127,7 +127,7 @@ The pool list accepts `search` (case-insensitive pool name), `state` (`ready` or
 
 ### Analyses
 
-Under `/v1/drt/pools/{pda}/analyses/{analysis_id}` (`analyses:run`, and for an analyst an active grant): `GET` describes the analysis and the caller's rows; `POST …/options { filters }` and `…/options/{filter} { search, limit, filters }` list filter values from those rows that the other filters match; `POST …/query` returns `{ rows, total_matched, limit, offset }`. See [Analyses](analyses.md).
+Under `/v1/drt/pools/{pda}/analyses/{analysis_id}` (`analyses:run`, and for an analyst an active grant): `GET` describes the analysis and the caller's rows, and `GET …?include=page` (with `distinct=…` repeated for counts) opens it: the description, the options of all the caller's rows, the first page and each search filter's first values, in one call that counts against the per-user limit and is recorded once in the analysis log; `POST …/options { filters }` and `…/options/{filter} { search, limit, filters }` list filter values from those rows that the other filters match; `POST …/query` returns `{ rows, total_matched, limit, offset }`, and `distinct` when the request names output columns to count the distinct values of (at most the summary's `max_distinct`). See [Analyses](analyses.md).
 
 ### Admin
 
