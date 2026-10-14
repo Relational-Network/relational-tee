@@ -37,6 +37,8 @@ pub(super) const DEADLINE_STEPS: i32 = 1000;
 /// The most options a multi-select lists, in its option query's order: a
 /// column with more distinct values suits a search.
 pub const MAX_OPTIONS: usize = 1000;
+/// The most output columns a query counts the distinct values of.
+pub const MAX_DISTINCT: usize = 4;
 
 /// A query, as the browser sends it.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, ToSchema)]
@@ -50,6 +52,11 @@ pub struct QueryRequest {
     pub sort: Option<SortRequest>,
     #[serde(default)]
     pub pagination: Option<PageRequest>,
+    /// Output columns to count the distinct non-empty values of, over every
+    /// matching row, such as people by an ID column; at most
+    /// [`MAX_DISTINCT`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub distinct: Vec<String>,
 }
 
 /// A date range takes `from` and `to` (DD/MM/YYYY, inclusive, either may be
@@ -113,6 +120,8 @@ pub struct Query {
     pub direction: Direction,
     pub limit: u32,
     pub offset: u64,
+    /// The output columns whose distinct values a page counts, as asked.
+    pub distinct: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -248,12 +257,29 @@ impl Query {
         if offset > MAX_OFFSET {
             return invalid(format!("offset must be at most {MAX_OFFSET}"));
         }
+        if request.distinct.len() > MAX_DISTINCT {
+            return invalid(format!("distinct names at most {MAX_DISTINCT} columns"));
+        }
+        let mut distinct: Vec<String> = Vec::new();
+        for name in &request.distinct {
+            let Some(column) = def.output.iter().find(|column| **column == *name) else {
+                return invalid(format!(
+                    "{} can't count the distinct values of {name}",
+                    def.analysis_id
+                ));
+            };
+            if distinct.contains(column) {
+                return invalid(format!("distinct names {name} twice"));
+            }
+            distinct.push(column.clone());
+        }
         Ok(Self {
             filters,
             sort,
             direction,
             limit,
             offset,
+            distinct,
         })
     }
 
@@ -330,6 +356,22 @@ impl Query {
     fn count_sql(def: &Definition, conditions: &str) -> String {
         format!("SELECT count(*) FROM {}{conditions}", quoted(&def.relation))
     }
+
+    /// How many distinct values each of this query's `distinct` columns
+    /// holds in the rows `conditions` match. An empty cell is NULL, so it
+    /// isn't counted.
+    fn distinct_sql(&self, def: &Definition, conditions: &str) -> String {
+        let counts: Vec<String> = self
+            .distinct
+            .iter()
+            .map(|column| format!("count(DISTINCT {})", quoted(column)))
+            .collect();
+        format!(
+            "SELECT {} FROM {}{conditions}",
+            counts.join(", "),
+            quoted(&def.relation)
+        )
+    }
 }
 
 /// One page of matching rows.
@@ -342,6 +384,11 @@ pub struct Page {
     pub total_matched: u64,
     pub limit: u32,
     pub offset: u64,
+    /// For each column the request's `distinct` names, how many distinct
+    /// non-empty values it holds in every matching row. Absent when it
+    /// names none.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub distinct: BTreeMap<String, u64>,
 }
 
 /// A filter's options, from the caller's rows.
@@ -535,6 +582,19 @@ impl Table {
                 u64::try_from(total).unwrap_or(0)
             };
 
+            let mut distinct = BTreeMap::new();
+            if !query.distinct.is_empty() {
+                let mut counts = conn.prepare(&query.distinct_sql(def, &conditions))?;
+                bind_all(&mut counts, &binds)?;
+                let mut rows = counts.raw_query();
+                if let Some(row) = rows.next()? {
+                    for (i, column) in query.distinct.iter().enumerate() {
+                        let count: i64 = row.get(i)?;
+                        distinct.insert(column.clone(), u64::try_from(count).unwrap_or(0));
+                    }
+                }
+            }
+
             let mut page = conn.prepare(&query.page_sql(def, &conditions))?;
             bind_all(&mut page, &binds)?;
             bind(&mut page, ":_limit", &i64::from(query.limit))?;
@@ -544,6 +604,7 @@ impl Table {
                 total_matched: total,
                 limit: query.limit,
                 offset: query.offset,
+                distinct,
             })
         })
     }
@@ -775,6 +836,68 @@ mod tests {
             panic!("award is a multi-select");
         };
         assert_eq!(values.len(), MAX_OPTIONS);
+    }
+
+    #[test]
+    fn a_query_counts_the_distinct_values_it_names_in_every_matching_row() {
+        let all = table(&Scope::All);
+        let page = run(
+            &all,
+            serde_json::json!({
+                "distinct": ["membership_number", "staff_number"],
+                "pagination": { "limit": 1 },
+            }),
+        );
+        assert_eq!((page.total_matched, page.rows.len()), (10, 1));
+        assert_eq!(
+            page.distinct,
+            BTreeMap::from([
+                ("membership_number".to_string(), 6),
+                ("staff_number".to_string(), 9)
+            ])
+        );
+
+        let certificates = run(
+            &all,
+            serde_json::json!({
+                "filters": { "award": { "mode": "selected", "values": ["Certificate"] } },
+                "distinct": ["membership_number"],
+            }),
+        );
+        assert_eq!(certificates.total_matched, 4);
+        assert_eq!(
+            certificates.distinct,
+            BTreeMap::from([("membership_number".to_string(), 3)])
+        );
+
+        let plain = run(&all, serde_json::json!({}));
+        assert!(plain.distinct.is_empty());
+        assert!(serde_json::to_value(&plain)
+            .unwrap()
+            .get("distinct")
+            .is_none());
+    }
+
+    #[test]
+    fn distinct_names_output_columns_once_each() {
+        let def = awards_report();
+        let refused = |json: serde_json::Value| Query::check(&def, &request(json)).unwrap_err();
+        assert_eq!(
+            refused(serde_json::json!({ "distinct": ["_record_id"] })),
+            QueryError::Invalid(
+                "awards-report-v1 can't count the distinct values of _record_id".into()
+            )
+        );
+        assert_eq!(
+            refused(serde_json::json!({ "distinct": ["award", "award"] })),
+            QueryError::Invalid("distinct names award twice".into())
+        );
+        assert_eq!(
+            refused(serde_json::json!({
+                "distinct": ["award", "surname", "employer", "staff_number", "title"]
+            })),
+            QueryError::Invalid(format!("distinct names at most {MAX_DISTINCT} columns"))
+        );
     }
 
     #[test]
@@ -1255,6 +1378,7 @@ mod tests {
                     total_matched: u64::try_from(total).unwrap_or(0),
                     limit: query.limit,
                     offset: query.offset,
+                    distinct: BTreeMap::new(),
                 })
             })
             .unwrap()

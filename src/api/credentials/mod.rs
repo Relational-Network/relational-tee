@@ -136,9 +136,15 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn worker() -> Worker {
+        worker_with(|_| {})
+    }
+
+    /// A worker whose state `edit` changes first, such as its rate limits.
+    pub(crate) fn worker_with(edit: impl FnOnce(&mut AppState)) -> Worker {
         let chain = Arc::new(FakeChain::default());
         let mut state = AppState::for_tests();
         state.solana_client = Arc::new(fake::start(chain.clone()));
+        edit(&mut state);
         let transport = state.transport.get(state.transport.current_kid()).unwrap();
         let storage = state.storage.clone();
         let commitments = state.commitments.clone();

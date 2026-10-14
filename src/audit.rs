@@ -56,9 +56,21 @@ fn event_for(method: &Method, route: &str) -> Option<&'static str> {
     })
 }
 
+/// Events a route records only when its handler asks to, with [`emit`]: an
+/// analysis description is read unrecorded, but opening its first page is
+/// recorded.
+fn optional_event_for(method: &Method, route: &str) -> Option<&'static str> {
+    Some(match (method.as_str(), route) {
+        ("GET", "/v1/drt/pools/{pool_pda}/analyses/{analysis_id}") => "analysis_opened",
+        _ => return None,
+    })
+}
+
 /// What handlers and the auth extractor add to the request's event.
 #[derive(Debug, Default)]
 struct Fields {
+    /// The handler asked for its route's optional event.
+    emit: bool,
     user_id: Option<String>,
     pool: Option<String>,
     record_id: Option<String>,
@@ -107,6 +119,12 @@ pub fn rows(rows: u64) {
     set(|f| f.rows = Some(rows));
 }
 
+/// Record this request's optional event, such as an analysis opened with
+/// its first page.
+pub fn emit() {
+    set(|f| f.emit = true);
+}
+
 /// The grant a request made or revoked, as its `record_id`.
 pub fn grant(grant_id: &str) {
     set(|f| f.record_id = Some(grant_id.to_string()));
@@ -120,12 +138,16 @@ pub fn signature(signature: &str) {
 /// Middleware: emit the audit event of an audited route once it completes,
 /// with the pool or wallet from the path and whatever the request added.
 pub async fn record(request: Request, next: Next) -> Response {
-    let event = request
+    let route = request
         .extensions()
         .get::<MatchedPath>()
-        .and_then(|route| event_for(request.method(), route.as_str()));
-    let Some(event) = event else {
-        return next.run(request).await;
+        .map(|r| r.as_str());
+    let (event, optional) = match route.and_then(|r| event_for(request.method(), r)) {
+        Some(event) => (event, false),
+        None => match route.and_then(|r| optional_event_for(request.method(), r)) {
+            Some(event) => (event, true),
+            None => return next.run(request).await,
+        },
     };
 
     let (mut parts, body) = request.into_parts();
@@ -155,6 +177,9 @@ pub async fn record(request: Request, next: Next) -> Response {
         .lock()
         .map(|mut f| std::mem::take(&mut *f))
         .unwrap_or_default();
+    if optional && !f.emit {
+        return response;
+    }
     tracing::info!(
         target: "audit",
         event,
@@ -225,9 +250,22 @@ mod tests {
         crate::error::ApiError::conflict("the wallet changed; retry")
     }
 
+    /// An analysis GET that opens a page when the query string asks it to.
+    async fn analysis(request: Request) -> StatusCode {
+        if request.uri().query() == Some("include=page") {
+            emit();
+            rows(7);
+        }
+        StatusCode::OK
+    }
+
     fn app() -> Router {
         Router::new()
             .route("/v1/drt/pools/{pool_pda}/issue", post(issue))
+            .route(
+                "/v1/drt/pools/{pool_pda}/analyses/{analysis_id}",
+                get(analysis),
+            )
             .route("/v1/admin/wallets/{wallet_id}/suspend", post(suspend))
             .route("/v1/drt/pools/list", get(|| async { "not audited" }))
             .layer(axum::middleware::from_fn(record))
@@ -300,5 +338,25 @@ mod tests {
         );
         assert_eq!(suspended["wallet_id"], "w-9");
         assert!(!suspended.contains_key("record_id"));
+    }
+
+    #[tokio::test]
+    async fn an_optional_event_is_recorded_only_when_its_handler_asks() {
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::registry().with(Capture(captured.clone()));
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        call("GET", "/v1/drt/pools/Pool1/analyses/report-v1").await;
+        call("GET", "/v1/drt/pools/Pool1/analyses/report-v1?include=page").await;
+
+        let events = captured.lock().unwrap().clone();
+        assert_eq!(events.len(), 1, "a description isn't recorded: {events:?}");
+        let opened = &events[0];
+        assert_eq!(opened["event"], "analysis_opened");
+        assert_eq!(opened["outcome"], "success");
+        assert_eq!(
+            (opened["pool"].as_str(), opened["rows"].as_str()),
+            ("Pool1", "7")
+        );
     }
 }
