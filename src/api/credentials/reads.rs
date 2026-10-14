@@ -143,8 +143,12 @@ pub enum PoolSort {
     CreatedAsc,
     /// By name, case-insensitively.
     NameAsc,
+    /// By name descending, case-insensitively.
+    NameDesc,
     /// Most uploaded rows first.
     CredentialsDesc,
+    /// Fewest uploaded rows first.
+    CredentialsAsc,
 }
 
 /// Query parameters for the list-all-pools endpoint.
@@ -396,6 +400,13 @@ pub async fn list_all_pools(
             (a.pool_name.to_lowercase(), &a.pool_pda)
                 .cmp(&(b.pool_name.to_lowercase(), &b.pool_pda))
         }),
+        PoolSort::NameDesc => entries.sort_by(|a, b| {
+            (std::cmp::Reverse(a.pool_name.to_lowercase()), &a.pool_pda)
+                .cmp(&(std::cmp::Reverse(b.pool_name.to_lowercase()), &b.pool_pda))
+        }),
+        PoolSort::CredentialsAsc => {
+            entries.sort_by(|a, b| (a.total_rows, &a.pool_pda).cmp(&(b.total_rows, &b.pool_pda)))
+        }
         PoolSort::CredentialsDesc => entries.sort_by(|a, b| {
             (std::cmp::Reverse(a.total_rows), &a.pool_pda)
                 .cmp(&(std::cmp::Reverse(b.total_rows), &b.pool_pda))

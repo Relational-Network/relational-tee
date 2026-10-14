@@ -34,7 +34,7 @@ With `LOG_FORMAT=json` (release builds' default) each line is one JSON object: `
 
 ### Audit events
 
-Every mutation, failed mutation, admin read and analysis request (options, search or query) logs exactly one event with target `audit` when it completes, for operators to query in Azure Monitor. An event carries only `event` (for example `credential_issued`), `outcome` (`success` or `failure`), `code` on failure, `request_id`, `user_id`, and where relevant `pool`, `record_id`, `wallet_id`, `rows` and `signature`; never CSV content, emails, free-text reasons, keys or client IP addresses. The output leaves the TEE through the host, so these events are diagnostics: the pool's own records, the sealed analysis log and the chain are the audit trail users rely on.
+Every mutation, failed mutation, admin read, definition preview and analysis request (options, search or query) logs exactly one event with target `audit` when it completes, for operators to query in Azure Monitor. An event carries only `event` (for example `credential_issued`), `outcome` (`success` or `failure`), `code` on failure, `request_id`, `user_id`, and where relevant `pool`, `record_id`, `wallet_id`, `rows` and `signature`; never CSV content, emails, free-text reasons, keys or client IP addresses. The output leaves the TEE through the host, so these events are diagnostics: the pool's own records, the sealed analysis log and the chain are the audit trail users rely on.
 
 ### Errors
 
@@ -115,7 +115,11 @@ Clients verify the signature against the manifest key pinned for the environment
 
 ### Pools
 
+`POST /v1/drt/analyses/preview` (`pools:create`) takes `{ code_repo_url, code_hash_hex }` and returns `{ analysis_id, display_name, fields: [{ name, field_type, nullable }] }`. It checks the same URL allowlist, nonzero SHA-256 and definition format as pool creation, allowing a client to validate a CSV before creating a pool. It needs neither a wallet nor an `Idempotency-Key`, stores no definition or pool, and sends no transaction. Invalid inputs return 400; a temporarily unavailable definition returns 503.
+
 `POST /v1/drt/pools/malta` takes `{ wallet_id, pool_name, append_supply, analysis: { code_repo_url, code_hash_hex, supply } }`; `GET /v1/drt/pools/list`; `GET …/schema`, the analysis's columns; `POST …/initialize`, `…/issue` and `…/revoke`; `GET …/revocations`, `…/summary` and `…/issuance-log`. The summary, issuance log and revocations together are the pool's audit trail: who created it and when, with the creation signature; the initial upload; each issuance with its burn signature; and each revocation with who, when and why.
+
+The pool list accepts `search` (case-insensitive pool name), `state` (`ready` or `needs_init`), `sort`, `limit` and `cursor`. Sorts are `created_desc` (default), `created_asc`, `name_asc`, `name_desc`, `credentials_desc` and `credentials_asc`; credential sorts count uploaded rows. Ties use the pool address. Keep the same filters and sort when following `next_cursor`, and reset the cursor when either changes.
 
 ### Grants
 

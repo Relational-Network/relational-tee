@@ -694,6 +694,59 @@ pub(crate) mod tests {
         ))
     }
 
+    fn preview(token: &str, body: Value) -> Request<Body> {
+        Request::post("/v1/drt/analyses/preview")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn preview_checks_the_schema_without_a_wallet_or_persistent_changes() {
+        use crate::analysis::fetch::tests::AWARDS_REPORT_URL;
+
+        let worker = worker();
+        let token = admin_token("preview-admin");
+        sign_in(&worker.app, &token).await;
+        let hash = awards_report_hash();
+        let body = json!({ "code_repo_url": AWARDS_REPORT_URL, "code_hash_hex": hash });
+        let (status, _, result) = send(&worker.app, preview(&token, body)).await;
+        assert_eq!(status, StatusCode::OK, "{result}");
+        assert_eq!(result["analysis_id"], "awards-report-v1");
+        assert_eq!(
+            result["fields"],
+            serde_json::to_value(crate::data_validation::tests::awards_schema()).unwrap()
+        );
+        assert!(worker.storage.scripts().get(&hash).await.unwrap().is_none());
+        assert!(worker.storage.pools().all().await.unwrap().is_empty());
+        assert!(worker.chain.sent().is_empty());
+    }
+
+    #[tokio::test]
+    async fn preview_requires_create_permission_and_refuses_bad_definitions() {
+        use crate::analysis::fetch::tests::AWARDS_REPORT_URL;
+
+        let worker = worker();
+        let hash = awards_report_hash();
+        let body = json!({ "code_repo_url": AWARDS_REPORT_URL, "code_hash_hex": hash });
+        let token = Spec::valid(&config()).sign(entra_key()).unwrap();
+        let (status, _, _) = send(&worker.app, preview(&token, body)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let token = admin_token("preview-admin");
+        for (url, hash) in [
+            ("http://127.0.0.1/schema.toml", hash.as_str()),
+            (AWARDS_REPORT_URL, "not-a-hash"),
+            (AWARDS_REPORT_URL, &"00".repeat(32)),
+            (AWARDS_REPORT_URL, &"ab".repeat(32)),
+        ] {
+            let body = json!({ "code_repo_url": url, "code_hash_hex": hash });
+            let (status, _, error) = send(&worker.app, preview(&token, body)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+        }
+        assert!(worker.chain.sent().is_empty());
+    }
+
     #[tokio::test]
     async fn a_pool_takes_its_schema_and_execute_drt_from_its_analysis() {
         use crate::analysis::fetch::tests::AWARDS_REPORT_URL;
@@ -877,6 +930,21 @@ pub(crate) mod tests {
         let (_, _, body) = list("state=needs_init").await;
         assert_eq!(pools(&body), [fresh.to_string()]);
         let (_, _, body) = list("sort=credentials_desc").await;
+        assert_eq!(pools(&body), [ready.to_string(), fresh.to_string()]);
+        let (_, _, body) = list("sort=credentials_asc").await;
+        assert_eq!(pools(&body), [fresh.to_string(), ready.to_string()]);
+        worker
+            .storage
+            .pools()
+            .update::<ApiError>(&fresh.to_string(), |doc| {
+                doc.pool_name = "Alpha".into();
+                Ok(Change::Changed)
+            })
+            .await
+            .unwrap();
+        let (_, _, body) = list("sort=name_asc").await;
+        assert_eq!(pools(&body), [fresh.to_string(), ready.to_string()]);
+        let (_, _, body) = list("sort=name_desc").await;
         assert_eq!(pools(&body), [ready.to_string(), fresh.to_string()]);
 
         for query in ["state=open", "sort=newest"] {

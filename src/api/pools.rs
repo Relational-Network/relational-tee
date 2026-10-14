@@ -5,7 +5,8 @@
 //!
 //! - `POST /v1/drt/pools/malta` — atomic create (pool + its analysis)
 
-use axum::{extract::State, http::StatusCode, response::Response};
+use axum::{extract::State, http::StatusCode, response::Response, Json};
+use serde::{Deserialize, Serialize};
 use solana_instruction::Instruction;
 use solana_keypair::Keypair;
 use solana_message::Message;
@@ -15,6 +16,7 @@ use solana_transaction::Transaction;
 use std::collections::BTreeMap;
 use std::str::FromStr;
 use tracing::info;
+use utoipa::ToSchema;
 
 use crate::audit;
 use crate::auth::{Caller, Permission};
@@ -93,12 +95,18 @@ pub(crate) fn explorer_url(state: &AppState, sig: &str) -> String {
 }
 
 /// The analysis definition at `url`, which must hash to `hash`: stored by an
-/// earlier attempt, or else fetched. Either way it is checked, then stored.
+/// earlier attempt, or else fetched. Reading a preview never stores it.
 async fn load_definition(
     state: &AppState,
     url: &str,
     hash: &[u8; 32],
-) -> Result<Definition, ApiError> {
+) -> Result<(Definition, Vec<u8>), ApiError> {
+    check_url(url).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    if hash == &[0; 32] {
+        return Err(ApiError::bad_request(
+            "code_hash_hex must be the definition's SHA-256",
+        ));
+    }
     let bytes = match state.storage.scripts().get(&hex::encode(hash)).await? {
         Some(bytes) => bytes,
         None => {
@@ -120,8 +128,55 @@ async fn load_definition(
     };
     let definition = Definition::parse(&bytes)
         .map_err(|e| ApiError::bad_request(format!("the analysis isn't valid: {e}")))?;
-    state.storage.scripts().put(&bytes).await?;
-    Ok(definition)
+    Ok((definition, bytes))
+}
+
+/// The immutable definition selected for a new pool.
+#[derive(Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PreviewAnalysisRequest {
+    pub code_repo_url: String,
+    pub code_hash_hex: String,
+}
+
+/// CSV requirements, without creating a pool or exposing its SQL.
+#[derive(Serialize, ToSchema)]
+pub struct PreviewAnalysisResponse {
+    pub analysis_id: String,
+    pub display_name: String,
+    pub fields: Vec<crate::data_validation::FieldSchema>,
+}
+
+/// Preview a checked definition before selecting and validating a CSV.
+#[utoipa::path(
+    post,
+    path = "/v1/drt/analyses/preview",
+    tag = "DRT Pools",
+    summary = "Preview an analysis definition",
+    description = "Check an allowlisted definition and its SHA-256, then return its CSV schema. Needs pools:create, but no wallet or Idempotency-Key. Creates no pool, stores no definition, and sends no transaction.",
+    security(("bearer_auth" = [])),
+    request_body = PreviewAnalysisRequest,
+    responses(
+        (status = 200, description = "Checked definition and CSV schema", body = PreviewAnalysisResponse),
+        (status = 400, description = "Invalid URL, hash or definition"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Needs pools:create"),
+        (status = 503, description = "Definition could not be fetched")
+    )
+)]
+pub async fn preview_analysis(
+    caller: Caller,
+    State(state): State<AppState>,
+    JsonBody { value: body, .. }: JsonBody<PreviewAnalysisRequest>,
+) -> Result<Json<PreviewAnalysisResponse>, ApiError> {
+    caller.require(Permission::PoolsCreate)?;
+    let hash = parse_code_hash(&body.code_hash_hex)?;
+    let (definition, _) = load_definition(&state, &body.code_repo_url, &hash).await?;
+    Ok(Json(PreviewAnalysisResponse {
+        fields: definition.schema(),
+        analysis_id: definition.analysis_id,
+        display_name: definition.display_name,
+    }))
 }
 
 /// The one transaction that creates a pool: compute budget, `create_pool`,
@@ -211,7 +266,9 @@ pub async fn create_malta_pool(
     }
     let (wallet, keypair) =
         load_wallet_keypair(&state, &payload.wallet_id, &caller.user_id).await?;
-    let definition = load_definition(&state, &analysis.code_repo_url, &code_hash).await?;
+    let (definition, definition_bytes) =
+        load_definition(&state, &analysis.code_repo_url, &code_hash).await?;
+    state.storage.scripts().put(&definition_bytes).await?;
     let resolved = validate_drt_requests(&[
         DrtRequest {
             name: APPEND_DRT_NAME.to_string(),

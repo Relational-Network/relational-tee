@@ -221,6 +221,7 @@ pub fn wallet_router() -> Router<AppState> {
 pub fn drt_router() -> Router<AppState> {
     Router::new()
         // ── Atomic create (new contract) ─────────────────────────
+        .route("/v1/drt/analyses/preview", post(pools::preview_analysis))
         .route("/v1/drt/pools/malta", post(pools::create_malta_pool))
         // ── Schema, from the pool's analysis ─────────────────────
         .route(
