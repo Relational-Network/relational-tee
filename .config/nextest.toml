@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Relational Network
+
+[profile.default]
+# How long a test's output may stay open after its process exits before
+# nextest calls the test leaky. No test starts a process that outlives it,
+# but on a loaded machine (the gates after clippy, or CI) closing the pipes
+# can take longer than nextest's 100 ms default, which flagged a test that
+# starts nothing at all.
+leak-timeout = "500ms"
