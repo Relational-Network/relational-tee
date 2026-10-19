@@ -230,6 +230,37 @@ faults *args: dev-keys
     STACK_UID=$(id -u) STACK_GID=$(id -g) docker compose -f compose.yaml -f dev/compose.faults.yaml up -d --wait
     cargo run --features dev -- faults "$@"
 
+# Run the load run against the stack's first worker, which it (re)starts with
+# a deployed worker's CPU and memory and a port of its own (127.0.0.1:8444),
+# then print the container's peak memory and fail if it was killed or
+# restarted. Needs `just image-dev` first, and devnet SOL in the suite's
+# wallet, as `just faults` does. `just load --help` lists the options.
+[positional-arguments]
+load *args: dev-keys
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export STACK_UID=$(id -u) STACK_GID=$(id -g)
+    docker compose -f compose.yaml -f dev/compose.load.yaml up -d --wait
+    worker=$(docker compose ps -q worker1)
+    restarts=$(docker inspect -f '{{{{.RestartCount}}' "$worker")
+    samples=$(mktemp)
+    (while sleep 1; do
+        docker stats --no-stream --format '{{{{.MemUsage}}' "$worker" >> "$samples" 2>/dev/null || true
+    done) &
+    sampler=$!
+    trap 'kill "$sampler" 2>/dev/null || true; rm -f "$samples"' EXIT
+    status=0
+    LOAD_API=http://127.0.0.1:8444 cargo run --features dev -- load "$@" || status=$?
+    kill "$sampler" 2>/dev/null || true
+    peak=$(awk '{ n = $1; unit = $1; gsub(/[A-Za-z]/, "", n); gsub(/[0-9.]/, "", unit)
+        mib = unit == "GiB" ? n * 1024 : unit == "KiB" ? n / 1024 : unit == "B" ? n / 1048576 : n
+        if (mib > peak) peak = mib } END { printf "%.0f", peak }' "$samples")
+    killed=$(docker inspect -f '{{{{.State.OOMKilled}}' "$worker")
+    restarted=$(( $(docker inspect -f '{{{{.RestartCount}}' "$worker") - restarts ))
+    echo "load: worker1's peak memory ${peak} MiB of 3072; out-of-memory kill: $killed; restarts: $restarted"
+    if [[ "$killed" == true || "$restarted" != 0 ]]; then status=1; fi
+    exit "$status"
+
 # Build the canonical x86_64-linux image and load it into Docker.
 image: (_nix-image "linux/amd64" "x86_64-linux" "image")
 

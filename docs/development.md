@@ -49,6 +49,7 @@ just            # list the recipes
 | `just image-dev` | Build the aarch64-linux dev image and load it into Docker as `relational-tee:dev` |
 | `just stack-up` | Start the local stack (needs `just image-dev`): Azurite, the fake SKR sidecar, three workers and a round-robin proxy on `127.0.0.1:8443`; `just stack-down` stops it |
 | `just faults` | Run the idempotency fault-injection suite against the local stack, which it (re)starts with fault injection on and a fast reconciler (see [Fault injection](#fault-injection)); `--runs N` sets the randomised runs |
+| `just load` | Load the stack's first worker, held to a deployed worker's CPU and memory, with queries, uploads and an overload, and report latencies, refusals and its peak memory (see [The load run](#the-load-run)) |
 
 ## Running locally
 
@@ -138,3 +139,11 @@ Chain steps run on devnet, so the suite user's wallet in the stack needs about 0
 
 Release builds can't inject faults, so against a deployment the suite runs without kills. Set `FAULTS_API` to the deployment's API and `FAULTS_TOKEN` to an access token for it, from a user with the `Admin` role, and run `cargo run --features dev -- faults` (or the dev binary). The suite then acts as that user, with their wallet, which needs the same 0.2 devnet SOL. It runs the replays, the concurrent attempts, the reused key and the randomised runs without crashes, and skips what needs users made up on the spot (wallet creation, two users with one key). Grants go to `FAULTS_ANALYST_USER_ID`, a user the deployment already knows (the admin finds their `user_id` with `GET /v1/users?email=`); without it the randomised runs make no grants. A `429` from the deployment's per-address limit is waited out as its `Retry-After` asks. Entra access tokens last about an hour, which covers a 20-run pass.
 
+## The load run
+
+`just load` restarts the stack with `dev/compose.load.yaml` layered on, which holds the first worker to a deployed worker's 2 vCPU and 3 GiB (its memory budget is the default 2 GiB) and gives it a port of its own, `127.0.0.1:8444`. Every request reaches it from one address, which a deployment would rate-limit as a single client, so the overlay raises its per-address limits: the run loads the worker, not the limiter. Then `relational-tee load`, as the fault suite's user:
+1. creates a pool, uploads `--rows` synthetic rows (100,000) spread over eight employer groups, and grants `--analysts` analysts (3) one group each, so each sees a table of their own;
+2. for `--seconds` (120) runs, all at once, `--clients` clients (32) opening and querying the analysis as the admin or an analyst with random filters, sorts and pages; `--uploaders` clients (2) issuing `--upload-rows` rows (50,000) at a time, each of which makes every table build again; and a probe of `/health/ready` five times a second;
+3. then, with the probe still running, opens `--slow` uploads (24) at once that each declare the largest body and send it a byte every half second, more than the memory budget holds, so those it can't hold must get `503 worker_busy`.
+
+It prints each kind's outcomes, with one message of each refusal, and latency percentiles, and fails if a request got anything but an answer or a defined refusal (`503 worker_busy`, `analysis_busy`, `pool_settling` or `rpc_unavailable`, `422 too_large_for_memory`, `413 pool_full`, `409 conflict`, a `429`), if a health probe failed or its p99 passed a second, or if the overload got no `503 worker_busy`. The recipe samples the container's memory every second, prints the peak, and fails if the worker was killed for its memory or restarted. Its pool creation, grants and uploads run on devnet, so it needs the suite's wallet funded, as `just faults` does. A Mac's cores are faster than a deployment's, so the latencies flatter it; the memory and the refusals are what carry over.

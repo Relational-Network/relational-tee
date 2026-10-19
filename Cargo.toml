@@ -14,7 +14,8 @@ resolver = "3"
 [features]
 default = []
 # Dev builds: plain HTTP, dev keys, and the fake SKR sidecar and MAA signer.
-dev = ["dep:aws-lc-rs"]
+# The load run opens raw connections for its slow uploads.
+dev = ["dep:aws-lc-rs", "tokio/net", "tokio/io-util"]
 swagger-ui = ["dep:utoipa-swagger-ui"]
 
 [dependencies]
