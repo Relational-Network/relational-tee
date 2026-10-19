@@ -207,6 +207,7 @@ An analysis shows admins every row. An analyst sees only the rows of their grant
         history::WalletTransaction,
         history::TokenType,
         history::TxStatus,
+        history::TxDirection,
         blockchain::types::TokenBalance,
         // DRT schemas (new contract)
         blockchain::drt::types::AnalysisRequest,

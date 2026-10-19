@@ -120,6 +120,37 @@ pub struct ScopeTarget {
     pub value: String,
 }
 
+/// Where a grant stands: `active`; `revoking` (access has ended, and the
+/// Grant PDA's close hasn't been recorded yet: revoke again to finish it);
+/// or `revoked`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GrantStatus {
+    Active,
+    Revoking,
+    Revoked,
+}
+
+/// What the chain last showed at a grant's Grant PDA: `live` (the program's
+/// Grant for the pool's Execute DRT), `closed`, or `unknown` when it hasn't
+/// been read and couldn't be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GrantOnChain {
+    Live,
+    Closed,
+    Unknown,
+}
+
+/// How the caller runs an analysis: `admin`, every row, with no grant; or
+/// `grant`, the rows their grant's employer scope allows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Access {
+    Admin,
+    Grant,
+}
+
 /// One setting of a grant's targets.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ScopeChange {
@@ -147,9 +178,7 @@ pub struct GrantEntry {
     pub scope_revision: usize,
     /// Every setting of the targets, oldest first.
     pub scope_history: Vec<ScopeChange>,
-    /// `active`, `revoking` (access has ended, and the Grant PDA's close
-    /// hasn't been recorded yet: revoke again to finish it) or `revoked`.
-    pub status: String,
+    pub status: GrantStatus,
     /// The `user_id` of the admin who granted it. Empty for a burn found
     /// on-chain that no request recorded, which a revocation recorded.
     pub granted_by: String,
@@ -168,10 +197,7 @@ pub struct GrantEntry {
     pub revoke_signature: Option<String>,
     /// The grant's Grant PDA, the on-chain receipt of its burn.
     pub grant_pda: String,
-    /// What the chain last showed at the Grant PDA: `live` (the program's
-    /// Grant for the pool's Execute DRT), `closed`, or `unknown` when it
-    /// hasn't been read and couldn't be.
-    pub on_chain: String,
+    pub on_chain: GrantOnChain,
     /// When the chain was last read for it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verified_at: Option<DateTime<Utc>>,
@@ -191,9 +217,7 @@ pub struct MyAnalysis {
     pub pool_name: String,
     pub analysis_id: String,
     pub display_name: String,
-    /// `admin`: every row, with no grant; `grant`: the rows the caller's
-    /// employer scope allows.
-    pub access: String,
+    pub access: Access,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub granted_at: Option<DateTime<Utc>>,
 }
@@ -361,11 +385,10 @@ fn entry(
             })
             .collect(),
         status: match revoked {
-            None => "active",
-            Some(r) if r.signature.is_none() => "revoking",
-            Some(_) => "revoked",
-        }
-        .into(),
+            None => GrantStatus::Active,
+            Some(r) if r.signature.is_none() => GrantStatus::Revoking,
+            Some(_) => GrantStatus::Revoked,
+        },
         granted_by: grant.granted_by.clone(),
         granted_at: grant.granted_at,
         explorer_url: signature.as_deref().map(|s| explorer_url(state, s)),
@@ -378,11 +401,10 @@ fn entry(
             .map(|c| derive_grant_pda(&c).0.to_string())
             .unwrap_or_default(),
         on_chain: match seen {
-            Some(seen) if seen.live => "live",
-            Some(_) => "closed",
-            None => "unknown",
-        }
-        .into(),
+            Some(seen) if seen.live => GrantOnChain::Live,
+            Some(_) => GrantOnChain::Closed,
+            None => GrantOnChain::Unknown,
+        },
         verified_at: seen.map(|s| s.at),
     }
 }
@@ -1144,7 +1166,7 @@ pub async fn my_analyses(
             pool_name: doc.pool_name.clone(),
             analysis_id: analysis.analysis_id.clone(),
             display_name: analysis.display_name.clone(),
-            access: if admin { "admin" } else { "grant" }.into(),
+            access: if admin { Access::Admin } else { Access::Grant },
             granted_at,
         });
     }
