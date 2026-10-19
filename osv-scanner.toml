@@ -9,3 +9,18 @@
 id = "RUSTSEC-2025-0141"
 ignoreUntil = 2027-01-12
 reason = "bincode 1 is unmaintained and has no fixed release. The worker serializes Solana transactions with it, to send them and to store them for retries, and Solana's crates depend on it; a replacement must keep that wire format."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0367"
+ignoreUntil = 2027-01-19
+reason = "zip 3 extracts SUID/SGID bits from an archive unchecked. Only utoipa-swagger-ui's build script uses it, to unpack the Swagger UI archive of utoipa-swagger-ui-vendored, which Cargo.lock pins by checksum, and only for the dev-only swagger-ui feature; release builds contain neither. No utoipa-swagger-ui release uses zip 9 or later."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0368"
+ignoreUntil = 2027-01-19
+reason = "zip 3 extracts symbolic links that point outside the destination. Only utoipa-swagger-ui's build script uses it, to unpack the Swagger UI archive of utoipa-swagger-ui-vendored, which Cargo.lock pins by checksum, and only for the dev-only swagger-ui feature; release builds contain neither. No utoipa-swagger-ui release uses zip 9 or later."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0369"
+ignoreUntil = 2027-01-19
+reason = "zip 3 applies Unix permissions through symbolic links when extracting. Only utoipa-swagger-ui's build script uses it, to unpack the Swagger UI archive of utoipa-swagger-ui-vendored, which Cargo.lock pins by checksum, and only for the dev-only swagger-ui feature; release builds contain neither. No utoipa-swagger-ui release uses zip 9 or later."
