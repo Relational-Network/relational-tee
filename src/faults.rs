@@ -40,6 +40,8 @@ use crate::http_client::HttpClient;
 use crate::seal;
 use crate::tee::dev_rsa::RsaSigner;
 
+pub mod load;
+
 const USAGE: &str = "usage: relational-tee faults [--runs N]
 
 Runs the idempotency fault-injection suite against FAULTS_API (default

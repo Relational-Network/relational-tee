@@ -358,7 +358,8 @@ fn openapi_document() -> String {
 /// key files, `relational-tee dev-token …` prints a token signed with the dev
 /// token signing key, `relational-tee dev-manifest …` signs and stores a dev
 /// reference-values manifest, `relational-tee fake-skr` runs the fake SKR
-/// sidecar, and `relational-tee faults` runs the fault-injection suite.
+/// sidecar, `relational-tee faults` runs the fault-injection suite, and
+/// `relational-tee load` runs the load run.
 /// Returns the exit code when the arguments name a command.
 #[cfg(feature = "dev")]
 async fn run_dev_command(args: &[String]) -> Option<i32> {
@@ -402,10 +403,11 @@ async fn run_dev_command(args: &[String]) -> Option<i32> {
         "dev-token" => Some(auth::dev_token::run(&args[2..])),
         "dev-manifest" => Some(reference_values::dev::run(&args[2..]).await),
         "faults" => Some(faults::run(&args[2..]).await),
+        "load" => Some(faults::load::run(&args[2..]).await),
         other => {
             eprintln!(
                 "error: unknown command {other:?} (dev commands: dev-keys, dev-token, \
-                 dev-manifest, fake-skr, faults)"
+                 dev-manifest, fake-skr, faults, load)"
             );
             Some(2)
         }

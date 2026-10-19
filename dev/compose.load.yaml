@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Relational Network
+
+# The load run's settings for the local stack (`just load`), layered over
+# compose.yaml: the first worker gets a deployed worker's CPU and memory
+# (deploy/worker.json: 2 vCPU and 3 GiB) and a port of its own on the host,
+# 127.0.0.1:8444, so the load reaches it alone. Its memory budget is the
+# default 2 GiB. Every request reaches it from one address, which a
+# deployment would rate-limit as one client, so its per-address limits are
+# raised to load the worker rather than the limiter.
+
+services:
+  worker1:
+    cpus: 2
+    mem_limit: 3g
+    memswap_limit: 3g
+    environment:
+      RATE_LIMIT_IP_PER_SECOND: "10000"
+      RATE_LIMIT_IP_BURST: "10000"
+      RATE_LIMIT_USER_MUTATIONS_PER_SECOND: "1000"
+    ports:
+      - 127.0.0.1:8444:8443
