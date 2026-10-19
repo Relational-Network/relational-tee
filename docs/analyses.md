@@ -70,6 +70,17 @@ Decrypted datasets are cached by upload and tables by version and scope, each lo
 
 About one table build, page or search per CPU runs at a time, and a table runs one request's work at a time, which waits for its turn before it takes a thread, so requests queued for a busy table never hold the threads other tables need; one that can't start within a second gets `503 analysis_busy` with `Retry-After`. A request's other CPU-heavy steps, such as opening a sealed upload, hashing it, validating its CSV and sealing it for storage, run off the threads that serve requests, so health checks and other requests keep being answered.
 
+### Selecting blank values
+
+A multi-select may return an option with `value: ""`, meaning an empty CSV
+cell (SQL NULL). Send `{ "mode": "selected", "values": [""] }` to select
+only blanks, or include named values in the same array to select their union.
+The option's count and all dependent options, searches and distinct counts
+follow the same filters and grant scope. An empty array remains invalid;
+`mode: "all"` removes the filter. Identifier searches accept only non-empty
+selections. The definition's options SQL decides which choices it offers;
+existing pinned definitions remain unchanged.
+
 ## Dates
 
 DD/MM/YYYY in the CSV and the API, in filters, options and rows; `YYYY-MM-DD` only inside SQLite, so ranges and sorting work.

@@ -1,0 +1,56 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Relational Network
+
+analysis_id = "exam-modules-v1"
+display_name = "Exam Modules"
+relation = "exam_modules"
+
+[columns]
+staff_number = { header = "Staff Number", type = "text" }
+membership_number = { header = "Membership Number", type = "text" }
+title = { header = "Title", type = "text" }
+first_name = { header = "First Name", type = "text" }
+surname = { header = "Surname", type = "text" }
+date_of_birth = { header = "Date of Birth", type = "date" }
+employer = { header = "Employer", type = "text" }
+employer_group = { header = "Employer Group", type = "text" }
+module = { header = "Module", type = "text" }
+exam_date = { header = "Exam Date", type = "date" }
+
+[scope]
+employer = "employer"
+employer_group = "employer_group"
+
+[filters]
+staff_number = "search_select"
+membership_number = "search_select"
+
+[output]
+columns = [
+    "staff_number", "membership_number", "title", "first_name",
+    "surname", "date_of_birth", "employer", "employer_group",
+    "module", "exam_date",
+]
+default_sort = { column = "exam_date", direction = "desc" }
+page_size = { default = 100, max = 500 }
+
+[sql]
+rows = '''
+SELECT _record_id, staff_number, membership_number, title, first_name, surname, date_of_birth,
+       employer, employer_group, module, exam_date
+FROM exam_modules
+WHERE (:staff_number IS NULL OR staff_number IN (SELECT value FROM json_each(:staff_number)))
+  AND (:membership_number IS NULL OR membership_number IN (SELECT value FROM json_each(:membership_number)))
+'''
+
+[sql.options]
+staff_number = '''
+SELECT staff_number AS value
+FROM exam_modules WHERE staff_number LIKE :search || '%' ESCAPE '\'
+GROUP BY staff_number ORDER BY staff_number LIMIT :limit
+'''
+membership_number = '''
+SELECT membership_number AS value
+FROM exam_modules WHERE membership_number LIKE :search || '%' ESCAPE '\'
+GROUP BY membership_number ORDER BY membership_number LIMIT :limit
+'''

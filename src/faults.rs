@@ -69,10 +69,10 @@ const BOUNDARY: &str = "fault-suite-boundary";
 const SAGA_POINTS: [&str; 5] = ["staged", "tx_stored", "tx_sent", "tx_confirmed", "recorded"];
 
 /// Every pool's analysis, which the stack's workers fetch from GitHub, so
-/// `main` must hold this file as it is here.
+/// its published commit must hold the same bytes as the local definition.
 const AWARDS_REPORT_URL: &str = "https://raw.githubusercontent.com/relational-network/\
-    relational-tee/main/drt-examples/awards-report/awards-report-v1.toml";
-const AWARDS_REPORT: &str = include_str!("../drt-examples/awards-report/awards-report-v1.toml");
+    relational-tee/c5e61d6cb3cdf9dbea779f09c9404e62dee56807/drt-examples/awards-report/awards-report-v1.toml";
+const AWARDS_REPORT: &str = include_str!("../drt-examples/awards-report-v1.toml");
 /// Its Execute DRT's name.
 const ANALYSIS: &str = "awards-report-v1";
 

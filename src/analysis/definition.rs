@@ -580,8 +580,7 @@ fn check_statement(
 pub(crate) mod tests {
     use super::*;
 
-    pub(crate) const AWARDS_REPORT: &str =
-        include_str!("../../drt-examples/awards-report/awards-report-v1.toml");
+    pub(crate) const AWARDS_REPORT: &str = include_str!("../../drt-examples/awards-report-v1.toml");
 
     pub(crate) fn awards_report() -> Definition {
         Definition::parse(AWARDS_REPORT.as_bytes()).unwrap()

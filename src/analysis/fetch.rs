@@ -211,8 +211,7 @@ pub(crate) mod tests {
     /// The Awards Report's URL in tests.
     pub(crate) const AWARDS_REPORT_URL: &str =
         "https://raw.githubusercontent.com/relational-network/\
-        relational-tee/0123456789abcdef0123456789abcdef01234567/drt-examples/awards-report/\
-        awards-report-v1.toml";
+        relational-tee/0123456789abcdef0123456789abcdef01234567/drt-examples/awards-report-v1.toml";
 
     /// Serves fixed files, and counts fetches.
     #[derive(Default)]

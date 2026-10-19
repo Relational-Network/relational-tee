@@ -1,0 +1,75 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Relational Network
+
+analysis_id = "mcc-categories-v1"
+display_name = "MCC Categories"
+relation = "mcc_categories"
+
+[columns]
+staff_number = { header = "Staff Number", type = "text" }
+membership_number = { header = "Membership Number", type = "text" }
+title = { header = "Title", type = "text" }
+first_name = { header = "First Name", type = "text" }
+surname = { header = "Surname", type = "text" }
+date_of_birth = { header = "Date of Birth", type = "date" }
+employer = { header = "Employer", type = "text" }
+employer_group = { header = "Employer Group", type = "text" }
+designation = { header = "Designation", type = "text" }
+designation_status = { header = "Designation Status", type = "text" }
+date_designated = { header = "Date Designated", type = "date" }
+category_name = { header = "Category Name", type = "text" }
+category_type = { header = "Category Type", type = "text" }
+category_date_accredited = { header = "Category Date Accredited", type = "date" }
+shortfall_warning_status = { header = "Shortfall Warning Status", type = "text" }
+
+[scope]
+employer = "employer"
+employer_group = "employer_group"
+
+[filters]
+designation = "multi_select"
+category_date_accredited = "date_range"
+staff_number = "search_select"
+membership_number = "search_select"
+
+[output]
+columns = [
+    "staff_number", "membership_number", "title", "first_name",
+    "surname", "date_of_birth", "employer", "employer_group",
+    "designation", "designation_status", "date_designated", "category_name",
+    "category_type", "category_date_accredited", "shortfall_warning_status",
+]
+default_sort = { column = "category_date_accredited", direction = "desc" }
+page_size = { default = 100, max = 500 }
+
+[sql]
+rows = '''
+SELECT _record_id, staff_number, membership_number, title, first_name, surname, date_of_birth,
+       employer, employer_group, designation, designation_status, date_designated,
+       category_name, category_type, category_date_accredited, shortfall_warning_status
+FROM mcc_categories
+WHERE (:designation IS NULL OR coalesce(designation, '') IN (SELECT value FROM json_each(:designation)))
+  AND (:category_date_accredited_from IS NULL OR category_date_accredited >= :category_date_accredited_from)
+  AND (:category_date_accredited_to IS NULL OR category_date_accredited <= :category_date_accredited_to)
+  AND (:staff_number IS NULL OR staff_number IN (SELECT value FROM json_each(:staff_number)))
+  AND (:membership_number IS NULL OR membership_number IN (SELECT value FROM json_each(:membership_number)))
+'''
+
+[sql.options]
+designation = '''
+SELECT coalesce(designation, '') AS value, count(*) AS count
+FROM mcc_categories GROUP BY designation ORDER BY value
+'''
+category_date_accredited = '''
+SELECT min(category_date_accredited) AS min, max(category_date_accredited) AS max FROM mcc_categories
+'''
+staff_number = '''
+SELECT staff_number AS value
+FROM mcc_categories WHERE staff_number LIKE :search || '%' ESCAPE '\'
+GROUP BY staff_number ORDER BY staff_number LIMIT :limit
+'''
+membership_number = '''
+SELECT membership_number AS value
+FROM mcc_categories WHERE membership_number LIKE :search || '%' ESCAPE '\'
+GROUP BY membership_number ORDER BY membership_number LIMIT :limit
+'''

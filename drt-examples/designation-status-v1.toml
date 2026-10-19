@@ -1,0 +1,91 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Relational Network
+
+analysis_id = "designation-status-v1"
+display_name = "Designation Status"
+relation = "designation_status"
+
+[columns]
+staff_number = { header = "Staff Number", type = "text" }
+membership_number = { header = "Membership Number", type = "text" }
+title = { header = "Title", type = "text" }
+first_name = { header = "First Name", type = "text" }
+surname = { header = "Surname", type = "text" }
+date_of_birth = { header = "Date of Birth", type = "date" }
+employer = { header = "Employer", type = "text" }
+employer_group = { header = "Employer Group", type = "text" }
+designation = { header = "Designation", type = "text" }
+current_status = { header = "Current Status", type = "text" }
+previous_status = { header = "Previous Status", type = "text" }
+status_update_date = { header = "Status Update Date", type = "date" }
+reason_for_change = { header = "Reason for Change", type = "text" }
+
+[scope]
+employer = "employer"
+employer_group = "employer_group"
+
+[filters]
+designation = "multi_select"
+current_status = "multi_select"
+previous_status = "multi_select"
+status_update_date = "date_range"
+reason_for_change = "multi_select"
+staff_number = "search_select"
+membership_number = "search_select"
+
+[output]
+columns = [
+    "staff_number", "membership_number", "title", "first_name",
+    "surname", "date_of_birth", "employer", "employer_group",
+    "designation", "current_status", "previous_status", "status_update_date",
+    "reason_for_change",
+]
+default_sort = { column = "status_update_date", direction = "desc" }
+page_size = { default = 100, max = 500 }
+
+[sql]
+rows = '''
+SELECT _record_id, staff_number, membership_number, title, first_name, surname, date_of_birth,
+       employer, employer_group, designation, current_status, previous_status,
+       status_update_date, reason_for_change
+FROM designation_status
+WHERE (:designation IS NULL OR coalesce(designation, '') IN (SELECT value FROM json_each(:designation)))
+  AND (:current_status IS NULL OR coalesce(current_status, '') IN (SELECT value FROM json_each(:current_status)))
+  AND (:previous_status IS NULL OR coalesce(previous_status, '') IN (SELECT value FROM json_each(:previous_status)))
+  AND (:status_update_date_from IS NULL OR status_update_date >= :status_update_date_from)
+  AND (:status_update_date_to IS NULL OR status_update_date <= :status_update_date_to)
+  AND (:reason_for_change IS NULL OR coalesce(reason_for_change, '') IN (SELECT value FROM json_each(:reason_for_change)))
+  AND (:staff_number IS NULL OR staff_number IN (SELECT value FROM json_each(:staff_number)))
+  AND (:membership_number IS NULL OR membership_number IN (SELECT value FROM json_each(:membership_number)))
+'''
+
+[sql.options]
+designation = '''
+SELECT coalesce(designation, '') AS value, count(*) AS count
+FROM designation_status GROUP BY designation ORDER BY value
+'''
+current_status = '''
+SELECT coalesce(current_status, '') AS value, count(*) AS count
+FROM designation_status GROUP BY current_status ORDER BY value
+'''
+previous_status = '''
+SELECT coalesce(previous_status, '') AS value, count(*) AS count
+FROM designation_status GROUP BY previous_status ORDER BY value
+'''
+status_update_date = '''
+SELECT min(status_update_date) AS min, max(status_update_date) AS max FROM designation_status
+'''
+reason_for_change = '''
+SELECT coalesce(reason_for_change, '') AS value, count(*) AS count
+FROM designation_status GROUP BY reason_for_change ORDER BY value
+'''
+staff_number = '''
+SELECT staff_number AS value
+FROM designation_status WHERE staff_number LIKE :search || '%' ESCAPE '\'
+GROUP BY staff_number ORDER BY staff_number LIMIT :limit
+'''
+membership_number = '''
+SELECT membership_number AS value
+FROM designation_status WHERE membership_number LIKE :search || '%' ESCAPE '\'
+GROUP BY membership_number ORDER BY membership_number LIMIT :limit
+'''
