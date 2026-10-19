@@ -31,7 +31,6 @@ use bytes::Bytes;
 use http_body_util::Full;
 use p256::elliptic_curve::rand_core::{OsRng, RngCore};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use solana_pubkey::Pubkey;
 
 use crate::blockchain::counter::{self, counter_address};
@@ -68,11 +67,12 @@ const BOUNDARY: &str = "fault-suite-boundary";
 /// The saga steps a pool creation or an issuance can crash after.
 const SAGA_POINTS: [&str; 5] = ["staged", "tx_stored", "tx_sent", "tx_confirmed", "recorded"];
 
-/// Every pool's analysis, which the stack's workers fetch from GitHub, so
-/// its published commit must hold the same bytes as the local definition.
+/// A published analysis for the suite's pools. Keep the URL and hash paired:
+/// local definition edits must not break a suite run before publication.
 const AWARDS_REPORT_URL: &str = "https://raw.githubusercontent.com/relational-network/\
     relational-tee/c5e61d6cb3cdf9dbea779f09c9404e62dee56807/drt-examples/awards-report/awards-report-v1.toml";
-const AWARDS_REPORT: &str = include_str!("../drt-examples/awards-report-v1.toml");
+const AWARDS_REPORT_HASH_HEX: &str =
+    "707fffa5c459559693a645d1629d535db06264cfcb2aeb5140ed0316e66084d2";
 /// Its Execute DRT's name.
 const ANALYSIS: &str = "awards-report-v1";
 
@@ -369,7 +369,7 @@ impl Suite {
             "append_supply": supply,
             "analysis": {
                 "code_repo_url": AWARDS_REPORT_URL,
-                "code_hash_hex": hex::encode(Sha256::digest(AWARDS_REPORT)),
+                "code_hash_hex": AWARDS_REPORT_HASH_HEX,
                 "supply": execute_supply,
             },
         });

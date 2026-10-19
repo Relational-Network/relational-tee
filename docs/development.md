@@ -133,7 +133,7 @@ A dev worker started with `FAULT_INJECTION=on` honours an `X-Fault-Exit` request
 
 A transfer whose transaction no node reports any more isn't in the suite, because devnet can't be made to forget one; the fake chain's unit tests cover it (`chain::tests::an_expired_transfer_that_no_node_reports_is_judged_by_its_receipt`).
 
-Chain steps run on devnet, so the suite user's wallet in the stack needs about 0.2 devnet SOL; the suite stops at once and names the address if it holds less. Its pools take the Awards Report from a pinned published commit on GitHub, whose definition bytes must match the checkout's `drt-examples/awards-report-v1.toml`. The historical URL remains valid when the local file moves. The stack keeps its data in memory, so move any SOL left in that wallet elsewhere before `just stack-down`.
+Chain steps run on devnet, so the suite user's wallet in the stack needs about 0.2 devnet SOL; the suite stops at once and names the address if it holds less. Its pools take the Awards Report from a published commit on GitHub, with its URL and SHA-256 pinned together in `src/faults.rs`. The pair stays usable when the local definition moves or changes; update both together when adopting a newer published definition. The stack keeps its data in memory, so move any SOL left in that wallet elsewhere before `just stack-down`.
 
 ### Against a deployment
 

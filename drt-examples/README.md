@@ -61,7 +61,7 @@ changes; set dashboard URLs and hashes after publication and merge.
 
 | File | SHA-256 |
 |---|---|
-| [awards-report-v1.toml](awards-report-v1.toml) | `707fffa5c459559693a645d1629d535db06264cfcb2aeb5140ed0316e66084d2` |
+| [awards-report-v1.toml](awards-report-v1.toml) | `472eb4e1e11ff4f10270af7ab29638ddef8eaacd9264cd42c0483693c8481499` |
 | [cpd-audit-v1.toml](cpd-audit-v1.toml) | `888222526ccdd4504bedc5d12b3a5fe604f84de5a15d563b7fba9e130a736f2f` |
 | [cpd-report-v1.toml](cpd-report-v1.toml) | `ad5a0873766d29b043db8e1b89950ce85534d467badd8e5263ede47eacc4dfb7` |
 | [designation-status-v1.toml](designation-status-v1.toml) | `300f06f6c4f7379e9ce087a56bb6905b08961aa9ca56b4e0b69a5d0562ddcc47` |
