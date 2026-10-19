@@ -117,7 +117,7 @@ To rehearse a transport key rotation: move `dev/keys/transport-key.jwk` to `tran
 
 ## Fault injection
 
-A dev worker started with `FAULT_INJECTION=on` honours an `X-Fault-Exit` request header naming a point in a request: `staged` (a pool creation, issuance or grant staged its saga, or a grant's revocation was recorded), `tx_stored` (a chain step stored its signed transaction), `tx_sent`, `tx_confirmed`, or `recorded` (the request's last document write is done, its response isn't stored). When the request reaches that point, the process exits at once with status 137, as if it had been killed. Release builds contain none of this and refuse `FAULT_INJECTION`.
+A dev worker started with `FAULT_INJECTION=on` honours an `X-Fault-Exit` request header naming a point in a request: `staged` (a pool creation, issuance or grant staged its saga, a grant's revocation was recorded, or a scope edit opened its idempotency record), `tx_stored` (a chain step stored its signed transaction), `tx_sent`, `tx_confirmed`, or `recorded` (the request's last document write is done, its response isn't stored). When the request reaches that point, the process exits at once with status 137, as if it had been killed. Release builds contain none of this and refuse `FAULT_INJECTION`.
 
 `just faults` starts the local stack with `dev/compose.faults.yaml` layered on (fault injection on, and the reconciler running every 15 seconds for sagas older than 45 seconds), then runs `relational-tee faults` against the proxy. The suite calls the API as dev-token users, seals uploads to the stack's transport key, and crashes workers mid-request; compose restarts them, and the suite retries with the same `Idempotency-Key`. It checks that:
 - a replay returns the stored response and creates nothing, and a reused key with another body gets `422`;
@@ -126,6 +126,14 @@ A dev worker started with `FAULT_INJECTION=on` honours an `X-Fault-Exit` request
 - a worker killed after each step of a grant burns one Execute DRT and leaves one active grant, and one killed after each step of its revocation burns nothing and leaves it revoked;
 - after a crash between the burn and the pool document, with no retry, the reconciler adds the entry;
 - two users with one key get different IDs;
-- randomised runs across issue, pool creation, wallet creation, send and revoke, with duplicates, concurrent attempts and crashes, leave no double burn, double transfer, lost update or second wallet.
+- a scope edit killed after storing its anchor, with no retry, leaves the analyst with `503 pool_settling`, never the old rows, until a worker or the reconciler lands the pool's counter; the analyst then sees the new rows, the counter has risen by one, and a late retry of the edit mints nothing more;
+- randomised runs across issue, pool creation, wallet creation, send, credential revocation, grants, scope edits and grant revocations, with duplicates, concurrent attempts and crashes, leave no double burn, double transfer, lost update, second wallet or undone revocation, and move a grant's scope revision by exactly one per edit.
+
+A transfer whose transaction no node reports any more isn't in the suite, because devnet can't be made to forget one; the fake chain's unit tests cover it (`chain::tests::an_expired_transfer_that_no_node_reports_is_judged_by_its_receipt`).
 
 Chain steps run on devnet, so the suite user's wallet in the stack needs about 0.2 devnet SOL; the suite stops at once and names the address if it holds less. Its pools take the Awards Report from `main` on GitHub, so `main` must hold `drt-examples/awards-report/awards-report-v1.toml` as the checkout does. The stack keeps its data in memory, so move any SOL left in that wallet elsewhere before `just stack-down`.
+
+### Against a deployment
+
+Release builds can't inject faults, so against a deployment the suite runs without kills. Set `FAULTS_API` to the deployment's API and `FAULTS_TOKEN` to an access token for it, from a user with the `Admin` role, and run `cargo run --features dev -- faults` (or the dev binary). The suite then acts as that user, with their wallet, which needs the same 0.2 devnet SOL. It runs the replays, the concurrent attempts, the reused key and the randomised runs without crashes, and skips what needs users made up on the spot (wallet creation, two users with one key). Grants go to `FAULTS_ANALYST_USER_ID`, a user the deployment already knows (the admin finds their `user_id` with `GET /v1/users?email=`); without it the randomised runs make no grants. A `429` from the deployment's per-address limit is waited out as its `Retry-After` asks. Entra access tokens last about an hour, which covers a 20-run pass.
+

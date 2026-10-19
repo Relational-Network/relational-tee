@@ -997,6 +997,7 @@ pub async fn set_grant_scope(
     };
 
     op.begin().await?;
+    crate::fault::point("staged");
     let mut target = String::new();
     let doc = generation::update(&state.storage, &state.solana_client, &pool_pda_str, |doc| {
         let grant = doc
@@ -1032,6 +1033,7 @@ pub async fn set_grant_scope(
     })
     .await?
     .ok_or_else(|| pool_not_found(&pool_pda_str))?;
+    crate::fault::point("recorded");
     audit::grant(&target);
     let grant = doc
         .grants
