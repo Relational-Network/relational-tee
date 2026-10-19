@@ -12,7 +12,7 @@
 //!
 //! | Point | Reached |
 //! |---|---|
-//! | `staged` | after a pool creation or an issuance stages its saga |
+//! | `staged` | after a pool creation, issuance or grant stages its saga, a grant's revocation is recorded, or a scope edit opens its idempotency record |
 //! | `tx_stored` | after a chain step stores its signed transaction, before sending it |
 //! | `tx_sent` | after sending it, before it reaches its commitment |
 //! | `tx_confirmed` | after it reaches its commitment |
