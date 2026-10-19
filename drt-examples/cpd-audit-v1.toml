@@ -1,0 +1,73 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Relational Network
+
+analysis_id = "cpd-audit-v1"
+display_name = "CPD Audit"
+relation = "cpd_audit"
+
+[columns]
+staff_number = { header = "Staff Number", type = "text" }
+membership_number = { header = "Membership Number", type = "text" }
+title = { header = "Title", type = "text" }
+first_name = { header = "First Name", type = "text" }
+surname = { header = "Surname", type = "text" }
+date_of_birth = { header = "Date of Birth", type = "date" }
+employer = { header = "Employer", type = "text" }
+employer_group = { header = "Employer Group", type = "text" }
+audit_year = { header = "Audit Year", type = "text" }
+designation = { header = "Designation", type = "text" }
+designation_status = { header = "Designation Status", type = "text" }
+audit_receipt_date = { header = "Audit Receipt Date", type = "date" }
+audit_outcome = { header = "Audit Outcome", type = "text" }
+
+[scope]
+employer = "employer"
+employer_group = "employer_group"
+
+[filters]
+audit_year = "multi_select"
+audit_outcome = "multi_select"
+staff_number = "search_select"
+membership_number = "search_select"
+
+[output]
+columns = [
+    "staff_number", "membership_number", "title", "first_name",
+    "surname", "date_of_birth", "employer", "employer_group",
+    "audit_year", "designation", "designation_status", "audit_receipt_date",
+    "audit_outcome",
+]
+default_sort = { column = "audit_year", direction = "desc" }
+page_size = { default = 100, max = 500 }
+
+[sql]
+rows = '''
+SELECT _record_id, staff_number, membership_number, title, first_name, surname, date_of_birth,
+       employer, employer_group, audit_year, designation, designation_status,
+       audit_receipt_date, audit_outcome
+FROM cpd_audit
+WHERE (:audit_year IS NULL OR coalesce(audit_year, '') IN (SELECT value FROM json_each(:audit_year)))
+  AND (:audit_outcome IS NULL OR coalesce(audit_outcome, '') IN (SELECT value FROM json_each(:audit_outcome)))
+  AND (:staff_number IS NULL OR staff_number IN (SELECT value FROM json_each(:staff_number)))
+  AND (:membership_number IS NULL OR membership_number IN (SELECT value FROM json_each(:membership_number)))
+'''
+
+[sql.options]
+audit_year = '''
+SELECT coalesce(audit_year, '') AS value, count(*) AS count
+FROM cpd_audit GROUP BY audit_year ORDER BY value
+'''
+audit_outcome = '''
+SELECT coalesce(audit_outcome, '') AS value, count(*) AS count
+FROM cpd_audit GROUP BY audit_outcome ORDER BY value
+'''
+staff_number = '''
+SELECT staff_number AS value
+FROM cpd_audit WHERE staff_number LIKE :search || '%' ESCAPE '\'
+GROUP BY staff_number ORDER BY staff_number LIMIT :limit
+'''
+membership_number = '''
+SELECT membership_number AS value
+FROM cpd_audit WHERE membership_number LIKE :search || '%' ESCAPE '\'
+GROUP BY membership_number ORDER BY membership_number LIMIT :limit
+'''

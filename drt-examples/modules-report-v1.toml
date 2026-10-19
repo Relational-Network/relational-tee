@@ -1,0 +1,104 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Relational Network
+
+analysis_id = "modules-report-v1"
+display_name = "Modules"
+relation = "modules_report"
+
+[columns]
+staff_number = { header = "Staff Number", type = "text" }
+membership_number = { header = "Membership Number", type = "text" }
+title = { header = "Title", type = "text" }
+first_name = { header = "First Name", type = "text" }
+surname = { header = "Surname", type = "text" }
+date_of_birth = { header = "Date of Birth", type = "date" }
+employer = { header = "Employer", type = "text" }
+employer_group = { header = "Employer Group", type = "text" }
+programme_level_nfq = { header = "Programme Level (NFQ)", type = "text" }
+programme = { header = "Programme", type = "text" }
+module = { header = "Module", type = "text" }
+exam_result = { header = "Exam Result", type = "text" }
+exam_date = { header = "Exam Date", type = "date" }
+registration_date = { header = "Registration Date", type = "date" }
+registration_mode = { header = "Registration Mode", type = "text" }
+exam_board_date = { header = "Exam Board Date", type = "date" }
+exam_attendance_status_mcc_modules = { header = "Exam Attendance Status (MCC Modules)", type = "text" }
+mcc_module = { header = "MCC Module", type = "text" }
+
+[scope]
+employer = "employer"
+employer_group = "employer_group"
+
+[filters]
+programme = "multi_select"
+mcc_module = "multi_select"
+module = "multi_select"
+registration_mode = "multi_select"
+registration_date = "date_range"
+exam_date = "date_range"
+staff_number = "search_select"
+membership_number = "search_select"
+
+[output]
+columns = [
+    "staff_number", "membership_number", "title", "first_name",
+    "surname", "date_of_birth", "employer", "employer_group",
+    "programme_level_nfq", "programme", "module", "exam_result",
+    "exam_date", "registration_date", "registration_mode", "exam_board_date",
+    "exam_attendance_status_mcc_modules", "mcc_module",
+]
+default_sort = { column = "registration_date", direction = "desc" }
+page_size = { default = 100, max = 500 }
+
+[sql]
+rows = '''
+SELECT _record_id, staff_number, membership_number, title, first_name, surname, date_of_birth,
+       employer, employer_group, programme_level_nfq, programme, module, exam_result,
+       exam_date, registration_date, registration_mode, exam_board_date,
+       exam_attendance_status_mcc_modules, mcc_module
+FROM modules_report
+WHERE (:programme IS NULL OR coalesce(programme, '') IN (SELECT value FROM json_each(:programme)))
+  AND (:mcc_module IS NULL OR coalesce(mcc_module, '') IN (SELECT value FROM json_each(:mcc_module)))
+  AND (:module IS NULL OR coalesce(module, '') IN (SELECT value FROM json_each(:module)))
+  AND (:registration_mode IS NULL OR coalesce(registration_mode, '') IN (SELECT value FROM json_each(:registration_mode)))
+  AND (:registration_date_from IS NULL OR registration_date >= :registration_date_from)
+  AND (:registration_date_to IS NULL OR registration_date <= :registration_date_to)
+  AND (:exam_date_from IS NULL OR exam_date >= :exam_date_from)
+  AND (:exam_date_to IS NULL OR exam_date <= :exam_date_to)
+  AND (:staff_number IS NULL OR staff_number IN (SELECT value FROM json_each(:staff_number)))
+  AND (:membership_number IS NULL OR membership_number IN (SELECT value FROM json_each(:membership_number)))
+'''
+
+[sql.options]
+programme = '''
+SELECT coalesce(programme, '') AS value, count(*) AS count
+FROM modules_report GROUP BY programme ORDER BY value
+'''
+mcc_module = '''
+SELECT coalesce(mcc_module, '') AS value, count(*) AS count
+FROM modules_report GROUP BY mcc_module ORDER BY value
+'''
+module = '''
+SELECT coalesce(module, '') AS value, count(*) AS count
+FROM modules_report GROUP BY module ORDER BY value
+'''
+registration_mode = '''
+SELECT coalesce(registration_mode, '') AS value, count(*) AS count
+FROM modules_report GROUP BY registration_mode ORDER BY value
+'''
+registration_date = '''
+SELECT min(registration_date) AS min, max(registration_date) AS max FROM modules_report
+'''
+exam_date = '''
+SELECT min(exam_date) AS min, max(exam_date) AS max FROM modules_report
+'''
+staff_number = '''
+SELECT staff_number AS value
+FROM modules_report WHERE staff_number LIKE :search || '%' ESCAPE '\'
+GROUP BY staff_number ORDER BY staff_number LIMIT :limit
+'''
+membership_number = '''
+SELECT membership_number AS value
+FROM modules_report WHERE membership_number LIKE :search || '%' ESCAPE '\'
+GROUP BY membership_number ORDER BY membership_number LIMIT :limit
+'''

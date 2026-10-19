@@ -71,6 +71,7 @@ pub struct FilterRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<Mode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// A multi-select value of "" selects empty cells (SQL NULL).
     pub values: Option<Vec<String>>,
 }
 
@@ -105,7 +106,10 @@ enum Bound {
         from: Option<String>,
         to: Option<String>,
     },
-    Values(String),
+    Values {
+        json: String,
+        blank: bool,
+    },
 }
 
 /// A request that fits its definition, ready to bind. The names it holds
@@ -164,7 +168,11 @@ fn date(filter: &str, end: &str, value: Option<&str>) -> Result<Option<String>, 
     }
 }
 
-fn selection(filter: &str, given: &FilterRequest) -> Result<Option<String>, QueryError> {
+fn selection(
+    filter: &str,
+    kind: FilterKind,
+    given: &FilterRequest,
+) -> Result<Option<Bound>, QueryError> {
     if given.from.is_some() || given.to.is_some() {
         return invalid(format!("{filter} takes a mode, not from and to"));
     }
@@ -177,17 +185,19 @@ fn selection(filter: &str, given: &FilterRequest) -> Result<Option<String>, Quer
             if values.len() > MAX_SELECTED {
                 return invalid(format!("{filter} selects more than {MAX_SELECTED} values"));
             }
-            if values
-                .iter()
-                .any(|v| v.is_empty() || v.chars().count() > MAX_VALUE_CHARS)
-            {
+            if values.iter().any(|v| {
+                (v.is_empty() && kind != FilterKind::MultiSelect)
+                    || v.chars().count() > MAX_VALUE_CHARS
+            }) {
                 return invalid(format!(
-                    "{filter}'s values must be 1-{MAX_VALUE_CHARS} characters"
+                    "{filter}'s values must be at most {MAX_VALUE_CHARS} characters; only multi-selects accept empty values"
                 ));
             }
-            Ok(Some(
-                serde_json::to_string(values).map_err(|e| QueryError::Failed(e.to_string()))?,
-            ))
+            Ok(Some(Bound::Values {
+                json: serde_json::to_string(values)
+                    .map_err(|e| QueryError::Failed(e.to_string()))?,
+                blank: values.iter().any(String::is_empty),
+            }))
         }
         _ => invalid(format!(
             "{filter} needs mode all, or mode selected with values"
@@ -227,10 +237,10 @@ impl Query {
                 FilterKind::MultiSelect | FilterKind::SearchSelect => {
                     let values = match given {
                         None => None,
-                        Some(f) => selection(&filter.name, f)?,
+                        Some(f) => selection(&filter.name, filter.kind, f)?,
                     };
                     if let Some(values) = values {
-                        filters.push((filter.name.clone(), Bound::Values(values)));
+                        filters.push((filter.name.clone(), values));
                     }
                 }
             }
@@ -315,12 +325,15 @@ impl Query {
                         }
                     }
                 }
-                Bound::Values(values) => {
-                    terms.push(format!(
-                        "{} IN (SELECT value FROM json_each(:{name}))",
-                        quoted(name)
-                    ));
-                    binds.push((format!(":{name}"), values.clone()));
+                Bound::Values { json, blank } => {
+                    let membership =
+                        format!("{} IN (SELECT value FROM json_each(:{name}))", quoted(name));
+                    terms.push(if *blank {
+                        format!("({membership} OR {} IS NULL)", quoted(name))
+                    } else {
+                        membership
+                    });
+                    binds.push((format!(":{name}"), json.clone()));
                 }
             }
         }
@@ -693,6 +706,10 @@ mod tests {
     use crate::analysis::definition::tests::{awards_report, AWARDS_REPORT};
     use crate::analysis::table::tests::only;
     use crate::analysis::table::{check_targets, Conditions, Scope, TableError, Target};
+
+    mod catalogue {
+        include!("catalogue_tests.rs");
+    }
 
     const HEADER: &str = "Staff Number,Membership Number,Title,First Name,Surname,Date of Birth,\
                           Employer,Employer Group,Award,Award Grade,Exam Board Date";

@@ -1,0 +1,110 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Relational Network
+
+analysis_id = "cpd-report-v1"
+display_name = "CPD"
+relation = "cpd_report"
+
+[columns]
+staff_number = { header = "Staff Number", type = "text" }
+membership_number = { header = "Membership Number", type = "text" }
+title = { header = "Title", type = "text" }
+first_name = { header = "First Name", type = "text" }
+surname = { header = "Surname", type = "text" }
+date_of_birth = { header = "Date of Birth", type = "date" }
+employer = { header = "Employer", type = "text" }
+employer_group = { header = "Employer Group", type = "text" }
+cpd_year = { header = "CPD Year", type = "text" }
+designation = { header = "Designation", type = "text" }
+designation_status = { header = "Designation Status", type = "text" }
+last_status_update_date = { header = "Last Status Update Date", type = "date" }
+date_designated = { header = "Date Designated", type = "date" }
+pro_rata_applied = { header = "Pro-rata Applied", type = "text" }
+shortfall_applied = { header = "Shortfall Applied", type = "text" }
+total_hours_required = { header = "Total Hours Required", type = "text" }
+total_hours_recorded = { header = "Total Hours Recorded", type = "text" }
+category_name = { header = "Category Name", type = "text" }
+category_type = { header = "Category Type", type = "text" }
+category_date_accredited = { header = "Category Date Accredited", type = "date" }
+category_hours_required = { header = "Category Hours Required", type = "text" }
+category_hours_recorded = { header = "Category Hours Recorded", type = "text" }
+annual_return_made = { header = "Annual Return Made", type = "text" }
+total_hours_returned = { header = "Total Hours Returned", type = "text" }
+category_hours_returned = { header = "Category Hours Returned", type = "text" }
+total_shortfall = { header = "Total Shortfall", type = "text" }
+category_shortfall = { header = "Category Shortfall", type = "text" }
+audited = { header = "Audited", type = "text" }
+shortfall_warning_status = { header = "Shortfall Warning Status", type = "text" }
+shortfall_warning_start_date = { header = "Shortfall Warning Start Date", type = "date" }
+shortfall_warning_end_date = { header = "Shortfall Warning End Date", type = "date" }
+last_shortfall_warning_removal_date = { header = "Last Shortfall Warning Removal Date", type = "date" }
+reason_for_last_shortfall_removal = { header = "Reason for Last Shortfall Removal", type = "text" }
+
+[scope]
+employer = "employer"
+employer_group = "employer_group"
+
+[filters]
+cpd_year = "multi_select"
+designation = "multi_select"
+designation_status = "multi_select"
+staff_number = "search_select"
+membership_number = "search_select"
+
+[output]
+columns = [
+    "staff_number", "membership_number", "title", "first_name",
+    "surname", "date_of_birth", "employer", "employer_group",
+    "cpd_year", "designation", "designation_status", "last_status_update_date",
+    "date_designated", "pro_rata_applied", "shortfall_applied", "total_hours_required",
+    "total_hours_recorded", "category_name", "category_type", "category_date_accredited",
+    "category_hours_required", "category_hours_recorded", "annual_return_made", "total_hours_returned",
+    "category_hours_returned", "total_shortfall", "category_shortfall", "audited",
+    "shortfall_warning_status", "shortfall_warning_start_date", "shortfall_warning_end_date", "last_shortfall_warning_removal_date",
+    "reason_for_last_shortfall_removal",
+]
+default_sort = { column = "cpd_year", direction = "desc" }
+page_size = { default = 100, max = 500 }
+
+[sql]
+rows = '''
+SELECT _record_id, staff_number, membership_number, title, first_name, surname, date_of_birth,
+       employer, employer_group, cpd_year, designation, designation_status,
+       last_status_update_date, date_designated, pro_rata_applied, shortfall_applied,
+       total_hours_required, total_hours_recorded, category_name, category_type,
+       category_date_accredited, category_hours_required, category_hours_recorded,
+       annual_return_made, total_hours_returned, category_hours_returned, total_shortfall,
+       category_shortfall, audited, shortfall_warning_status, shortfall_warning_start_date,
+       shortfall_warning_end_date, last_shortfall_warning_removal_date,
+       reason_for_last_shortfall_removal
+FROM cpd_report
+WHERE (:cpd_year IS NULL OR coalesce(cpd_year, '') IN (SELECT value FROM json_each(:cpd_year)))
+  AND (:designation IS NULL OR coalesce(designation, '') IN (SELECT value FROM json_each(:designation)))
+  AND (:designation_status IS NULL OR coalesce(designation_status, '') IN (SELECT value FROM json_each(:designation_status)))
+  AND (:staff_number IS NULL OR staff_number IN (SELECT value FROM json_each(:staff_number)))
+  AND (:membership_number IS NULL OR membership_number IN (SELECT value FROM json_each(:membership_number)))
+'''
+
+[sql.options]
+cpd_year = '''
+SELECT coalesce(cpd_year, '') AS value, count(*) AS count
+FROM cpd_report GROUP BY cpd_year ORDER BY value
+'''
+designation = '''
+SELECT coalesce(designation, '') AS value, count(*) AS count
+FROM cpd_report GROUP BY designation ORDER BY value
+'''
+designation_status = '''
+SELECT coalesce(designation_status, '') AS value, count(*) AS count
+FROM cpd_report GROUP BY designation_status ORDER BY value
+'''
+staff_number = '''
+SELECT staff_number AS value
+FROM cpd_report WHERE staff_number LIKE :search || '%' ESCAPE '\'
+GROUP BY staff_number ORDER BY staff_number LIMIT :limit
+'''
+membership_number = '''
+SELECT membership_number AS value
+FROM cpd_report WHERE membership_number LIKE :search || '%' ESCAPE '\'
+GROUP BY membership_number ORDER BY membership_number LIMIT :limit
+'''
