@@ -168,6 +168,7 @@ fn date(filter: &str, end: &str, value: Option<&str>) -> Result<Option<String>, 
     }
 }
 
+/// Validate and encode a select's values; only multi-selects admit blanks.
 fn selection(
     filter: &str,
     kind: FilterKind,

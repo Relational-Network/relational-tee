@@ -61,7 +61,7 @@ SELECT _record_id,
 FROM awards
 WHERE (:exam_board_date_from IS NULL OR exam_board_date >= :exam_board_date_from)
   AND (:exam_board_date_to   IS NULL OR exam_board_date <= :exam_board_date_to)
-  AND (:award             IS NULL OR award             IN (SELECT value FROM json_each(:award)))
+  AND (:award             IS NULL OR coalesce(award, '') IN (SELECT value FROM json_each(:award)))
   AND (:staff_number      IS NULL OR staff_number      IN (SELECT value FROM json_each(:staff_number)))
   AND (:membership_number IS NULL OR membership_number IN (SELECT value FROM json_each(:membership_number)))
 '''
@@ -74,9 +74,9 @@ exam_board_date = '''
 SELECT min(exam_board_date) AS min, max(exam_board_date) AS max FROM awards
 '''
 award = '''
-SELECT award AS value, count(*) AS count
-FROM awards WHERE award IS NOT NULL
-GROUP BY award ORDER BY award
+SELECT coalesce(award, '') AS value, count(*) AS count
+FROM awards
+GROUP BY award ORDER BY value
 '''
 staff_number = '''
 SELECT staff_number AS value

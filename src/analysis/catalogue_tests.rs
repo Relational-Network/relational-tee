@@ -14,6 +14,13 @@ struct Example {
 
 const EXAMPLES: &[Example] = &[
     Example {
+        source: crate::analysis::definition::tests::AWARDS_REPORT,
+        headers: "Staff Number,Membership Number,Title,First Name,Surname,Date of Birth,Employer,Employer Group,Award,Award Grade,Exam Board Date",
+        dates: &["date_of_birth", "exam_board_date"],
+        filters: &["award", "exam_board_date", "membership_number", "staff_number"],
+        sort: "exam_board_date",
+    },
+    Example {
         source: include_str!("../../drt-examples/modules-report-v1.toml"),
         headers: "Staff Number,Membership Number,Title,First Name,Surname,Date of Birth,Employer,Employer Group,Programme Level (NFQ),Programme,Module,Exam Result,Exam Date,Registration Date,Registration Mode,Exam Board Date,Exam Attendance Status (MCC Modules),MCC Module",
         dates: &["date_of_birth", "exam_date", "registration_date", "exam_board_date"],
@@ -57,8 +64,8 @@ const EXAMPLES: &[Example] = &[
     },
  ];
 
-// Five invented rows: one blank, two tied dates, repeated identifiers and
-// one row outside Group A. No export data is included in the tests.
+/// Five invented rows: one blank, two tied dates, repeated identifiers and
+/// one row outside Group A. No export data is included in the tests.
 fn data(def: &Definition) -> Vec<u8> {
     let mut csv = def
         .columns
@@ -102,6 +109,7 @@ fn data(def: &Definition) -> Vec<u8> {
 }
 
 #[test]
+/// Every catalogue definition keeps its schema, scope and filter contract.
 fn catalogue_schemas_match_the_exports_and_filter_contracts() {
     for example in EXAMPLES {
         let def = Definition::parse(example.source.as_bytes()).unwrap();
@@ -147,6 +155,7 @@ fn catalogue_schemas_match_the_exports_and_filter_contracts() {
 }
 
 #[test]
+/// Generated pages and counts match the pinned reference SQL for every view.
 fn catalogue_pages_match_reference_sql_with_blanks_dates_and_every_sort() {
     for example in EXAMPLES {
         let def = Definition::parse(example.source.as_bytes()).unwrap();
@@ -202,6 +211,7 @@ fn catalogue_pages_match_reference_sql_with_blanks_dates_and_every_sort() {
 }
 
 #[test]
+/// Scope and blank selections constrain all derived views of a dataset.
 fn catalogue_scopes_restrict_rows_options_searches_and_member_counts() {
     for example in EXAMPLES {
         let def = Definition::parse(example.source.as_bytes()).unwrap();
@@ -283,6 +293,7 @@ fn catalogue_scopes_restrict_rows_options_searches_and_member_counts() {
 }
 
 #[tokio::test]
+/// Every catalogue definition can be fetched, checked and registered as a pool.
 async fn catalogue_definitions_create_pools_through_the_checked_fetcher() {
     use crate::analysis::fetch::tests::Fixed;
     use crate::api::credentials::tests::{send, worker_with};

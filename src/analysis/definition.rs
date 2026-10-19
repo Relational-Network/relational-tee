@@ -621,9 +621,9 @@ pub(crate) mod tests {
 
     #[test]
     fn statements_must_be_read_only() {
+        let def = awards_report();
         let toml = AWARDS_REPORT.replace(
-            "SELECT award AS value, count(*) AS count\nFROM awards WHERE award IS NOT NULL\n\
-             GROUP BY award ORDER BY award",
+            def.options_sql("award").unwrap(),
             "DELETE FROM awards RETURNING award AS value, 1 AS count",
         );
         assert!(refused(&toml).contains("read-only"), "{}", refused(&toml));
@@ -737,8 +737,9 @@ pub(crate) mod tests {
 
     #[test]
     fn option_queries_leave_with_to_the_worker() {
+        let def = awards_report();
         let toml = AWARDS_REPORT.replace(
-            "SELECT award AS value, count(*) AS count\nFROM awards",
+            def.options_sql("award").unwrap(),
             "WITH a AS (SELECT * FROM awards) SELECT award AS value, count(*) AS count\nFROM a",
         );
         assert!(refused(&toml).contains("WITH"), "{}", refused(&toml));
