@@ -2,7 +2,8 @@
 // Copyright (C) 2026 Relational Network
 
 //! The store contract, checked against every backend: local files always,
-//! and Azurite with `just test-azurite`.
+//! Azurite with `just test-azurite`, and a real storage account with
+//! `just test-blob`.
 
 use bytes::Bytes;
 
@@ -161,4 +162,51 @@ async fn azurite_meets_the_contract() {
     .expect("Azurite config");
     store.ensure_container().await.expect("Azurite reachable");
     check_all(&store).await;
+}
+
+/// Against a real storage account: `just test-blob` runs it with the
+/// account's Blob endpoint in `CONFORMANCE_BLOB_URL` and an Entra token for
+/// Storage in `CONFORMANCE_STORAGE_TOKEN`, from someone with Storage Blob
+/// Data Contributor on the account. It works in a container of its own,
+/// deleted afterwards whether the checks pass or not.
+#[cfg(feature = "dev")]
+#[tokio::test]
+#[ignore = "needs a storage account: run `just test-blob`"]
+async fn a_storage_account_meets_the_contract() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let setting = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| panic!("{name} isn't set: run `just test-blob`"))
+    };
+    let container = format!("conformance-{}", uuid::Uuid::new_v4().simple());
+    let store = std::sync::Arc::new(
+        super::azure::AzureBlob::new(
+            &super::azure::AzureConfig {
+                blob_url: setting("CONFORMANCE_BLOB_URL"),
+                credential: super::azure::CredentialConfig::Fixed(super::azure::FixedToken(
+                    zeroize::Zeroizing::new(setting("CONFORMANCE_STORAGE_TOKEN")),
+                )),
+            },
+            &container,
+        )
+        .expect("the storage account's endpoint"),
+    );
+    store
+        .ensure_container()
+        .await
+        .expect("the storage account is reachable and the token may create containers");
+    let checks = tokio::spawn({
+        let store = store.clone();
+        async move { check_all(store.as_ref()).await }
+    })
+    .await;
+    store
+        .delete_container()
+        .await
+        .expect("the throwaway container is deleted");
+    if let Err(failed) = checks {
+        std::panic::resume_unwind(failed.into_panic());
+    }
 }
