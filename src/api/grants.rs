@@ -1996,4 +1996,80 @@ pub(crate) mod tests {
         let (_, _, mine) = send(&worker.app, get("/v1/drt/me/analyses", &token)).await;
         assert_eq!(mine["analyses"].as_array().map(Vec::len), Some(1), "{mine}");
     }
+
+    #[tokio::test]
+    async fn the_users_list_shows_the_pools_each_person_holds_a_grant_in() {
+        let worker = worker();
+        let owner = worker.admin("oid-owner").await;
+        let pool_pda = analysis_pool(&worker, &owner, 2).await;
+        worker.chain.lands.store(true, SeqCst);
+        let (_, ana) = analyst(&worker.app, "oid-ana").await;
+        let blair = json!({ "entra_object_id": "5d9a1f40-1b2c-4d3e-8f90-123456789abc",
+            "email": "blair@example.com", "display_name": "Blair Bravo" });
+        let (status, _, registered) = send(
+            &worker.app,
+            post("/v1/users", &owner.token, &new_key(), &blair),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{registered}");
+        let blair = registered["user_id"].as_str().unwrap().to_string();
+        let grant_path = format!("/v1/drt/pools/{pool_pda}/grant");
+        for analyst_id in [&ana, &blair] {
+            let (status, _, granted) = send(
+                &worker.app,
+                post(&grant_path, &owner.token, &new_key(), &granting(analyst_id)),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{granted}");
+        }
+        let doc = worker
+            .storage
+            .pools()
+            .get(&pool_pda.to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        let pools_of = |list: &Value, user_id: &str| {
+            list["users"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|u| u["user_id"] == user_id)
+                .map(|u| u["pools"].clone())
+                .unwrap()
+        };
+
+        let (status, _, list) = send(&worker.app, get("/v1/users", &owner.token)).await;
+        assert_eq!(status, StatusCode::OK, "{list}");
+        let held = pools_of(&list, &ana);
+        assert_eq!(
+            held,
+            json!([{
+                "pool_pda": pool_pda.to_string(),
+                "pool_name": doc.pool_name,
+                "display_name": "Awards Report",
+                "granted_at": doc.active_grant(&ana, ANALYSIS).unwrap().granted_at,
+            }])
+        );
+        // Granted before their first sign-in, they hold it already.
+        assert_eq!(pools_of(&list, &blair).as_array().map(Vec::len), Some(1));
+        // The owner opens the pool as an admin, without a grant.
+        assert_eq!(pools_of(&list, &owner.user_id), json!([]));
+
+        // A revocation takes the pool away at once, before its close.
+        worker
+            .chain
+            .grant(grant_pda(&worker, &ana), execute_drt_config(&pool_pda));
+        let revoke = json!({ "analyst_user_id": ana, "analysis_id": ANALYSIS });
+        let revoke_path = format!("/v1/drt/pools/{pool_pda}/revoke-grant");
+        let (status, _, revoked) = send(
+            &worker.app,
+            post(&revoke_path, &owner.token, &new_key(), &revoke),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{revoked}");
+        let (_, _, list) = send(&worker.app, get("/v1/users", &owner.token)).await;
+        assert_eq!(pools_of(&list, &ana), json!([]));
+        assert_eq!(pools_of(&list, &blair).as_array().map(Vec::len), Some(1));
+    }
 }

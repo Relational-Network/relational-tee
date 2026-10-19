@@ -179,6 +179,8 @@ An analysis shows admins every row. An analyst sees only the rows of their grant
         api::users::UsersBody,
         api::users::UsersResponse,
         api::users::UserEntry,
+        api::users::UserListEntry,
+        api::users::UserPool,
         api::users::UserLookupResponse,
         api::users::RegisterUserRequest,
         auth::Permission,

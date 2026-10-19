@@ -4,7 +4,8 @@
 //! Users: the caller's own identity, and the known users for admins.
 //!
 //! - `GET /v1/users/me`: who the caller is and what they may do.
-//! - `GET /v1/users`: every user who has signed in, paged by cursor.
+//! - `GET /v1/users`: every known user, with the pools each can open,
+//!   paged by cursor.
 //! - `GET /v1/users?email=`: the one user with that email, or 404.
 //! - `POST /v1/users`: register someone an admin found in Entra, before
 //!   their first sign-in, so they can be granted at once.
@@ -12,6 +13,8 @@
 //! Users become known at their first sign-in, or when an admin registers
 //! them; the worker never queries Microsoft Graph: the dashboard finds
 //! people there, and the first sign-in with that Entra object ID is theirs.
+
+use std::collections::HashMap;
 
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
@@ -124,10 +127,31 @@ pub struct RegisterUserRequest {
 
 const MAX_TEXT: usize = 256;
 
+/// A known user, with the pools they can open.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct UserListEntry {
+    #[serde(flatten)]
+    pub user: UserEntry,
+    /// The pools where they hold a grant that isn't revoked, by pool name,
+    /// as the pool documents record it: the chain is checked when they open
+    /// one, not here. Admins open every pool without one.
+    pub pools: Vec<UserPool>,
+}
+
+/// A pool someone holds a grant in.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct UserPool {
+    pub pool_pda: String,
+    pub pool_name: String,
+    /// The pool's analysis.
+    pub display_name: String,
+    pub granted_at: DateTime<Utc>,
+}
+
 /// One page of known users, by email.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct UsersResponse {
-    pub users: Vec<UserEntry>,
+    pub users: Vec<UserListEntry>,
     /// Present when there's another page; pass it as `cursor`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
@@ -223,7 +247,7 @@ pub enum UsersBody {
     path = "/v1/users",
     tag = "Users",
     summary = "Users",
-    description = "Without `email`: every known user, signed in or registered by an admin (`pending`), with their roles as of their last sign-in, sorted by email and paged by cursor, with no totals. With `email`: an exact, case-insensitive match, or 404 if nobody with that email is known. Needs `users:read`.",
+    description = "Without `email`: every known user, signed in or registered by an admin (`pending`), with their roles as of their last sign-in and the pools where they hold a grant that isn't revoked, sorted by email and paged by cursor, with no totals. With `email`: an exact, case-insensitive match, or 404 if nobody with that email is known. Needs `users:read`.",
     security(("bearer_auth" = [])),
     params(UsersQuery),
     responses(
@@ -260,8 +284,43 @@ pub async fn list_users(
     });
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
     let (users, next_cursor) = page(all, |i| i.user_id.as_str(), query.cursor.as_deref(), limit)?;
+    let mut pools = pools_by_analyst(&state).await?;
     Ok(Json(UsersBody::Page(UsersResponse {
-        users: users.into_iter().map(UserEntry::from).collect(),
+        users: users
+            .into_iter()
+            .map(|i| UserListEntry {
+                pools: pools.remove(&i.user_id).unwrap_or_default(),
+                user: i.into(),
+            })
+            .collect(),
         next_cursor,
     })))
+}
+
+/// Each analyst's pools, from the grants the pool documents hold that
+/// aren't revoked: the same rule as an analyst's active grant.
+async fn pools_by_analyst(state: &AppState) -> Result<HashMap<String, Vec<UserPool>>, ApiError> {
+    let mut held: HashMap<String, Vec<UserPool>> = HashMap::new();
+    for doc in state.storage.pools().all().await? {
+        let Some(analysis) = doc.analysis.as_ref() else {
+            continue;
+        };
+        for grant in &doc.grants {
+            if grant.revoked.is_some() || grant.drt_name != analysis.analysis_id {
+                continue;
+            }
+            held.entry(grant.analyst.clone())
+                .or_default()
+                .push(UserPool {
+                    pool_pda: doc.pool_pda.clone(),
+                    pool_name: doc.pool_name.clone(),
+                    display_name: analysis.display_name.clone(),
+                    granted_at: grant.granted_at,
+                });
+        }
+    }
+    for pools in held.values_mut() {
+        pools.sort_by(|a, b| (&a.pool_name, &a.pool_pda).cmp(&(&b.pool_name, &b.pool_pda)));
+    }
+    Ok(held)
 }
