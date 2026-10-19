@@ -47,6 +47,14 @@ pub enum TxStatus {
     Failed,
 }
 
+/// Which way a transaction moved value, from the wallet's side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TxDirection {
+    Sent,
+    Received,
+}
+
 /// One transaction, from one wallet's side.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct WalletTransaction {
@@ -67,8 +75,7 @@ pub struct WalletTransaction {
     pub explorer_url: String,
     /// The block time.
     pub created_at: DateTime<Utc>,
-    /// `sent` or `received`.
-    pub direction: String,
+    pub direction: TxDirection,
 }
 
 /// The wallet whose history is read.
@@ -292,7 +299,7 @@ fn view(
             .block_time
             .and_then(|t| DateTime::from_timestamp(t, 0))
             .unwrap_or_default(),
-        direction: side.direction.to_string(),
+        direction: side.direction,
     }
 }
 
@@ -303,7 +310,7 @@ struct Side {
     amount: String,
     amount_lamports: Option<u64>,
     token: TokenType,
-    direction: &'static str,
+    direction: TxDirection,
 }
 
 /// A SOL transfer, from the address's balance change. The fee payer is the
@@ -335,7 +342,11 @@ fn sol_side(detail: &TransactionDetail, address: &str) -> Side {
         amount: lamports.map_or_else(|| "0".to_string(), |l| decimal(u128::from(l), 9)),
         amount_lamports: lamports,
         token: TokenType::Native,
-        direction: if is_sender { "sent" } else { "received" },
+        direction: if is_sender {
+            TxDirection::Sent
+        } else {
+            TxDirection::Received
+        },
     }
 }
 
@@ -377,9 +388,9 @@ fn token_side(detail: &TransactionDetail, address: &str) -> Option<Side> {
         .unwrap_or_default()
         .to_string();
     let (from, to, direction) = if delta < 0 {
-        (address.to_string(), counterparty, "sent")
+        (address.to_string(), counterparty, TxDirection::Sent)
     } else {
-        (counterparty, address.to_string(), "received")
+        (counterparty, address.to_string(), TxDirection::Received)
     };
     Some(Side {
         from,
@@ -458,12 +469,8 @@ mod tests {
         let (solana, detail) = (solana(), sol_transfer());
         let sent = view(&solana, &alice(), "sig1", &detail);
         assert_eq!(
-            (
-                sent.direction.as_str(),
-                sent.from.as_str(),
-                sent.to.as_str()
-            ),
-            ("sent", ALICE, BOB)
+            (sent.direction, sent.from.as_str(), sent.to.as_str()),
+            (TxDirection::Sent, ALICE, BOB)
         );
         assert_eq!(sent.amount, "1.500000000");
         assert_eq!(sent.amount_lamports, Some(1_500_000_000));
@@ -473,8 +480,8 @@ mod tests {
 
         let received = view(&solana, &bob(), "sig1", &detail);
         assert_eq!(
-            (received.direction.as_str(), received.from.as_str()),
-            ("received", ALICE)
+            (received.direction, received.from.as_str()),
+            (TxDirection::Received, ALICE)
         );
         assert_eq!(received.amount_lamports, Some(1_500_000_000));
         assert_eq!(received.wallet_id, "w-bob");
@@ -503,20 +510,16 @@ mod tests {
         let sent = view(&solana, &alice(), "sig2", &detail);
         assert_eq!(sent.token, TokenType::SplToken(MINT.into()));
         assert_eq!(
-            (
-                sent.amount.as_str(),
-                sent.direction.as_str(),
-                sent.to.as_str()
-            ),
-            ("2.000000", "sent", BOB)
+            (sent.amount.as_str(), sent.direction, sent.to.as_str()),
+            ("2.000000", TxDirection::Sent, BOB)
         );
         assert_eq!(sent.amount_lamports, None);
         assert_eq!(sent.status, TxStatus::Failed);
 
         let received = view(&solana, &bob(), "sig2", &detail);
         assert_eq!(
-            (received.direction.as_str(), received.from.as_str()),
-            ("received", ALICE)
+            (received.direction, received.from.as_str()),
+            (TxDirection::Received, ALICE)
         );
     }
 
@@ -575,7 +578,7 @@ mod tests {
             serde_json::json!([balance(1, ALICE, "0", 255), balance(2, BOB, &max, 255)]),
         );
         let sent = view(&solana, &alice(), "sig", &detail);
-        assert_eq!((sent.direction.as_str(), sent.to.as_str()), ("sent", BOB));
+        assert_eq!((sent.direction, sent.to.as_str()), (TxDirection::Sent, BOB));
         assert_eq!(
             sent.amount,
             format!("0.{}{max}", "0".repeat(255 - max.len()))
@@ -596,8 +599,8 @@ mod tests {
         );
         let received = view(&solana, &alice(), "sig", &detail);
         assert_eq!(
-            (received.direction.as_str(), received.from.as_str()),
-            ("received", BOB)
+            (received.direction, received.from.as_str()),
+            (TxDirection::Received, BOB)
         );
         assert_eq!(received.amount, max);
     }

@@ -377,8 +377,8 @@ impl Query {
 /// One page of matching rows.
 #[derive(Debug, Clone, PartialEq, Serialize, ToSchema)]
 pub struct Page {
-    /// By output column; dates as DD/MM/YYYY.
-    #[schema(value_type = Vec<Object>)]
+    /// By output column, each a string or null; dates as DD/MM/YYYY.
+    #[schema(value_type = Vec<HashMap<String, Option<String>>>)]
     pub rows: Vec<Map<String, Value>>,
     /// Every row the filters match in the caller's scope.
     pub total_matched: u64,

@@ -163,8 +163,8 @@ fn unverified_claims(token: &str) -> Result<Value, AttestError> {
 pub struct AttestationResponse {
     /// MAA token (JWT) whose `x-ms-runtime.keys[0]` is `transport_jwk`.
     pub maa_token: String,
-    /// The transport public key, as a JWK.
-    #[schema(value_type = Object)]
+    /// The transport public key, as a JWK, whose members are all strings.
+    #[schema(value_type = HashMap<String, String>)]
     pub transport_jwk: Value,
     /// RFC 7638 thumbprint of `transport_jwk`.
     pub kid: String,
