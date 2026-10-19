@@ -103,6 +103,22 @@ azurite-stop:
 test-azurite: azurite
     cargo nextest run --features dev --run-ignored only -E 'test(azurite)'
 
+# Run the store conformance tests against a real storage account, in a
+# throwaway container they delete: CONFORMANCE_BLOB_URL is the account's Blob
+# endpoint, and the token comes from `az` (the signed-in user needs Storage
+# Blob Data Contributor) unless CONFORMANCE_STORAGE_TOKEN holds one.
+test-blob:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    : "${CONFORMANCE_BLOB_URL:?set it to the Blob endpoint of the storage account}"
+    if [[ -z "${CONFORMANCE_STORAGE_TOKEN:-}" ]]; then
+        CONFORMANCE_STORAGE_TOKEN=$(az account get-access-token \
+            --resource https://storage.azure.com/ --query accessToken -o tsv)
+        export CONFORMANCE_STORAGE_TOKEN
+    fi
+    cargo nextest run --features dev --run-ignored only \
+        -E 'test(a_storage_account_meets_the_contract)'
+
 # Upload a pilot-sized dataset (100,000 rows of 30 fields) to a pool's initial
 # upload and issuance routes in an optimised build, and print its size against
 # the upload limit and how long each upload took; then time pages that count

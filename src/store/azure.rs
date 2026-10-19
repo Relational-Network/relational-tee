@@ -6,7 +6,8 @@
 //! Requests authenticate with Entra bearer tokens for
 //! `https://storage.azure.com/`, from the managed-identity endpoint; the
 //! storage account has shared keys disabled. Dev builds can also sign with
-//! Azurite's well-known dev account key instead.
+//! Azurite's well-known dev account key instead, or send a Storage token
+//! they were given, for the conformance tests against a real account.
 //!
 //! Three REST calls cover the store: Get Blob (conditional with
 //! `If-None-Match`), Put Blob (with `If-None-Match: *` or `If-Match`) and
@@ -79,6 +80,22 @@ pub enum CredentialConfig {
     /// Azurite's well-known dev account key. Dev builds only.
     #[cfg(feature = "dev")]
     AzuriteDevAccount,
+    /// A Storage token obtained elsewhere, used until it expires. Dev test
+    /// builds only, for the conformance tests against a real account.
+    #[cfg(all(test, feature = "dev"))]
+    Fixed(FixedToken),
+}
+
+/// A bearer token for Storage, kept out of `Debug` output.
+#[cfg(all(test, feature = "dev"))]
+#[derive(Clone, PartialEq, Eq)]
+pub struct FixedToken(pub Zeroizing<String>);
+
+#[cfg(all(test, feature = "dev"))]
+impl std::fmt::Debug for FixedToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FixedToken(..)")
+    }
 }
 
 /// Where the storage account is and how to reach it.
@@ -164,6 +181,8 @@ enum Credential {
         account: String,
         key: Zeroizing<Vec<u8>>,
     },
+    #[cfg(all(test, feature = "dev"))]
+    Fixed(Zeroizing<String>),
 }
 
 /// The account's client and credential, shared by its containers.
@@ -222,6 +241,13 @@ impl AzureBlob {
                 account: AZURITE_ACCOUNT.to_string(),
                 key: Zeroizing::new(STANDARD.decode(AZURITE_KEY).expect("valid base64")),
             },
+            #[cfg(all(test, feature = "dev"))]
+            CredentialConfig::Fixed(token) => {
+                if !config.blob_url.starts_with("https://") {
+                    return Err("a fixed Storage token is sent over https only".into());
+                }
+                Credential::Fixed(token.0.clone())
+            }
         };
         Ok(Self {
             account: Arc::new(Account {
@@ -263,6 +289,22 @@ impl AzureBlob {
         }
     }
 
+    /// Delete the container and everything in it. Dev test builds only,
+    /// for the conformance tests' throwaway containers.
+    #[cfg(all(test, feature = "dev"))]
+    pub async fn delete_container(&self) -> Result<(), StoreError> {
+        let mut req = Req::new(
+            Method::DELETE,
+            format!("{}/{}", self.account.endpoint.prefix, self.container),
+        );
+        req.query.push(("restype", "container".into()));
+        let response = self.account.send(req).await?;
+        match response.status() {
+            StatusCode::ACCEPTED | StatusCode::NOT_FOUND => Ok(()),
+            _ => Err(unexpected("delete container", &response)),
+        }
+    }
+
     fn blob_path(&self, path: &str) -> Result<String, StoreError> {
         check_path(path)?;
         Ok(format!(
@@ -300,6 +342,8 @@ impl Account {
             Credential::ManagedIdentity(tokens) => tokens.bearer().await?,
             #[cfg(feature = "dev")]
             Credential::SharedKey { account, key } => shared_key(account, key, &req),
+            #[cfg(all(test, feature = "dev"))]
+            Credential::Fixed(token) => format!("Bearer {}", token.as_str()),
         };
 
         let mut url = format!("{}{}", self.endpoint.origin, req.path);
