@@ -71,7 +71,7 @@ pub struct FilterRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<Mode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    /// A multi-select value of "" selects empty cells (SQL NULL).
+    /// A selected value of "" selects empty cells (SQL NULL).
     pub values: Option<Vec<String>>,
 }
 
@@ -168,12 +168,8 @@ fn date(filter: &str, end: &str, value: Option<&str>) -> Result<Option<String>, 
     }
 }
 
-/// Validate and encode a select's values; only multi-selects admit blanks.
-fn selection(
-    filter: &str,
-    kind: FilterKind,
-    given: &FilterRequest,
-) -> Result<Option<Bound>, QueryError> {
+/// Validate and encode a select's values, including blank-cell selections.
+fn selection(filter: &str, given: &FilterRequest) -> Result<Option<Bound>, QueryError> {
     if given.from.is_some() || given.to.is_some() {
         return invalid(format!("{filter} takes a mode, not from and to"));
     }
@@ -186,12 +182,9 @@ fn selection(
             if values.len() > MAX_SELECTED {
                 return invalid(format!("{filter} selects more than {MAX_SELECTED} values"));
             }
-            if values.iter().any(|v| {
-                (v.is_empty() && kind != FilterKind::MultiSelect)
-                    || v.chars().count() > MAX_VALUE_CHARS
-            }) {
+            if values.iter().any(|v| v.chars().count() > MAX_VALUE_CHARS) {
                 return invalid(format!(
-                    "{filter}'s values must be at most {MAX_VALUE_CHARS} characters; only multi-selects accept empty values"
+                    "{filter}'s values must be at most {MAX_VALUE_CHARS} characters"
                 ));
             }
             Ok(Some(Bound::Values {
@@ -238,7 +231,7 @@ impl Query {
                 FilterKind::MultiSelect | FilterKind::SearchSelect => {
                     let values = match given {
                         None => None,
-                        Some(f) => selection(&filter.name, filter.kind, f)?,
+                        Some(f) => selection(&filter.name, f)?,
                     };
                     if let Some(values) = values {
                         filters.push((filter.name.clone(), values));

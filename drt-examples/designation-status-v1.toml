@@ -55,8 +55,8 @@ WHERE (:designation IS NULL OR coalesce(designation, '') IN (SELECT value FROM j
   AND (:status_update_date_from IS NULL OR status_update_date >= :status_update_date_from)
   AND (:status_update_date_to IS NULL OR status_update_date <= :status_update_date_to)
   AND (:reason_for_change IS NULL OR coalesce(reason_for_change, '') IN (SELECT value FROM json_each(:reason_for_change)))
-  AND (:staff_number IS NULL OR staff_number IN (SELECT value FROM json_each(:staff_number)))
-  AND (:membership_number IS NULL OR membership_number IN (SELECT value FROM json_each(:membership_number)))
+  AND (:staff_number IS NULL OR coalesce(staff_number, '') IN (SELECT value FROM json_each(:staff_number)))
+  AND (:membership_number IS NULL OR coalesce(membership_number, '') IN (SELECT value FROM json_each(:membership_number)))
 '''
 
 [sql.options]
@@ -80,12 +80,12 @@ SELECT coalesce(reason_for_change, '') AS value, count(*) AS count
 FROM designation_status GROUP BY reason_for_change ORDER BY value
 '''
 staff_number = '''
-SELECT staff_number AS value
-FROM designation_status WHERE staff_number LIKE :search || '%' ESCAPE '\'
+SELECT coalesce(staff_number, '') AS value
+FROM designation_status WHERE coalesce(staff_number, '') LIKE :search || '%' ESCAPE '\'
 GROUP BY staff_number ORDER BY staff_number LIMIT :limit
 '''
 membership_number = '''
-SELECT membership_number AS value
-FROM designation_status WHERE membership_number LIKE :search || '%' ESCAPE '\'
+SELECT coalesce(membership_number, '') AS value
+FROM designation_status WHERE coalesce(membership_number, '') LIKE :search || '%' ESCAPE '\'
 GROUP BY membership_number ORDER BY membership_number LIMIT :limit
 '''

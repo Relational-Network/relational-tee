@@ -39,18 +39,18 @@ rows = '''
 SELECT _record_id, staff_number, membership_number, title, first_name, surname, date_of_birth,
        employer, employer_group, module, exam_date
 FROM exam_modules
-WHERE (:staff_number IS NULL OR staff_number IN (SELECT value FROM json_each(:staff_number)))
-  AND (:membership_number IS NULL OR membership_number IN (SELECT value FROM json_each(:membership_number)))
+WHERE (:staff_number IS NULL OR coalesce(staff_number, '') IN (SELECT value FROM json_each(:staff_number)))
+  AND (:membership_number IS NULL OR coalesce(membership_number, '') IN (SELECT value FROM json_each(:membership_number)))
 '''
 
 [sql.options]
 staff_number = '''
-SELECT staff_number AS value
-FROM exam_modules WHERE staff_number LIKE :search || '%' ESCAPE '\'
+SELECT coalesce(staff_number, '') AS value
+FROM exam_modules WHERE coalesce(staff_number, '') LIKE :search || '%' ESCAPE '\'
 GROUP BY staff_number ORDER BY staff_number LIMIT :limit
 '''
 membership_number = '''
-SELECT membership_number AS value
-FROM exam_modules WHERE membership_number LIKE :search || '%' ESCAPE '\'
+SELECT coalesce(membership_number, '') AS value
+FROM exam_modules WHERE coalesce(membership_number, '') LIKE :search || '%' ESCAPE '\'
 GROUP BY membership_number ORDER BY membership_number LIMIT :limit
 '''

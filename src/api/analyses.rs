@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Relational Network
 
 //! Running a pool's analysis: an admin over every row, an analyst with an
-//! active grant over the rows their employer scope allows.
+//! active grant over the rows their grant scope allows.
 //!
 //! - `GET  …/analyses/{analysis_id}`                  — the analysis, and the caller's rows
 //! - `POST …/analyses/{analysis_id}/options`          — filter options, under the other filters
@@ -460,7 +460,7 @@ fn summary(
     path = "/v1/drt/pools/{pool_pda}/analyses/{analysis_id}",
     tag = "Analyses",
     summary = "Get an analysis",
-    description = "The pool's analysis as the caller may run it: the columns a page returns, the filters a query may use, the default sort and page sizes, the definition's URL and hash, and the rows the caller sees (every row for an admin; for an analyst, their employer scope). With `include=page` it opens the analysis: it also returns each filter's options but the searches' from all the caller's rows, the page a query with no filters returns in the default sort at the default page size, with the distinct counts `distinct` asks for, and each search filter's first values, as a search with no prefix returns them. An open counts against the per-user limit on non-`GET` requests and is recorded in the analysis log as one `open`; a description alone isn't. Needs `analyses:run`, and for an analyst an active grant.",
+    description = "The pool's analysis as the caller may run it: the columns a page returns, the filters a query may use, the default sort and page sizes, the definition's URL and hash, and the rows the caller sees (every row for an admin; for an analyst, their grant scope). With `include=page` it opens the analysis: it also returns each filter's options but the searches' from all the caller's rows, the page a query with no filters returns in the default sort at the default page size, with the distinct counts `distinct` asks for, and each search filter's first values, as a search with no prefix returns them. An open counts against the per-user limit on non-`GET` requests and is recorded in the analysis log as one `open`; a description alone isn't. Needs `analyses:run`, and for an analyst an active grant.",
     security(("bearer_auth" = [])),
     params(
         ("pool_pda" = String, Path, description = "Pool PDA address (base58)"),
@@ -472,7 +472,7 @@ fn summary(
         (status = 200, description = "The analysis", body = AnalysisSummary),
         (status = 400, description = "A parameter other than `include=page` and its `distinct`, or a `distinct` that doesn't fit the analysis (`invalid_query`)"),
         (status = 401, description = "Unauthorized"),
-        (status = 403, description = "No active grant (`no_grant`), a grant the chain doesn't show (`grant_not_live`), or no employer scope (`no_employer_scope`, `groups_overage`)"),
+        (status = 403, description = "No active grant (`no_grant`), a grant the chain doesn't show (`grant_not_live`), or no row scope (`no_employer_scope`)"),
         (status = 404, description = "Pool or analysis not found"),
         (status = 422, description = "The open ran out of time (`analysis_timeout`)"),
         (status = 429, description = "An open over the per-user limit (`rate_limited`, with Retry-After)"),
@@ -633,7 +633,7 @@ async fn open(
         (status = 200, description = "The options", body = OptionsResponse),
         (status = 400, description = "The filters don't fit the analysis (`invalid_query`)"),
         (status = 401, description = "Unauthorized"),
-        (status = 403, description = "No active grant (`no_grant`), a grant the chain doesn't show (`grant_not_live`), or no employer scope"),
+        (status = 403, description = "No active grant (`no_grant`), a grant the chain doesn't show (`grant_not_live`), or no row scope"),
         (status = 404, description = "Pool or analysis not found"),
         (status = 415, description = "The body isn't JSON"),
         (status = 422, description = "The options ran out of time (`analysis_timeout`)"),
@@ -723,7 +723,7 @@ async fn options_for(
         (status = 200, description = "The values", body = SearchResponse),
         (status = 400, description = "Not a search filter, a search or limit out of range, or filters that don't fit the analysis (`invalid_query`)"),
         (status = 401, description = "Unauthorized"),
-        (status = 403, description = "No active grant (`no_grant`), a grant the chain doesn't show (`grant_not_live`), or no employer scope"),
+        (status = 403, description = "No active grant (`no_grant`), a grant the chain doesn't show (`grant_not_live`), or no row scope"),
         (status = 404, description = "Pool or analysis not found"),
         (status = 415, description = "The body isn't JSON"),
         (status = 422, description = "The search ran out of time (`analysis_timeout`)"),
@@ -811,7 +811,7 @@ async fn search_for(
         (status = 200, description = "A page of rows", body = Page),
         (status = 400, description = "The query doesn't fit the analysis (`invalid_query`)"),
         (status = 401, description = "Unauthorized"),
-        (status = 403, description = "No active grant (`no_grant`), a grant the chain doesn't show (`grant_not_live`), or no employer scope"),
+        (status = 403, description = "No active grant (`no_grant`), a grant the chain doesn't show (`grant_not_live`), or no row scope"),
         (status = 404, description = "Pool or analysis not found"),
         (status = 415, description = "The body isn't JSON"),
         (status = 422, description = "The query ran out of time (`analysis_timeout`)"),

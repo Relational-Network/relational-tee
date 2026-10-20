@@ -5,24 +5,6 @@ static file: a TOML definition holding the pool's columns, the filters a
 request may use, what a page returns, and the SQL the worker runs inside
 the TEE.
 
-## Layout
-
-| Analysis | Filters beyond staff and membership numbers | Default sort (descending) |
-|---|---|---|
-| Awards | Exam Board Date, Award | Exam Board Date |
-| Modules | Programme, MCC Module, Module, Registration Mode, Registration Date, Exam Date | Registration Date |
-| MCC Categories | Designation, Category Date Accredited | Category Date Accredited |
-| Exam Modules | None | Exam Date |
-| CPD | CPD Year, Designation, Designation Status | CPD Year |
-| Designation Status | Designation, Current Status, Previous Status, Status Update Date, Reason for Change | Status Update Date |
-| CPD Audit | Audit Year, Audit Outcome | Audit Year |
-
-Each definition accepts exactly the headers in its columns, returns them in
-its output order, and declares employer and employer-group grant targets.
-Admins see every row; other callers need a live grant. Pages default to 100
-rows, with a maximum of 500. Non-date fields remain text, including identifiers.
-
-
 ## Trust contract
 
 1. The definition is committed here. Its raw GitHub URL at a commit, and
@@ -47,12 +29,11 @@ sha256sum *-v1.toml
 ```
 
 ```
-https://raw.githubusercontent.com/relational-network/relational-tee/<commit>/drt-examples/awards-report-v1.toml
+https://raw.githubusercontent.com/relational-network/relational-tee/<commit>/drt-examples/<analysis-id>.toml
 ```
 
-Any change to a definition changes its hash. Pools registered with the old
-hash keep the old analysis; new pools need the new hash in the dashboard's
-registry.
+Any change to a definition changes its hash. Existing pools keep their pinned
+definition; new pools need the corresponding URL and hash.
 
 ## Definition SHA-256 values
 
@@ -61,56 +42,39 @@ changes; set dashboard URLs and hashes after publication and merge.
 
 | File | SHA-256 |
 |---|---|
-| [awards-report-v1.toml](awards-report-v1.toml) | `472eb4e1e11ff4f10270af7ab29638ddef8eaacd9264cd42c0483693c8481499` |
-| [cpd-audit-v1.toml](cpd-audit-v1.toml) | `888222526ccdd4504bedc5d12b3a5fe604f84de5a15d563b7fba9e130a736f2f` |
-| [cpd-report-v1.toml](cpd-report-v1.toml) | `ad5a0873766d29b043db8e1b89950ce85534d467badd8e5263ede47eacc4dfb7` |
-| [designation-status-v1.toml](designation-status-v1.toml) | `300f06f6c4f7379e9ce087a56bb6905b08961aa9ca56b4e0b69a5d0562ddcc47` |
-| [exam-modules-v1.toml](exam-modules-v1.toml) | `78ae975d3a4d3c147e688d9b081396f8cf163120bf33625e573c41532b8077e2` |
-| [mcc-categories-v1.toml](mcc-categories-v1.toml) | `4f3c859df4fecfa859fe0056441b05ad6daa6a050f84eca7c368c768bcf52c0f` |
-| [modules-report-v1.toml](modules-report-v1.toml) | `1b42cdeb673dfb92024610eff3d19ddad62b8b173070333f70e250e041c42165` |
+| [awards-report-v1.toml](awards-report-v1.toml) | `6c521e7e0fb829cc0927aa443f65ec066bc5a46795890bdbfe12a3f60c3434e0` |
+| [cpd-audit-v1.toml](cpd-audit-v1.toml) | `74839dfeec772020035cbd62dc44747a6438548153710d65e5872691a5dbc72c` |
+| [cpd-report-v1.toml](cpd-report-v1.toml) | `7d5cd182ba4991278cfbac8dab8c8872293dce9e11cceb9f9440d8631d7b9c03` |
+| [designation-status-v1.toml](designation-status-v1.toml) | `c5dc9bbbb34f0dd6ed46f9ed2ceecdf5754e5d37dac8f7b8c99efb75bfa6b34b` |
+| [exam-modules-v1.toml](exam-modules-v1.toml) | `5ab9fe2312f32780b3f5041fb99e2dbf7684e5dfd6bbeb9b11f863cc5533c6de` |
+| [mcc-categories-v1.toml](mcc-categories-v1.toml) | `cc50edcc4999215737a72b3e797667e72800e6e597a4c9f21ca1d9f5c82ce020` |
+| [modules-report-v1.toml](modules-report-v1.toml) | `240301dd815c7ea8fa83e60e4ad269975f4947bd04ba27969d7cdb9e8235540d` |
+| [orders-report-v1.toml](orders-report-v1.toml) | `efafa68c74ff8056c21297ec996b0296a27512ac85c92d273761ee52f2188754` |
 
-## The format
+## Definition overview
 
-| Key | Meaning |
+| Key | Purpose |
 |---|---|
-| `analysis_id` | Lowercase letters, digits and hyphens; also the Execute DRT's name |
-| `display_name` | What the dashboard shows |
-| `relation` | The table name the SQL reads |
-| `[columns]` | `name = { header = "CSV header", type = "text" \| "date" }`. Dates are DD/MM/YYYY in the CSV and in the API, and `YYYY-MM-DD` inside SQLite, so ranges and sorting work |
-| `[scope]` | `key = "column"`: the scope keys a grant's targets may name, each with the text column it restricts (the Awards Report's are `employer` and `employer_group`). A target `{ key, value }` gives the rows whose column for its key holds its value exactly, and a grant sees the rows of any of its targets, so a new row-level field is a new key here, with no code change. Keys are lowercase SQL names other than `group_id` and `label`, and requests can't filter on these columns |
-| `[filters]` | `name = kind`. `date_range` binds `:name_from` and `:name_to`; `multi_select` and `search_select` bind `:name` as a JSON array of values. NULL means all; a multi-select value `""` selects empty cells |
-| `[output]` | `columns` returned in order, `default_sort`, and `page_size` (`default`, `max`). Any output column may be sorted on |
-| `sql.rows` | Every matching row, selecting `_record_id` and every output column, with each filter as `(:param IS NULL OR …)`. It is the reference for pages: the worker builds each page from `relation`, the output columns and only the filters a request sets, so SQLite can read it from the table's indexes, then sorts (then `_record_id`), pages and counts. A test holds those pages to the Awards Report's query; a definition whose rows query does more than select its columns under its filters needs a worker change, and a test of its own, first |
-| `sql.options.<filter>` | For a `date_range`, one row of `min` and `max`; for a `multi_select`, `value` and `count`; for a `search_select`, `value`, using `:search` (a prefix, already escaped for `LIKE ... ESCAPE '\'`) and `:limit`. Each runs as written: once per table, and on the rows the other filters a request sets match, which the worker gives it as `relation` in a `WITH` of its own, so an option query may not start with `WITH`. A filter's parameters may not be `:search` or `:limit`, nor another filter's |
+| `analysis_id`, `display_name` | Stable identifier and display name |
+| `relation` | The table the analysis reads |
+| `[columns]` | CSV headers and column types |
+| `[scope]` | Scope keys and the columns used to apply grant targets |
+| `[filters]` | Supported request filters |
+| `[output]` | Result columns, default sort and page limits |
+| `sql.rows`, `sql.options` | Read-only reference and filter-option queries |
+
+Each TOML file defines its own schema and analysis behaviour. For the shared
+access and query contract, including blank selections, see
+[the analysis reference](../docs/analyses.md).
 
 ## Adding an analysis
 
-A new use case, or another deployment's report, needs one TOML file here,
-named for what it does, not for whom: its `analysis_id` is also a name
-on-chain. Describe it in this README and add tests with small invented rows
-and the export's exact headers. Tests use made-up values only (Bank A, Group A,
-Subject A and so on), never a real organisation or person. After publication
-and review, the dashboard's registry takes its URL at the merged commit and
-its hash. Append a future registry entry after the existing views to place
-its tab on the right.
+Add a TOML file named for what it does and include its SHA-256 above. Add
+meaningful tests using small invented rows to verify its schema, filters,
+access restrictions and query results; a standalone fixture CSV is optional.
+Use no real organisations, people or deployment details in documentation or
+test data. After publication and review, clients can pin the definition's
+commit URL and hash.
 
-The worker needs a change only when a definition needs something the format
-can't express, such as a new filter kind, or a rows query that does more
-than select its columns under its filters. Such a change extends the format
-for every definition, with tests of its own. How the worker grants and runs
-an analysis is in [docs/analyses.md](../docs/analyses.md).
-
-## Blank multi-select values
-
-An empty CSV cell is SQL NULL. A multi-select can offer it as `value = ""`,
-with a count, displayed as **(Blank)**. Select it alone with
-`{ "mode": "selected", "values": [""] }`, or combine it with named values.
-An empty values array is invalid; `mode = "all"` still applies no condition.
-Searchable identifier selects require non-empty values.
-
-The new definitions' option queries return `coalesce(column, '') AS value`
-and group by the column. Their reference rows queries use
-`coalesce(column, '') IN (SELECT value FROM json_each(:filter))`. The worker's
-generated queries add `OR column IS NULL` only when a blank is selected, so
-ordinary nonblank queries keep their indexed lookup. Keep reference and
-page semantics aligned when adding another definition.
+Extend the shared engine only when the definition format cannot express the
+required behaviour, and cover that extension with tests.

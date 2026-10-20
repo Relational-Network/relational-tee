@@ -273,9 +273,6 @@ impl Definition {
             let Some(column) = kind_of(name) else {
                 return refuse(format!("filter {name} names no column"));
             };
-            if scoped.contains(name.as_str()) {
-                return refuse(format!("filter {name} is a scope column"));
-            }
             let expected = match kind {
                 FilterKind::DateRange => ColumnType::Date,
                 FilterKind::MultiSelect | FilterKind::SearchSelect => ColumnType::Text,
@@ -663,18 +660,17 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn scope_columns_can_not_be_filters() {
-        let toml = AWARDS_REPORT
-            .replace(
-                "award             = \"multi_select\"",
-                "employer_group    = \"multi_select\"",
-            )
-            .replace("award = '''", "employer_group = '''");
-        assert!(
-            refused(&toml).contains("scope column"),
-            "{}",
-            refused(&toml)
+    fn scope_columns_may_also_be_filters() {
+        let def =
+            Definition::parse(include_bytes!("../../drt-examples/orders-report-v1.toml")).unwrap();
+        assert_eq!(
+            def.scope["fee_payment_facility_code"],
+            "fee_payment_facility_code"
         );
+        assert!(def
+            .filters
+            .iter()
+            .any(|f| f.name == "fee_payment_facility_code"));
     }
 
     #[test]

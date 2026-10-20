@@ -1,0 +1,84 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Relational Network
+
+analysis_id = "orders-report-v1"
+display_name = "Fee Payment Facility – Orders Report"
+relation = "orders"
+
+[columns]
+order_date = { header = "Order Date", type = "date" }
+staff_number = { header = "Staff Number", type = "text" }
+membership_number = { header = "Membership Number", type = "text" }
+title = { header = "Title", type = "text" }
+first_name = { header = "First Name", type = "text" }
+surname = { header = "Surname", type = "text" }
+date_of_birth = { header = "Date of Birth", type = "date" }
+order_type = { header = "Order Type", type = "text" }
+item_description = { header = "Item Description", type = "text" }
+item_category = { header = "Item Category", type = "text" }
+fee_payment_facility_details = { header = "Fee Payment Facility Details", type = "text" }
+fee_payment_facility_code = { header = "Fee Payment Facility Code", type = "text" }
+order_id = { header = "Order ID", type = "text" }
+authorisation_code = { header = "Authorisation Code", type = "text" }
+item_fee = { header = "Item Fee", type = "text" }
+
+[scope]
+fee_payment_facility_code = "fee_payment_facility_code"
+
+[filters]
+order_date = "date_range"
+order_type = "multi_select"
+fee_payment_facility_code = "multi_select"
+item_category = "multi_select"
+staff_number = "search_select"
+membership_number = "search_select"
+
+[output]
+columns = [
+    "order_date", "staff_number", "membership_number", "title",
+    "first_name", "surname", "date_of_birth", "order_type",
+    "item_description", "item_category", "fee_payment_facility_details", "fee_payment_facility_code",
+    "order_id", "authorisation_code", "item_fee",
+]
+default_sort = { column = "order_date", direction = "desc" }
+page_size = { default = 100, max = 500 }
+
+[sql]
+rows = '''
+SELECT _record_id, order_date, staff_number, membership_number, title, first_name, surname, date_of_birth, order_type, item_description, item_category, fee_payment_facility_details, fee_payment_facility_code, order_id, authorisation_code, item_fee
+FROM orders
+WHERE (:order_date_from IS NULL OR order_date >= :order_date_from)
+  AND (:order_date_to IS NULL OR order_date <= :order_date_to)
+  AND (:order_type IS NULL OR coalesce(order_type, '') IN (SELECT value FROM json_each(:order_type)))
+  AND (:fee_payment_facility_code IS NULL OR coalesce(fee_payment_facility_code, '') IN (SELECT value FROM json_each(:fee_payment_facility_code)))
+  AND (:item_category IS NULL OR coalesce(item_category, '') IN (SELECT value FROM json_each(:item_category)))
+  AND (:staff_number IS NULL OR coalesce(staff_number, '') IN (SELECT value FROM json_each(:staff_number)))
+  AND (:membership_number IS NULL OR coalesce(membership_number, '') IN (SELECT value FROM json_each(:membership_number)))
+'''
+
+[sql.options]
+order_date = '''
+SELECT min(order_date) AS min, max(order_date) AS max FROM orders
+'''
+order_type = '''
+SELECT coalesce(order_type, '') AS value, count(*) AS count
+FROM orders GROUP BY order_type ORDER BY value
+'''
+fee_payment_facility_code = '''
+SELECT coalesce(fee_payment_facility_code, '') AS value, count(*) AS count
+FROM orders GROUP BY fee_payment_facility_code ORDER BY value
+'''
+item_category = '''
+SELECT coalesce(item_category, '') AS value, count(*) AS count
+FROM orders GROUP BY item_category ORDER BY value
+'''
+staff_number = '''
+SELECT coalesce(staff_number, '') AS value
+FROM orders WHERE coalesce(staff_number, '') LIKE :search || '%' ESCAPE '\'
+GROUP BY staff_number ORDER BY staff_number LIMIT :limit
+'''
+membership_number = '''
+SELECT coalesce(membership_number, '') AS value
+FROM orders WHERE coalesce(membership_number, '') LIKE :search || '%' ESCAPE '\'
+GROUP BY membership_number ORDER BY membership_number LIMIT :limit
+'''

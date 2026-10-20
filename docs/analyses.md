@@ -8,6 +8,13 @@ Admins see every row, with no grant. An analyst needs an active grant, which the
 
 The owner changes a grant's targets with `POST …/grant-scope`, naming the grant and the `scope_revision` the edit started from, so an edit made before the analyst was granted again never lands on the later grant; it burns nothing, and every setting is kept in the grant's `scope_history`. `POST …/scope-check` lists each key's values in the pool's data with their rows and counts what a draft's targets give, flagging a value no row holds with the data's nearest spellings; it decides rows with the same code as analysts' tables.
 
+A definition may also declare a filter on a scope column: it
+narrows the caller's already scoped table. Selecting an ungranted value returns
+no rows and never expands the grant. This applies to pages, counts, options
+and searches; ignoring a facet's own selection still retains the grant scope.
+Admins can filter any value, including blanks where the definition offers
+them. Queries cannot supply or replace grant targets.
+
 No grant, a grant with no targets, or targets the analysis can't apply is `403`; targets no row holds get an empty page. Only rows are restricted: every caller sees every column.
 
 ## Grants
@@ -72,13 +79,16 @@ About one table build, page or search per CPU runs at a time, and a table runs o
 
 ### Selecting blank values
 
-A multi-select may return an option with `value: ""`, meaning an empty CSV
+A select may return an option with `value: ""`, meaning an empty CSV
 cell (SQL NULL). Send `{ "mode": "selected", "values": [""] }` to select
 only blanks, or include named values in the same array to select their union.
 The option's count and all dependent options, searches and distinct counts
 follow the same filters and grant scope. An empty array remains invalid;
-`mode: "all"` removes the filter. Identifier searches accept only non-empty
-selections. The definition's options SQL decides which choices it offers;
+`mode: "all"` removes the filter. Identifier searches can return `""` as
+**(Blank)** when the search prefix is empty and matching rows have empty
+identifiers. A non-empty prefix searches populated identifiers; a chosen
+blank remains selected alongside any named values. The definition's options
+SQL decides which choices it offers;
 existing pinned definitions remain unchanged.
 
 ## Dates
