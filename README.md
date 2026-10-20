@@ -3,7 +3,7 @@
 A confidential worker for credential pools on Solana. It runs in Azure Confidential Containers (AMD SEV-SNP) as an Axum server, and serves an HTTPS API that:
 
 - creates credential pools from an approved analysis, takes sealed CSV uploads, issues and revokes credentials, and keeps each pool's issuance log and audit trail;
-- grants analysts an analysis of a pool's data, naming the rows each one sees, and runs it inside the worker;
+- grants analysts an analysis of a pool's data, naming the rows each one sees, runs it inside the worker, and exports what it matches as a CSV or XLSX file;
 - holds custodial Solana wallets: create, balance, fee estimate, send, history, and admin suspend and activate.
 
 Its keys are released only to an attested worker, clients seal uploads to an attested key, and everything it stores is sealed inside it. Clients check each worker against a signed manifest of reference values, and [`deploy/`](deploy/) shows how anyone can check that a deployment runs this code.
@@ -43,7 +43,7 @@ curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8443/v1/users/me
 | [docs/configuration.md](docs/configuration.md) | Environment variables, and how dev and release builds differ |
 | [docs/architecture.md](docs/architecture.md) | Keys, TLS, authentication, grant commitments, sealed storage, the reconciler, health and shutdown |
 | [docs/api.md](docs/api.md) | API conventions (errors, idempotency, sealed uploads, limits, logs, audit events) and the endpoints |
-| [docs/analyses.md](docs/analyses.md) | How analyses are granted, checked against the chain and run |
+| [docs/analyses.md](docs/analyses.md) | How analyses are granted, checked against the chain, run and exported |
 | [docs/build-and-release.md](docs/build-and-release.md) | The Nix build, the image, CI and publishing |
 | [deploy/README.md](deploy/README.md) | The measured container group profile, the manifest schema, and checking a deployment |
 | [drt-examples/README.md](drt-examples/README.md) | The analysis definition format, and adding an analysis |

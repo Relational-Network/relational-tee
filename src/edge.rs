@@ -71,6 +71,8 @@ pub fn cors(origin: &str) -> CorsLayer {
             HeaderName::from_static("idempotent-replayed"),
             header::RETRY_AFTER,
             crate::request_id::REQUEST_ID_HEADER,
+            header::CONTENT_DISPOSITION,
+            crate::api::analyses::EXPORT_ID_HEADER,
         ])
         .max_age(Duration::from_secs(86_400))
 }
@@ -543,7 +545,13 @@ mod tests {
         let exposed = simple.headers()[header::ACCESS_CONTROL_EXPOSE_HEADERS]
             .to_str()
             .unwrap();
-        for name in ["idempotent-replayed", "retry-after", "x-request-id"] {
+        for name in [
+            "idempotent-replayed",
+            "retry-after",
+            "x-request-id",
+            "content-disposition",
+            "x-export-id",
+        ] {
             assert!(exposed.contains(name), "{exposed}");
         }
     }

@@ -6,7 +6,8 @@
 //! - [`Threads`] runs analysis work on blocking threads, about one per CPU
 //!   at a time. Each job gets a [`Stop`] that fires at its deadline or once
 //!   the request that asked for it is gone, and checks it as it goes, so a
-//!   timed-out or abandoned job gives its thread back.
+//!   timed-out or abandoned job gives its thread back. Work that goes on in
+//!   a task of its own links its stops to the request's [`Cancel`].
 //! - [`cpu`] runs a request's CPU-heavy step, such as opening a sealed
 //!   upload, off the async threads, so other requests and health checks
 //!   keep being served. What can reach it is bounded by the memory budget.
@@ -27,11 +28,44 @@ use crate::error::ApiError;
 /// How long a job waits for a free thread before it gets 503.
 pub const QUEUE_WAIT: Duration = Duration::from_secs(1);
 
-/// When work should stop: at a deadline, or once it's abandoned.
+/// When work should stop: at a deadline, once it's abandoned, or once the
+/// request it's linked to is cancelled.
 #[derive(Clone, Debug)]
 pub struct Stop {
     deadline: Instant,
     abandoned: Arc<AtomicBool>,
+    cancelled: Option<Cancelled>,
+}
+
+/// A request's cancellation, for work that goes on in a task of its own
+/// when the request's future is dropped, as it is when its client goes
+/// away: dropping this fires every [`Stop`] linked to its [`Cancelled`].
+/// Each step of the work gets a stop of its own, since a stop is abandoned
+/// once its step ends, and they share the request's flag.
+#[derive(Debug, Default)]
+pub struct Cancel(Cancelled);
+
+impl Cancel {
+    /// The flag the work reads.
+    pub fn watch(&self) -> Cancelled {
+        self.0.clone()
+    }
+}
+
+impl Drop for Cancel {
+    fn drop(&mut self) {
+        self.0 .0.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Whether a request's [`Cancel`] has been dropped.
+#[derive(Clone, Debug, Default)]
+pub struct Cancelled(Arc<AtomicBool>);
+
+impl Cancelled {
+    pub fn is_set(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
 }
 
 /// Work stopped before it finished.
@@ -52,6 +86,7 @@ impl Stop {
         Self {
             deadline,
             abandoned: Arc::default(),
+            cancelled: None,
         }
     }
 
@@ -60,9 +95,17 @@ impl Stop {
         Self::at(Instant::now() + time)
     }
 
+    /// This stop, which also fires once `cancelled` is set.
+    pub fn linked(mut self, cancelled: &Cancelled) -> Self {
+        self.cancelled = Some(cancelled.clone());
+        self
+    }
+
     /// Whether the work should stop now.
     pub fn stopped(&self) -> bool {
-        self.abandoned.load(Ordering::Relaxed) || Instant::now() >= self.deadline
+        self.abandoned.load(Ordering::Relaxed)
+            || self.cancelled.as_ref().is_some_and(Cancelled::is_set)
+            || Instant::now() >= self.deadline
     }
 
     /// [`Self::stopped`] as an error, for `?`.
@@ -101,6 +144,7 @@ fn busy() -> ApiError {
 /// Blocking threads for analysis work, a few at a time.
 pub struct Threads {
     permits: Arc<Semaphore>,
+    count: usize,
 }
 
 impl Default for Threads {
@@ -115,7 +159,13 @@ impl Threads {
     pub fn new(count: usize) -> Self {
         Self {
             permits: Arc::new(Semaphore::new(count)),
+            count,
         }
+    }
+
+    /// How many jobs run at a time.
+    pub fn count(&self) -> usize {
+        self.count
     }
 
     /// Run `work` on a blocking thread once one is free, or 503 if none
@@ -293,6 +343,25 @@ mod tests {
             ("analysis_busy", Some(1))
         );
         assert_eq!(threads.run(soon(), |_| Ok(3)).await.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn linked_stops_fire_when_their_request_is_cancelled_and_not_before() {
+        let threads = Threads::new(1);
+        let cancel = Cancel::default();
+        let cancelled = cancel.watch();
+        let step = || Stop::after(Duration::from_secs(60)).linked(&cancelled);
+        // A finished step abandons its own stop only.
+        let first = step();
+        let seen = first.clone();
+        assert!(!threads.run(first, |stop| Ok(stop.stopped())).await.unwrap());
+        assert!(seen.stopped());
+        let second = step();
+        assert!(!second.stopped() && !cancelled.is_set());
+        drop(cancel);
+        assert!(cancelled.is_set());
+        assert!(second.stopped());
+        assert!(!Stop::after(Duration::from_secs(60)).stopped(), "unlinked");
     }
 
     #[tokio::test]

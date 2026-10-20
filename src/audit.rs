@@ -42,6 +42,7 @@ fn event_for(method: &Method, route: &str) -> Option<&'static str> {
         ("POST", "/v1/drt/pools/{pool_pda}/analyses/{analysis_id}/options/{filter}") => {
             "analysis_values_searched"
         }
+        ("POST", "/v1/drt/pools/{pool_pda}/analyses/{analysis_id}/export") => "analysis_exported",
         ("POST", "/v1/wallets") => "wallet_created",
         ("DELETE", "/v1/wallets/{wallet_id}") => "wallet_deleted",
         ("POST", "/v1/wallets/{wallet_id}/send") => "transaction_sent",

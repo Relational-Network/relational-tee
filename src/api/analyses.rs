@@ -8,41 +8,54 @@
 //! - `POST …/analyses/{analysis_id}/options`          — filter options, under the other filters
 //! - `POST …/analyses/{analysis_id}/options/{filter}` — a search filter's values, likewise
 //! - `POST …/analyses/{analysis_id}/query`            — a page of matching rows
+//! - `POST …/analyses/{analysis_id}/export`           — every matching row, as a file
 //!
 //! under `/v1/drt/pools/{pool_pda}`. The SQL is the pool's definition, read
 //! from storage by the hash its Execute DRT pins; requests only bind values
 //! to it. Every options, search and query request is recorded in the
 //! analysis log ([`crate::storage::analysis_log`]), and a success whose
-//! record can't be stored returns nothing.
+//! record can't be stored returns nothing. An export is recorded before it
+//! runs, and runs in a task of its own that records how it ended, even
+//! once its client has gone away.
 
 use std::collections::BTreeMap;
+use std::convert::Infallible;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
-use axum::body::Bytes;
+use axum::body::{Body, Bytes, HttpBody};
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Path, Query, State};
-use axum::http::{header, HeaderMap, Method};
+use axum::http::{header, HeaderMap, HeaderName, Method};
+use axum::response::Response;
 use axum::Json;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
+use http_body_util::Full;
+use hyper::body::{Frame, SizeHint};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tracing::{error, warn};
+use tracing::{error, warn, Instrument, Span};
 use utoipa::ToSchema;
 
 use crate::analysis::definition::{ColumnType, Definition, FilterKind};
+use crate::analysis::export::Format;
 use crate::analysis::query::{
     self, FilterOptions, FilterRequest, Page, QueryError, QueryRequest, SortRequest,
     DEFAULT_SEARCH_LIMIT,
 };
+use crate::analysis::runner::Exported;
 use crate::analysis::table::{check_targets, Scope, Target};
 use crate::api::pools::load_pool;
 use crate::audit;
 use crate::auth::{Caller, Permission};
+use crate::budget::Reservation;
 use crate::error::ApiError;
 use crate::state::AppState;
-use crate::storage::analysis_log::AnalysisRecord;
+use crate::storage::analysis_log::{AnalysisRecord, ExportEvent};
 use crate::storage::chain::Seen;
 use crate::storage::pools::{AnalysisRef, PoolDoc};
+use crate::work::{Cancel, Cancelled};
 
 // ============================================================================
 // Request / Response types
@@ -160,6 +173,24 @@ pub struct SearchRequest {
 pub struct SearchResponse {
     pub values: Vec<String>,
 }
+
+/// An export: a file format, and a query's filters and sort. It holds every
+/// matching row, so a page, `distinct` or anything else is refused.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ExportRequest {
+    pub format: Format,
+    /// As a query names them.
+    #[serde(default)]
+    pub filters: BTreeMap<String, FilterRequest>,
+    /// The definition's default sort when omitted.
+    #[serde(default)]
+    pub sort: Option<SortRequest>,
+}
+
+/// The export ID an export's file comes with, as its analysis log records
+/// name it.
+pub const EXPORT_ID_HEADER: HeaderName = HeaderName::from_static("x-export-id");
 
 // ============================================================================
 // Helpers
@@ -323,6 +354,7 @@ impl Logged {
                 returned: None,
                 total_matched: None,
                 outcome: String::new(),
+                export: None,
             },
         }
     }
@@ -358,10 +390,7 @@ impl Logged {
             (Ok(value), Ok(())) => Ok(value),
             (Ok(_), Err(e)) => {
                 error!(alert = "analysis_log", error = %e, "An analysis request couldn't be logged");
-                Err(ApiError::service_unavailable(
-                    "this request couldn't be recorded in the analysis log, so its result isn't returned; retry",
-                )
-                .with_code("analysis_log_unavailable"))
+                Err(log_unavailable())
             }
             (Err(e), stored) => {
                 if let Err(log) = stored {
@@ -871,24 +900,280 @@ pub async fn run_query(
     Ok(Json(page))
 }
 
+/// Every row of the caller's that a query matches, as a CSV or XLSX file.
+#[utoipa::path(
+    post,
+    path = "/v1/drt/pools/{pool_pda}/analyses/{analysis_id}/export",
+    tag = "Analyses",
+    summary = "Export an analysis",
+    description = "Every row the caller sees that the request's filters match, in the sort asked for, as a file of the analysis's output columns: CSV (UTF-8 with a byte order mark, CRLF line ends) or XLSX. The filters and sort are checked as a query's are; an export takes no page, `distinct` or scope. Dates are DD/MM/YYYY and empty cells are empty. Every XLSX cell is text, never a number, formula or link; a CSV value that a spreadsheet would read as a formula starts with `'`, unless it's a plain amount such as `-25.00`. An export holds at most 100,000 rows and 50 MiB, and fails rather than returning part of its rows. It's recorded in the analysis log twice under the export ID it returns: when it's asked for, before any work, and when it ends, and a file is sent only once its success is stored. Read-only, so it needs no Idempotency-Key. Needs `analyses:run`, and for an analyst an active grant.",
+    security(("bearer_auth" = [])),
+    params(
+        ("pool_pda" = String, Path, description = "Pool PDA address (base58)"),
+        ("analysis_id" = String, Path, description = "The pool's analysis"),
+    ),
+    request_body = ExportRequest,
+    responses(
+        (status = 200, description = "The file",
+            content(
+                (String = "text/csv"),
+                ([u8] = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+            ),
+            headers(
+                ("Content-Disposition" = String, description = "`attachment`, with a file name of the analysis ID and the UTC time the export was asked for"),
+                ("X-Export-Id" = String, description = "The export's ID, as its two records in the analysis log name it"),
+            ),
+        ),
+        (status = 400, description = "A format the worker doesn't make, or filters or a sort that don't fit the analysis (`invalid_query`)"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "No active grant (`no_grant`), a grant the chain doesn't show (`grant_not_live`), or no row scope"),
+        (status = 404, description = "Pool or analysis not found"),
+        (status = 415, description = "The body isn't JSON"),
+        (status = 422, description = "More rows match than an export holds (`export_too_many_rows`), the file would be over 50 MiB or holds a cell over Excel's 32,767 characters (`export_too_large`), the export ran out of time (`analysis_timeout`), or it needs more memory than the worker has (`too_large_for_memory`)"),
+        (status = 503, description = "The worker is busy (`analysis_busy` or `worker_busy`, with Retry-After), the export couldn't be recorded in the analysis log (`analysis_log_unavailable`), the chain can't be read to check the grant (`rpc_unavailable`), the pool's last change is still being anchored or was made while the export ran (`pool_settling`, with Retry-After), or the pool's records are older than its on-chain generation (`pool_records_stale`)"),
+    )
+)]
+pub async fn export_analysis(
+    caller: Caller,
+    State(state): State<AppState>,
+    Path((pool_pda, analysis_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    caller.require(Permission::AnalysesRun)?;
+    require_json(&headers)?;
+    let (doc, analysis) = load(&state, &pool_pda, &analysis_id).await?;
+    let asked = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    let format = asked
+        .get("format")
+        .and_then(|f| Format::deserialize(f).ok());
+    let mut logged = Logged::new(&caller, &doc, &analysis, "export", asked);
+    let requested_at = logged.record.at;
+    let export_id = uuid::Uuid::new_v4().to_string();
+    logged.record.outcome = "requested".into();
+    logged.record.export = Some(ExportEvent {
+        export_id: export_id.clone(),
+        stage: "requested".into(),
+        format,
+        pool_name: doc.pool_name.clone(),
+        requested_at,
+        result: None,
+        bytes: None,
+        duration_ms: None,
+    });
+    if let Err(e) = state.storage.analysis_log().record(&logged.record).await {
+        error!(alert = "analysis_log", error = %e, "An export request couldn't be logged");
+        return Err(log_unavailable());
+    }
+    // The export runs in a task of its own, so that it records how it ended
+    // even if its client goes away; dropping `cancel` stops its work.
+    let cancel = Cancel::default();
+    let task = tokio::spawn(
+        run_export(state, caller, doc, analysis, body, logged, cancel.watch())
+            .instrument(Span::current()),
+    );
+    let (exported, format) = task.await.map_err(|e| {
+        error!(error = %e, "An export's task failed");
+        ApiError::internal("the export failed")
+    })??;
+    let Exported { file, rows, held } = exported;
+    audit::rows(rows);
+    let name = file_name(&analysis_id, requested_at, format);
+    let body = Body::new(HeldFile {
+        file: Full::new(Bytes::from(file)),
+        _held: held,
+    });
+    Response::builder()
+        .header(header::CONTENT_TYPE, format.content_type())
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{name}\""),
+        )
+        .header(header::CACHE_CONTROL, "no-store")
+        .header(EXPORT_ID_HEADER, export_id)
+        .body(body)
+        .map_err(|e| {
+            error!(error = %e, "An export's response couldn't be built");
+            ApiError::internal("the export failed")
+        })
+}
+
+/// The export route's work, after its request is recorded: the file, and
+/// the record of how it ended, stored before the file is returned. A
+/// success whose record can't be stored, once retried, returns nothing.
+async fn run_export(
+    state: AppState,
+    caller: Caller,
+    doc: PoolDoc,
+    analysis: AnalysisRef,
+    body: Bytes,
+    mut logged: Logged,
+    cancelled: Cancelled,
+) -> Result<(Exported, Format), ApiError> {
+    let result = async {
+        let def = state
+            .analyses
+            .definition(&state.storage, &analysis.code_hash_hex)
+            .await?;
+        let (grant, scope) = authorize(&state, &caller, &doc, &analysis, &def).await?;
+        let analyst = grant.is_some();
+        logged.through(grant);
+        let request: ExportRequest = parse(&body)?;
+        let asked = QueryRequest {
+            filters: request.filters,
+            sort: request.sort,
+            ..Default::default()
+        };
+        let query = query::Query::check(&def, &asked).map_err(query_error)?;
+        if let Some(asked) = logged.record.request.as_object_mut() {
+            asked.insert(
+                "ran_with".into(),
+                json!({ "sort": { "field": query.sort, "direction": query.direction } }),
+            );
+        }
+        let table = state
+            .analyses
+            .table(&state.storage, &doc, &def, &scope)
+            .await?;
+        let exported = state
+            .analyses
+            .export(table, def, query, request.format, &cancelled)
+            .await?;
+        if_current(&state, &doc, analyst, (exported, request.format)).await
+    }
+    .await;
+
+    let record = &mut logged.record;
+    let event = record.export.as_mut().expect("an export's record names it");
+    let (result_name, outcome) = match &result {
+        Ok(_) if cancelled.is_set() => ("cancelled", "cancelled"),
+        Ok(_) => ("success", "success"),
+        Err(e) if e.code == "analysis_timeout" && cancelled.is_set() => ("cancelled", "cancelled"),
+        Err(e) if e.code == "analysis_timeout" => ("timeout", e.code),
+        Err(e) if e.status.is_server_error() => ("failed", e.code),
+        Err(e) => ("refused", e.code),
+    };
+    if let Ok((exported, _)) = &result {
+        record.returned = Some(exported.rows);
+        record.total_matched = Some(exported.rows);
+        event.bytes = Some(exported.file.len() as u64);
+    }
+    record.event_id = uuid::Uuid::new_v4().to_string();
+    record.at = Utc::now();
+    record.outcome = outcome.into();
+    event.stage = "finished".into();
+    event.result = Some(result_name.into());
+    event.duration_ms =
+        Some(u64::try_from((record.at - event.requested_at).num_milliseconds()).unwrap_or(0));
+
+    let log = state.storage.analysis_log();
+    let stored = match log.record(record).await {
+        Ok(()) => Ok(()),
+        Err(first) => {
+            warn!(error = %first, "An export's record couldn't be stored; retrying");
+            log.record(record).await
+        }
+    };
+    match (result, stored) {
+        (Ok(file), Ok(())) => Ok(file),
+        (Ok(_), Err(e)) => {
+            error!(alert = "analysis_log", error = %e, "An export couldn't be logged");
+            Err(log_unavailable())
+        }
+        (Err(e), stored) => {
+            if let Err(log) = stored {
+                warn!(error = %log, "A failed export couldn't be logged");
+            }
+            Err(e)
+        }
+    }
+}
+
+/// `503 analysis_log_unavailable`: the request couldn't be recorded.
+fn log_unavailable() -> ApiError {
+    ApiError::service_unavailable(
+        "this request couldn't be recorded in the analysis log, so its result isn't returned; retry",
+    )
+    .with_code("analysis_log_unavailable")
+}
+
+/// An export's file name: the analysis ID, kept to characters any file
+/// system and header take, and the UTC time it was asked for.
+fn file_name(analysis_id: &str, requested_at: DateTime<Utc>, format: Format) -> String {
+    let mut stem: String = analysis_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        .collect();
+    if stem.trim_matches('.').is_empty() {
+        stem = "export".into();
+    }
+    format!(
+        "{stem}-{}.{}",
+        requested_at.format("%Y%m%d-%H%M%S"),
+        format.extension()
+    )
+}
+
+/// A file's body, holding the file's share of the worker's memory until
+/// it's sent or dropped.
+struct HeldFile {
+    file: Full<Bytes>,
+    _held: Reservation,
+}
+
+impl HttpBody for HeldFile {
+    type Data = Bytes;
+    type Error = Infallible;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
+        Pin::new(&mut self.get_mut().file).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.file.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.file.size_hint()
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
-    use axum::body::Body;
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    use std::sync::{Arc, OnceLock, Weak};
+    use std::time::Duration;
+
+    use axum::body::{to_bytes, Body};
     use axum::http::{Request, StatusCode};
+    use axum::Router;
     use sha2::{Digest, Sha256};
     use solana_pubkey::Pubkey;
+    use tower::ServiceExt;
 
     use super::*;
     use crate::analysis::definition::tests::AWARDS_REPORT;
-    use crate::api::credentials::tests::{send, sign_in, worker, Admin, Worker};
+    use crate::analysis::export::tests::{read_csv, read_xlsx};
+    use crate::analysis::export::Limits;
+    use crate::analysis::runner::Analyses;
+    use crate::api::credentials::tests::{send, sign_in, worker, worker_with, Admin, Worker};
     use crate::api::grants::tests::{analysis_pool, analyst, execute_drt_config, ANALYSIS};
     use crate::auth::entra::mint::Spec;
     use crate::auth::entra::tests::{config, entra_key};
     use crate::blockchain::drt::pda::derive_grant_pda;
+    use crate::budget::Budget;
     use crate::data_validation::tests::{awards_schema, AWARDS_HEADER};
     use crate::storage::pools::GrantScope;
     use crate::storage::pools::{Grant, GrantRevocation, Upload, INITIAL};
     use crate::storage::Change;
+    use crate::storage::{Storage, StorageKeys, StoreError};
+    use crate::store::files::LocalFiles;
+    use crate::store::{BoxFuture, Created, ETag, Fetched, Listed, ObjectStore, Replaced};
+    use crate::tee::tests::fixed_key;
+    use crate::work::Threads;
     use std::collections::BTreeSet;
 
     /// Employer group Group A's rows.
@@ -1883,5 +2168,750 @@ pub(crate) mod tests {
         let (status, _, body) = send(&worker.app, get(&open, &reader)).await;
         assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
         assert_eq!(body["code"], "rate_limited");
+    }
+
+    fn export_path(pool_pda: &Pubkey) -> String {
+        format!("/v1/drt/pools/{pool_pda}/analyses/{ANALYSIS}/export")
+    }
+
+    /// A response's status and headers, its body's bytes, and the length
+    /// its body declares.
+    async fn download(
+        app: &Router,
+        request: Request<Body>,
+    ) -> (StatusCode, HeaderMap, Vec<u8>, Option<u64>) {
+        let response = app.clone().oneshot(request).await.unwrap();
+        let length = response.body().size_hint().exact();
+        let (parts, body) = response.into_parts();
+        let body = to_bytes(body, 64 << 20).await.unwrap();
+        (parts.status, parts.headers, body.to_vec(), length)
+    }
+
+    fn error_of(body: &[u8]) -> Value {
+        serde_json::from_slice(body).unwrap_or_default()
+    }
+
+    fn stage(record: &AnalysisRecord) -> Option<&str> {
+        record.export.as_ref().map(|e| e.stage.as_str())
+    }
+
+    /// The records of export `export_id`: the one written when it was
+    /// asked for and the one written when it ended.
+    fn pair<'a>(
+        log: &'a [AnalysisRecord],
+        export_id: &str,
+    ) -> (&'a AnalysisRecord, &'a AnalysisRecord) {
+        let records: Vec<_> = log
+            .iter()
+            .filter(|r| r.export.as_ref().is_some_and(|e| e.export_id == export_id))
+            .collect();
+        assert_eq!(records.len(), 2, "{log:#?}");
+        let of = |s| *records.iter().find(|r| stage(r) == Some(s)).unwrap();
+        let (requested, finished) = (of("requested"), of("finished"));
+        assert_eq!(requested.outcome, "requested");
+        assert_ne!(requested.event_id, finished.event_id);
+        let (asked, ended) = (
+            requested.export.as_ref().unwrap(),
+            finished.export.as_ref().unwrap(),
+        );
+        assert_eq!(asked.requested_at, ended.requested_at);
+        assert_eq!(
+            (&asked.pool_name, asked.format),
+            (&ended.pool_name, ended.format)
+        );
+        assert!(asked.result.is_none() && ended.result.is_some());
+        (requested, finished)
+    }
+
+    /// The finished records of every export in `log`.
+    fn finished(log: &[AnalysisRecord]) -> Vec<&AnalysisRecord> {
+        log.iter()
+            .filter(|r| stage(r) == Some("finished"))
+            .collect()
+    }
+
+    /// A worker whose analyses are `analyses`.
+    fn worker_exporting(analyses: Analyses) -> (Worker, Arc<Analyses>) {
+        let analyses = Arc::new(analyses);
+        let shared = analyses.clone();
+        (worker_with(move |state| state.analyses = shared), analyses)
+    }
+
+    #[tokio::test]
+    async fn an_export_is_every_matching_row_as_a_file_and_is_logged_twice() {
+        let worker = worker();
+        let owner = worker.admin("oid-owner").await;
+        let pool_pda = awards_pool(&worker, &owner).await;
+        let (group_a, group_a_id) = analyst(&worker.app, "oid-group-a").await;
+        grant(&worker, &pool_pda, &group_a_id, GROUP_A).await;
+        let base = format!("/v1/drt/pools/{pool_pda}/analyses/{ANALYSIS}");
+        let (_, _, summary) = send(&worker.app, get(&base, &owner.token)).await;
+        let named = |field: &str| -> Vec<String> {
+            summary["columns"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| c[field].as_str().unwrap().to_string())
+                .collect()
+        };
+        let (columns, headers) = (named("name"), named("header"));
+
+        // The file holds the rows the query pages through, in its sort.
+        let asked = json!({
+            "filters": { "award": { "mode": "selected", "values": ["Certificate"] } },
+            "sort": { "field": "staff_number", "direction": "desc" },
+        });
+        let mut paged = asked.clone();
+        paged["pagination"] = json!({ "limit": 500 });
+        let (_, _, page) = send(
+            &worker.app,
+            post(&format!("{base}/query"), &owner.token, &paged),
+        )
+        .await;
+        let mut expected = vec![headers.clone()];
+        expected.extend(page["rows"].as_array().unwrap().iter().map(|row| {
+            columns
+                .iter()
+                .map(|c| row[c].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        }));
+        assert_eq!(expected.len(), 4, "{page}");
+
+        let path = format!("{base}/export");
+        let mut exports = Vec::new();
+        for format in [Format::Csv, Format::Xlsx] {
+            let mut body = asked.clone();
+            body["format"] = json!(format);
+            let (status, sent, file, length) =
+                download(&worker.app, post(&path, &owner.token, &body)).await;
+            assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&file));
+            let cells = match format {
+                Format::Csv => read_csv(&file),
+                Format::Xlsx => read_xlsx(&file),
+            };
+            assert_eq!(cells, expected, "{format:?}");
+            assert_eq!(length, Some(file.len() as u64));
+            assert_eq!(sent[header::CONTENT_TYPE], format.content_type());
+            assert_eq!(sent[header::CACHE_CONTROL], "no-store");
+            let disposition = sent[header::CONTENT_DISPOSITION].to_str().unwrap();
+            let name = disposition
+                .strip_prefix("attachment; filename=\"awards-report-v1-")
+                .and_then(|n| n.strip_suffix(&format!(".{}\"", format.extension())))
+                .unwrap_or_else(|| panic!("{disposition}"));
+            assert!(
+                chrono::NaiveDateTime::parse_from_str(name, "%Y%m%d-%H%M%S").is_ok(),
+                "{disposition}"
+            );
+            let export_id = sent[&EXPORT_ID_HEADER].to_str().unwrap().to_string();
+            exports.push((format, body, file.len(), export_id));
+        }
+
+        // An analyst's file holds their rows only, in the default sort.
+        let (status, sent, file, _) = download(
+            &worker.app,
+            post(&path, &group_a, &json!({ "format": "csv" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let rows = read_csv(&file);
+        let group = columns.iter().position(|c| c == "employer_group").unwrap();
+        let staff: Vec<_> = rows[1..].iter().map(|r| r[0].as_str()).collect();
+        assert_eq!(staff, ["000124", "020001", "000123"]);
+        assert!(rows[1..].iter().all(|r| r[group] == "Group A"));
+        let analysts = sent[&EXPORT_ID_HEADER].to_str().unwrap().to_string();
+
+        // Each export has its two records, the request as it was sent and
+        // then how it ended.
+        let log = logged_today(&worker, &pool_pda).await;
+        assert_eq!(log.len(), 7, "a query and three exports: {log:#?}");
+        for (format, body, bytes, export_id) in &exports {
+            let (requested, finished) = pair(&log, export_id);
+            assert_eq!(&requested.request, body);
+            let event = requested.export.as_ref().unwrap();
+            assert_eq!(event.format, Some(*format));
+            assert_eq!(event.pool_name, summary["pool_name"].as_str().unwrap());
+            assert_eq!(finished.outcome, "success");
+            assert_eq!(
+                (finished.returned, finished.total_matched),
+                (Some(3), Some(3))
+            );
+            assert_eq!(finished.request["ran_with"]["sort"], asked["sort"]);
+            let ended = finished.export.as_ref().unwrap();
+            assert_eq!(ended.result.as_deref(), Some("success"));
+            assert_eq!(ended.bytes, Some(*bytes as u64));
+            assert!(ended.duration_ms.is_some());
+            assert!(finished.grant_id.is_none());
+        }
+        let (requested, finished) = pair(&log, &analysts);
+        assert_eq!(requested.user_id, group_a_id);
+        assert!(requested.grant_id.is_none(), "checked after it's recorded");
+        assert_eq!(finished.grant_id, Some(format!("g-{group_a_id}")));
+        assert!(finished.chain_slot.is_some());
+        assert_eq!(
+            finished.request["ran_with"]["sort"],
+            json!({ "field": "exam_board_date", "direction": "desc" })
+        );
+    }
+
+    #[tokio::test]
+    async fn an_export_takes_a_querys_filters_and_sort_only_and_fails_closed() {
+        let worker = worker();
+        let owner = worker.admin("oid-owner").await;
+        let pool_pda = awards_pool(&worker, &owner).await;
+        let (granted, granted_id) = analyst(&worker.app, "oid-group-a").await;
+        let (ungranted, _) = analyst(&worker.app, "oid-nogrant").await;
+        let (unseen, unseen_id) = analyst(&worker.app, "oid-unseen").await;
+        let (revoked, revoked_id) = analyst(&worker.app, "oid-revoked").await;
+        for id in [&granted_id, &unseen_id, &revoked_id] {
+            grant(&worker, &pool_pda, id, GROUP_A).await;
+        }
+        let commitment: [u8; 32] = Sha256::digest(&unseen_id).into();
+        worker.chain.close(&derive_grant_pda(&commitment).0);
+        worker
+            .storage
+            .pools()
+            .update::<ApiError>(&pool_pda.to_string(), |doc| {
+                let grant = doc
+                    .grants
+                    .iter_mut()
+                    .find(|g| g.analyst == revoked_id)
+                    .unwrap();
+                grant.revoked = Some(GrantRevocation {
+                    revocation_id: "r-1".into(),
+                    revoked_by: "admin".into(),
+                    revoked_at: Utc::now(),
+                    signature: None,
+                    generation: None,
+                });
+                Ok(Change::Changed)
+            })
+            .await
+            .unwrap();
+        let path = export_path(&pool_pda);
+
+        let refusals = [
+            (
+                &granted,
+                json!({ "format": "csv", "scope": { "employer_group": "Group C" } }),
+                StatusCode::BAD_REQUEST,
+                "invalid_query",
+            ),
+            (
+                &granted,
+                json!({ "format": "csv", "pagination": { "limit": 10 } }),
+                StatusCode::BAD_REQUEST,
+                "invalid_query",
+            ),
+            (
+                &granted,
+                json!({ "format": "xlsx", "distinct": ["membership_number"] }),
+                StatusCode::BAD_REQUEST,
+                "invalid_query",
+            ),
+            (
+                &granted,
+                json!({ "format": "csv", "filters": { "employer_group": { "mode": "selected", "values": ["Group C"] } } }),
+                StatusCode::BAD_REQUEST,
+                "invalid_query",
+            ),
+            (
+                &granted,
+                json!({ "format": "csv", "sort": { "field": "_record_id", "direction": "asc" } }),
+                StatusCode::BAD_REQUEST,
+                "invalid_query",
+            ),
+            (
+                &granted,
+                json!({ "format": "pdf" }),
+                StatusCode::BAD_REQUEST,
+                "invalid_query",
+            ),
+            (
+                &granted,
+                json!({}),
+                StatusCode::BAD_REQUEST,
+                "invalid_query",
+            ),
+            (
+                &ungranted,
+                json!({ "format": "csv" }),
+                StatusCode::FORBIDDEN,
+                "no_grant",
+            ),
+            (
+                &revoked,
+                json!({ "format": "csv" }),
+                StatusCode::FORBIDDEN,
+                "no_grant",
+            ),
+            (
+                &unseen,
+                json!({ "format": "xlsx" }),
+                StatusCode::FORBIDDEN,
+                "grant_not_live",
+            ),
+        ];
+        for (token, body, status, code) in &refusals {
+            let (got, sent, file, _) = download(&worker.app, post(&path, token, body)).await;
+            let err = error_of(&file);
+            assert_eq!(
+                (got, err["code"].as_str()),
+                (*status, Some(*code)),
+                "{body}: {err}"
+            );
+            assert!(sent.get(&EXPORT_ID_HEADER).is_none());
+        }
+
+        // A body that isn't JSON is refused before it's recorded.
+        let text = Request::post(&path)
+            .header(header::AUTHORIZATION, format!("Bearer {granted}"))
+            .header(header::CONTENT_TYPE, "text/plain")
+            .body(Body::from(r#"{"format":"csv"}"#))
+            .unwrap();
+        assert_eq!(
+            download(&worker.app, text).await.0,
+            StatusCode::UNSUPPORTED_MEDIA_TYPE
+        );
+
+        // A filter no row matches makes a file of the header only.
+        let later = json!({ "exam_board_date": { "from": "01/01/2027" } });
+        for format in [Format::Csv, Format::Xlsx] {
+            let body = json!({ "format": format, "filters": later });
+            let (status, _, file, _) = download(&worker.app, post(&path, &granted, &body)).await;
+            assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&file));
+            let cells = match format {
+                Format::Csv => read_csv(&file),
+                Format::Xlsx => read_xlsx(&file),
+            };
+            assert_eq!(cells.len(), 1, "{cells:?}");
+            assert_eq!(cells[0][0], "Staff Number");
+        }
+
+        // Each refusal is recorded as asked for and as refused.
+        let log = logged_today(&worker, &pool_pda).await;
+        let ended = finished(&log);
+        assert_eq!(ended.len(), refusals.len() + 2, "{log:#?}");
+        assert_eq!(log.len(), 2 * ended.len());
+        for (_, body, _, code) in &refusals {
+            let record = ended
+                .iter()
+                .find(|r| {
+                    let asked = r.request.as_object().map(|o| {
+                        o.iter()
+                            .filter(|(k, _)| *k != "ran_with")
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect::<serde_json::Map<_, _>>()
+                    });
+                    asked.as_ref() == body.as_object() && r.outcome == *code
+                })
+                .unwrap_or_else(|| panic!("{body}: {log:#?}"));
+            let (requested, _) = pair(&log, &record.export.as_ref().unwrap().export_id);
+            assert_eq!(&requested.request, body);
+            assert_eq!(
+                record.export.as_ref().unwrap().result.as_deref(),
+                Some("refused")
+            );
+        }
+        let pdf = log.iter().find(|r| r.request["format"] == "pdf").unwrap();
+        assert_eq!(pdf.export.as_ref().unwrap().format, None);
+        let empty: Vec<_> = ended.iter().filter(|r| r.outcome == "success").collect();
+        assert_eq!(empty.len(), 2);
+        assert!(empty
+            .iter()
+            .all(|r| (r.returned, r.total_matched) == (Some(0), Some(0))));
+    }
+
+    #[tokio::test]
+    async fn an_export_over_a_limit_is_refused_whole() {
+        let limited = |limits| Analyses::default().with_exports(limits, Duration::from_secs(5));
+        let cases = [
+            (
+                limited(Limits {
+                    max_rows: 4,
+                    ..Limits::default()
+                }),
+                Format::Csv,
+                "export_too_many_rows",
+                "refused",
+            ),
+            (
+                limited(Limits {
+                    max_bytes: 512,
+                    ..Limits::default()
+                }),
+                Format::Xlsx,
+                "export_too_large",
+                "refused",
+            ),
+            (
+                limited(Limits {
+                    deadline: Duration::ZERO,
+                    ..Limits::default()
+                }),
+                Format::Csv,
+                "analysis_timeout",
+                "timeout",
+            ),
+            (
+                Analyses::new(Arc::new(Budget::new(8 << 20))),
+                Format::Csv,
+                "too_large_for_memory",
+                "refused",
+            ),
+        ];
+        for (analyses, format, code, result) in cases {
+            let (worker, analyses) = worker_exporting(analyses);
+            let owner = worker.admin("oid-owner").await;
+            let pool_pda = awards_pool(&worker, &owner).await;
+            let body = json!({ "format": format });
+            let (status, sent, file, _) = download(
+                &worker.app,
+                post(&export_path(&pool_pda), &owner.token, &body),
+            )
+            .await;
+            let err = error_of(&file);
+            assert_eq!(
+                (status, err["code"].as_str()),
+                (StatusCode::UNPROCESSABLE_ENTITY, Some(code)),
+                "{err}"
+            );
+            assert!(sent.get(&EXPORT_ID_HEADER).is_none());
+            if code == "export_too_many_rows" {
+                assert_eq!(
+                    err["error"],
+                    "5 rows match, and an export holds at most 4; narrow the filters"
+                );
+            }
+            let log = logged_today(&worker, &pool_pda).await;
+            let ended = finished(&log);
+            assert_eq!(ended.len(), 1, "{log:#?}");
+            assert_eq!(ended[0].outcome, code);
+            assert_eq!(
+                ended[0].export.as_ref().unwrap().result.as_deref(),
+                Some(result)
+            );
+            assert!(ended[0].export.as_ref().unwrap().bytes.is_none());
+            drop(analyses);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_export_waits_for_a_slot_and_then_is_busy() {
+        let analyses = Analyses::with_threads(Arc::new(Budget::default()), Threads::new(3))
+            .with_exports(Limits::default(), Duration::from_millis(50));
+        let (worker, analyses) = worker_exporting(analyses);
+        assert_eq!(analyses.export_slots().available_permits(), 1);
+        let owner = worker.admin("oid-owner").await;
+        let pool_pda = awards_pool(&worker, &owner).await;
+        let export = || {
+            post(
+                &export_path(&pool_pda),
+                &owner.token,
+                &json!({ "format": "csv" }),
+            )
+        };
+
+        let slot = analyses
+            .export_slots()
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+        let (status, sent, file, _) = download(&worker.app, export()).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error_of(&file)["code"], "analysis_busy");
+        assert_eq!(sent[header::RETRY_AFTER], "1");
+        drop(slot);
+        let (status, _, _, _) = download(&worker.app, export()).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let log = logged_today(&worker, &pool_pda).await;
+        let busy = finished(&log)
+            .into_iter()
+            .find(|r| r.outcome == "analysis_busy")
+            .unwrap();
+        assert_eq!(
+            busy.export.as_ref().unwrap().result.as_deref(),
+            Some("failed")
+        );
+    }
+
+    /// What `work` comes to, failing the test if that takes over 10 s.
+    async fn within<T>(what: &str, work: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(Duration::from_secs(10), work)
+            .await
+            .unwrap_or_else(|_| panic!("{what} took too long"))
+    }
+
+    #[tokio::test]
+    async fn an_export_whose_client_goes_away_is_logged_as_cancelled() {
+        let one_slot = Analyses::with_threads(Arc::new(Budget::default()), Threads::new(2));
+        let (worker, analyses) = worker_exporting(one_slot);
+        let owner = worker.admin("oid-owner").await;
+        let pool_pda = awards_pool(&worker, &owner).await;
+        // The export's table, built first and its turn held, so that the
+        // export waits for it.
+        let doc = worker
+            .storage
+            .pools()
+            .get(&pool_pda.to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        let hash = doc.analysis.as_ref().unwrap().code_hash_hex.clone();
+        let def = analyses.definition(&worker.storage, &hash).await.unwrap();
+        let table = analyses
+            .table(&worker.storage, &doc, &def, &Scope::All)
+            .await
+            .unwrap();
+        let turn = table.turn().await.unwrap();
+
+        let body = json!({ "format": "xlsx" });
+        let mut request = tokio::spawn(worker.app.clone().oneshot(post(
+            &export_path(&pool_pda),
+            &owner.token,
+            &body,
+        )));
+        within("the export taking a slot", async {
+            while analyses.export_slots().available_permits() > 0 && !request.is_finished() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(!request.is_finished(), "{:?}", {
+            let response = (&mut request).await.unwrap().unwrap();
+            let (parts, body) = response.into_parts();
+            (parts.status, to_bytes(body, 1 << 20).await.unwrap())
+        });
+        request.abort();
+        let aborted = within("the request stopping", request).await;
+        assert!(aborted.unwrap_err().is_cancelled());
+        drop(turn);
+
+        // The export's own task records how it ended.
+        let ended = within("the export recording its end", async {
+            loop {
+                let log = logged_today(&worker, &pool_pda).await;
+                if let Some(ended) = finished(&log).into_iter().next() {
+                    break ended.clone();
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert_eq!(ended.outcome, "cancelled");
+        let event = ended.export.as_ref().unwrap();
+        assert_eq!(event.result.as_deref(), Some("cancelled"));
+        assert!(event.bytes.is_none());
+        assert_eq!(analyses.export_slots().available_permits(), 1);
+    }
+
+    type Hook = Box<
+        dyn Fn(Arc<Storage>, String, usize) -> BoxFuture<'static, Result<(), StoreError>>
+            + Send
+            + Sync,
+    >;
+
+    /// A store that calls `hook` before each analysis log write, with the
+    /// worker's storage, the record's path and the write's number from 0.
+    /// A write whose hook fails is refused.
+    struct Hooked {
+        files: LocalFiles,
+        storage: OnceLock<Weak<Storage>>,
+        writes: AtomicUsize,
+        hook: Hook,
+    }
+
+    impl ObjectStore for Hooked {
+        fn get<'a>(
+            &'a self,
+            path: &'a str,
+            cached: Option<&'a ETag>,
+        ) -> BoxFuture<'a, Result<Fetched, StoreError>> {
+            self.files.get(path, cached)
+        }
+        fn put_if_absent<'a>(
+            &'a self,
+            path: &'a str,
+            body: Bytes,
+        ) -> BoxFuture<'a, Result<Created, StoreError>> {
+            Box::pin(async move {
+                if path.contains("audit/analyses/") {
+                    let write = self.writes.fetch_add(1, SeqCst);
+                    let storage = self.storage.get().and_then(Weak::upgrade).unwrap();
+                    (self.hook)(storage, path.to_string(), write).await?;
+                }
+                self.files.put_if_absent(path, body).await
+            })
+        }
+        fn put_if_match<'a>(
+            &'a self,
+            path: &'a str,
+            body: Bytes,
+            etag: &'a ETag,
+        ) -> BoxFuture<'a, Result<Replaced, StoreError>> {
+            self.files.put_if_match(path, body, etag)
+        }
+        fn list<'a>(&'a self, dir: &'a str) -> BoxFuture<'a, Result<Vec<Listed>, StoreError>> {
+            self.files.list(dir)
+        }
+    }
+
+    /// A worker on a store that `hook` sees each analysis log write of.
+    fn hooked_worker(hook: Hook) -> (Worker, Arc<Analyses>) {
+        let store = Arc::new(Hooked {
+            files: LocalFiles::temporary(),
+            storage: OnceLock::new(),
+            writes: AtomicUsize::new(0),
+            hook,
+        });
+        let storage = Arc::new(Storage::new(
+            store.clone(),
+            StorageKeys::derive(&fixed_key(1)),
+            "worker-a".into(),
+        ));
+        assert!(store.storage.set(Arc::downgrade(&storage)).is_ok());
+        let analyses = Arc::new(Analyses::default());
+        let shared = analyses.clone();
+        let worker = worker_with(move |state| {
+            state.storage = storage;
+            state.analyses = shared;
+        });
+        (worker, analyses)
+    }
+
+    /// A hook that refuses the writes `refused` picks by number.
+    fn refusing(refused: fn(usize) -> bool) -> Hook {
+        Box::new(
+            move |_, _, write| -> BoxFuture<'static, Result<(), StoreError>> {
+                Box::pin(async move {
+                    if refused(write) {
+                        Err(StoreError::Unavailable("refused by the test".into()))
+                    } else {
+                        Ok(())
+                    }
+                })
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn an_export_runs_only_once_recorded_and_is_sent_only_once_its_success_is() {
+        let export = |pool_pda: &Pubkey, token: &str| {
+            post(&export_path(pool_pda), token, &json!({ "format": "csv" }))
+        };
+
+        // A request that can't be recorded runs nothing.
+        let (worker, analyses) = hooked_worker(refusing(|write| write == 0));
+        let owner = worker.admin("oid-owner").await;
+        let pool_pda = awards_pool(&worker, &owner).await;
+        let (status, sent, file, _) = download(&worker.app, export(&pool_pda, &owner.token)).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error_of(&file)["code"], "analysis_log_unavailable");
+        assert!(sent.get(&EXPORT_ID_HEADER).is_none());
+        assert_eq!(analyses.usage().1 .1, 0, "no table was built");
+        assert!(logged_today(&worker, &pool_pda).await.is_empty());
+
+        // A success that fails to store once is stored when retried, and sent.
+        let (worker, _) = hooked_worker(refusing(|write| write == 1));
+        let owner = worker.admin("oid-owner").await;
+        let pool_pda = awards_pool(&worker, &owner).await;
+        let (status, sent, file, _) = download(&worker.app, export(&pool_pda, &owner.token)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(read_csv(&file).len(), 6);
+        let log = logged_today(&worker, &pool_pda).await;
+        let (_, ended) = pair(&log, sent[&EXPORT_ID_HEADER].to_str().unwrap());
+        assert_eq!(ended.outcome, "success");
+
+        // One that fails twice is not sent, and no success is recorded.
+        let (worker, _) = hooked_worker(refusing(|write| write >= 1));
+        let owner = worker.admin("oid-owner").await;
+        let pool_pda = awards_pool(&worker, &owner).await;
+        let (status, sent, file, _) = download(&worker.app, export(&pool_pda, &owner.token)).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error_of(&file)["code"], "analysis_log_unavailable");
+        assert!(sent.get(&EXPORT_ID_HEADER).is_none());
+        let log = logged_today(&worker, &pool_pda).await;
+        assert_eq!(log.len(), 1, "{log:#?}");
+        assert_eq!(log[0].outcome, "requested");
+    }
+
+    #[tokio::test]
+    async fn a_revocation_recorded_while_an_export_runs_withholds_its_file() {
+        // Once the export is recorded, after it read the pool, its grants
+        // are revoked, as a revocation landing while it ran would be.
+        let (worker, analyses) = hooked_worker(Box::new(
+            |storage: Arc<Storage>,
+             path: String,
+             write|
+             -> BoxFuture<'static, Result<(), StoreError>> {
+                Box::pin(async move {
+                    if write > 0 {
+                        return Ok(());
+                    }
+                    let pool = path
+                        .split("audit/analyses/")
+                        .nth(1)
+                        .and_then(|p| p.split('/').next())
+                        .unwrap()
+                        .to_string();
+                    storage
+                        .pools()
+                        .update::<ApiError>(&pool, |doc| {
+                            for grant in &mut doc.grants {
+                                grant.revoked = Some(GrantRevocation {
+                                    revocation_id: "r-1".into(),
+                                    revoked_by: "admin".into(),
+                                    revoked_at: Utc::now(),
+                                    signature: None,
+                                    generation: None,
+                                });
+                            }
+                            doc.generation += 1;
+                            Ok(Change::Changed)
+                        })
+                        .await
+                        .map_err(|e| StoreError::Invalid(e.message))?;
+                    Ok(())
+                })
+            },
+        ));
+        let owner = worker.admin("oid-owner").await;
+        let pool_pda = awards_pool(&worker, &owner).await;
+        let (ana, ana_id) = analyst(&worker.app, "oid-ana").await;
+        grant(&worker, &pool_pda, &ana_id, GROUP_A).await;
+
+        let body = json!({ "format": "csv" });
+        let (status, sent, file, _) =
+            download(&worker.app, post(&export_path(&pool_pda), &ana, &body)).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error_of(&file)["code"], "pool_settling");
+        assert!(sent.get(&EXPORT_ID_HEADER).is_none());
+
+        // It ran under the grant it read, and its file was dropped.
+        assert_eq!(analyses.usage().1 .1, 1, "its table was built");
+        let log = logged_today(&worker, &pool_pda).await;
+        let ended = finished(&log);
+        assert_eq!(ended.len(), 1, "{log:#?}");
+        assert_eq!(ended[0].grant_id, Some(format!("g-{ana_id}")));
+        assert_eq!(ended[0].outcome, "pool_settling");
+        assert!(ended[0].export.as_ref().unwrap().bytes.is_none());
+    }
+
+    #[test]
+    fn an_exports_file_name_is_its_analysis_and_when_it_was_asked_for() {
+        let at = "2026-10-05T09:30:07Z".parse().unwrap();
+        assert_eq!(
+            file_name("awards-report-v1", at, Format::Xlsx),
+            "awards-report-v1-20261005-093007.xlsx"
+        );
+        assert_eq!(
+            file_name("a\"b;c/..\\d", at, Format::Csv),
+            "abc..d-20261005-093007.csv"
+        );
+        assert_eq!(
+            file_name("..", at, Format::Csv),
+            "export-20261005-093007.csv"
+        );
     }
 }

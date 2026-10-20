@@ -116,6 +116,9 @@ rusqlite = { version = "0.40", default-features = false, features = ["bundled", 
 toml = { version = "1.1", default-features = false, features = ["parse", "serde"] }
 # The resolver trait, for the definition fetcher's public-addresses-only DNS.
 tower-service = { version = "0.3", default-features = false }
+# Exports stream an XLSX file, a zip of XML parts, into memory: deflate only,
+# through zlib-rs (pure Rust).
+zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [dev-dependencies]
 tokio = { version = "1.49.0", default-features = false, features = ["io-util", "test-util"] }
@@ -124,3 +127,5 @@ tower = { version = "0.5", default-features = false, features = ["util"] }
 aws-lc-rs = { version = "1.18", default-features = false, features = ["aws-lc-sys", "ring-io"] }
 # The reference-values schema's patterns, which its tests check.
 regex = { version = "1", default-features = false, features = ["std"] }
+# Export tests read the XLSX files back.
+calamine = { version = "0.37", default-features = false }

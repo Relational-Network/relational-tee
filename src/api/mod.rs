@@ -281,6 +281,10 @@ pub fn drt_router() -> Router<AppState> {
             "/v1/drt/pools/{pool_pda}/analyses/{analysis_id}/query",
             post(analyses::run_query),
         )
+        .route(
+            "/v1/drt/pools/{pool_pda}/analyses/{analysis_id}/export",
+            post(analyses::export_analysis),
+        )
         // ── Marketplace discovery ────────────────────────────────
         .route(
             "/v1/drt/pools/list",

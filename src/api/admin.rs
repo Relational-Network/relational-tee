@@ -315,7 +315,7 @@ pub async fn activate_wallet(
     path = "/v1/admin/analysis-log",
     tag = "Admin",
     summary = "Analysis log",
-    description = "The sealed record of every options, search and query request to the pool's analysis on one UTC day, oldest first: who asked, through which grant, the filters, sort and page, how many rows went back, and the outcome. Admin only.",
+    description = "The sealed record of every open, options, search, query and export request to the pool's analysis on one UTC day, oldest first: who asked, through which grant, the filters, sort and page, how many rows went back, and the outcome. An export has two records sharing its `export.export_id`, both filed on the day it was asked for: one written before any work, with outcome `requested`, and one when it ended, with its `result`, rows and bytes. A `requested` record without a second means the worker stopped before the export ended. Admin only.",
     security(("bearer_auth" = [])),
     params(AnalysisLogQuery),
     responses(
