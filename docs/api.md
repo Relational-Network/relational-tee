@@ -10,7 +10,7 @@ Every response carries `Strict-Transport-Security: max-age=63072000; includeSubD
 
 ### CORS
 
-Only `DASHBOARD_ORIGIN`, with methods GET, POST, PUT, PATCH and DELETE, request headers `Authorization`, `Content-Type` and `Idempotency-Key`, exposed headers `Idempotent-Replayed`, `Retry-After` and `X-Request-Id`, and a preflight max age of a day. No credentials: the dashboard sends a bearer token.
+Only `DASHBOARD_ORIGIN`, with methods GET, POST, PUT, PATCH and DELETE, request headers `Authorization`, `Content-Type` and `Idempotency-Key`, exposed headers `Idempotent-Replayed`, `Retry-After`, `X-Request-Id`, and an export's `Content-Disposition` and `X-Export-Id`, and a preflight max age of a day. No credentials: the dashboard sends a bearer token.
 
 ### Rate limits
 
@@ -19,7 +19,7 @@ In memory per worker, so the effective limits grow with the worker count: per cl
 ### Request limits
 
 - **Sizes.** Bodies may be 1 MiB, or 50 MiB on the upload routes (`POST …/initialize` and `…/issue`); larger ones get `413 payload_too_large`. A pool's uploads may hold 200 MiB of CSV together, and an issuance past that gets `413 pool_full`; a CSV value may be 4 KiB.
-- **Memory.** Uploads, decrypted datasets and analysis tables reserve their memory from the worker's budget (`MEMORY_BUDGET_MIB`) before they allocate it and hold it while anything uses them: an upload reserves three times its `Content-Length` (the largest upload's, without one) before its body is read. What can't reserve within a few seconds gets `503 worker_busy` with `Retry-After`, and what needs more than the whole budget `422 too_large_for_memory`.
+- **Memory.** Uploads, decrypted datasets, analysis tables and exports reserve their memory from the worker's budget (`MEMORY_BUDGET_MIB`) before they allocate it and hold it while anything uses them: an upload reserves three times its `Content-Length` (the largest upload's, without one) before its body is read, and an export twice its largest file (50 MiB) before it writes, then its file's length until the file is sent. What can't reserve within a few seconds gets `503 worker_busy` with `Retry-After`, and what needs more than the whole budget `422 too_large_for_memory`.
 - **Upstream responses.** Responses the worker reads from Storage, Solana RPC, Entra ID's keys and the key release service are bounded too, each by what its largest legitimate answer holds.
 - **Time.** A request may run for 60 seconds, or 300 on the upload routes; one still running gets `408 request_timeout` and stops where it was, as if the worker had died there. A retry with the same `Idempotency-Key` returns the stored response if there is one, and otherwise runs the request again, reusing its staged saga and resending any transaction it stored, so it finishes what the first attempt started (see [Idempotency](#idempotency)). Pool creation waits up to 60 seconds for `finalized`, so under a slow RPC it can end in a `408` that a retry finishes.
 - **Headers and connections.** A request head (HTTP/1.1), or header list (HTTP/2), may be 16 KiB, and an HTTP/1.1 request may carry 100 header fields; beyond either it gets `431`. An HTTP/1.1 connection has 10 seconds to send each request's headers, idle keep-alive time included, and a TLS handshake has 10 seconds; past either, the connection is closed. An HTTP/2 connection whose client has been silent for 20 seconds gets a ping, and is closed if the ping goes unanswered for another 20, and it may have 64 requests open at once. A worker serves at most 1,024 connections at once, and closes any more as they arrive, before their TLS handshake, logging it at most once a minute. Clients that answer pings but send nothing still hold their places: a per-IP connection limit would be the next step.
@@ -34,7 +34,7 @@ With `LOG_FORMAT=json` (release builds' default) each line is one JSON object: `
 
 ### Audit events
 
-Every mutation, failed mutation, admin read, definition preview and analysis request (an open, options, search or query) logs exactly one event with target `audit` when it completes, for operators to query in Azure Monitor. An event carries only `event` (for example `credential_issued`), `outcome` (`success` or `failure`), `code` on failure, `request_id`, `user_id`, and where relevant `pool`, `record_id`, `wallet_id`, `rows` and `signature`; never CSV content, emails, free-text reasons, keys or client IP addresses. The output leaves the TEE through the host, so these events are diagnostics: the pool's own records, the sealed analysis log and the chain are the audit trail users rely on.
+Every mutation, failed mutation, admin read, definition preview and analysis request (an open, options, search, query or export, whose event is `analysis_exported`) logs exactly one event with target `audit` when it completes, for operators to query in Azure Monitor. An event carries only `event` (for example `credential_issued`), `outcome` (`success` or `failure`), `code` on failure, `request_id`, `user_id`, and where relevant `pool`, `record_id`, `wallet_id`, `rows` and `signature`; never CSV content, emails, free-text reasons, keys or client IP addresses. The output leaves the TEE through the host, so these events are diagnostics: the pool's own records, the sealed analysis log and the chain are the audit trail users rely on.
 
 ### Errors
 
@@ -51,7 +51,7 @@ Every error, including unknown routes and malformed bodies, has one body shape: 
 | 409 | `conflict`, `wallet_exists`, `email_taken`, `version_conflict`, `revocation_pending`, `grant_superseded`, `grant_settling`, `grant_active`, `grant_not_active`, `grant_pda_taken` |
 | 413 | `payload_too_large`, `pool_full` |
 | 415 | `unsupported_media_type` |
-| 422 | `unprocessable_entity`, `idempotency_mismatch`, `analysis_timeout`, `too_large_for_memory` |
+| 422 | `unprocessable_entity`, `idempotency_mismatch`, `analysis_timeout`, `too_large_for_memory`, `export_too_many_rows`, `export_too_large` |
 | 429 | `rate_limited` (with `Retry-After`) |
 | 500 | `internal_error`, `integrity_error` |
 | 502 | `transfer_outcome_unknown` |
@@ -75,7 +75,7 @@ The worker opens it after authentication and before the idempotency check. Any f
 
 ### Idempotency
 
-Every mutating route requires an `Idempotency-Key` header: a UUID the client generates for one user action and reuses on every retry of it. Without one the request fails with `400 idempotency_key_required`; `POST …/estimate` and an analysis's `POST …/query` are read-only and need none.
+Every mutating route requires an `Idempotency-Key` header: a UUID the client generates for one user action and reuses on every retry of it. Without one the request fails with `400 idempotency_key_required`; `POST …/estimate` and an analysis's `POST …/query` and `…/export` are read-only and need none.
 
 A retry of a completed request returns the stored status and body with `Idempotent-Replayed: true`, on any worker; the same key with a different method, path or body returns `422 idempotency_mismatch`. The fingerprint of a sealed upload covers the decrypted CSV, so a retry sealed afresh still matches. Keys are scoped to the user. There's no in-progress state: attempts running at once all run, converge on one effect, and return the first stored response. Failures aren't stored, so a retry after one runs again.
 
@@ -127,7 +127,7 @@ The pool list accepts `search` (case-insensitive pool name), `state` (`ready` or
 
 ### Analyses
 
-Under `/v1/drt/pools/{pda}/analyses/{analysis_id}` (`analyses:run`, and for an analyst an active grant): `GET` describes the analysis and the caller's rows, and `GET …?include=page` (with `distinct=…` repeated for counts) opens it: the description, the options of all the caller's rows, the first page and each search filter's first values, in one call that counts against the per-user limit and is recorded once in the analysis log; `POST …/options { filters }` and `…/options/{filter} { search, limit, filters }` list filter values from those rows that the other filters match; `POST …/query` returns `{ rows, total_matched, limit, offset }`, and `distinct` when the request names output columns to count the distinct values of (at most the summary's `max_distinct`). See [Analyses](analyses.md).
+Under `/v1/drt/pools/{pda}/analyses/{analysis_id}` (`analyses:run`, and for an analyst an active grant): `GET` describes the analysis and the caller's rows, and `GET …?include=page` (with `distinct=…` repeated for counts) opens it: the description, the options of all the caller's rows, the first page and each search filter's first values, in one call that counts against the per-user limit and is recorded once in the analysis log; `POST …/options { filters }` and `…/options/{filter} { search, limit, filters }` list filter values from those rows that the other filters match; `POST …/query` returns `{ rows, total_matched, limit, offset }`, and `distinct` when the request names output columns to count the distinct values of (at most the summary's `max_distinct`); `POST …/export { format, filters, sort }` returns every matching row as a CSV or XLSX file, of at most 100,000 rows and 50 MiB, with `Content-Disposition` and `X-Export-Id`, and is recorded twice in the analysis log, when it's asked for and when it ends. See [Analyses](analyses.md#exports).
 
 ### Admin
 

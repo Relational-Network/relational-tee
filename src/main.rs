@@ -84,8 +84,89 @@ use health::{
 use state::AppState;
 use tee::{AttestationProvider, KeyName, KeyProvider, WorkerKeys};
 
+#[cfg(not(test))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+/// Tests allocate through mimalloc too, and count what they hold, so a test
+/// can measure the most an operation holds at once.
+#[cfg(test)]
+#[global_allocator]
+static GLOBAL: heap::Counted = heap::Counted;
+
+#[cfg(test)]
+pub(crate) mod heap {
+    //! The bytes a test process holds on the heap.
+
+    use std::alloc::{GlobalAlloc, Layout};
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+
+    static HELD: AtomicUsize = AtomicUsize::new(0);
+    static PEAK: AtomicUsize = AtomicUsize::new(0);
+
+    pub struct Counted;
+
+    fn grew(bytes: usize) {
+        let held = HELD.fetch_add(bytes, Relaxed) + bytes;
+        PEAK.fetch_max(held, Relaxed);
+    }
+
+    fn shrank(bytes: usize) {
+        HELD.fetch_sub(bytes, Relaxed);
+    }
+
+    // SAFETY: each call forwards to mimalloc unchanged; the counters only
+    // observe the sizes.
+    #[allow(unsafe_code)]
+    unsafe impl GlobalAlloc for Counted {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let ptr = unsafe { mimalloc::MiMalloc.alloc(layout) };
+            if !ptr.is_null() {
+                grew(layout.size());
+            }
+            ptr
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            let ptr = unsafe { mimalloc::MiMalloc.alloc_zeroed(layout) };
+            if !ptr.is_null() {
+                grew(layout.size());
+            }
+            ptr
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { mimalloc::MiMalloc.dealloc(ptr, layout) };
+            shrank(layout.size());
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            let moved = unsafe { mimalloc::MiMalloc.realloc(ptr, layout, new_size) };
+            if !moved.is_null() {
+                if new_size > layout.size() {
+                    grew(new_size - layout.size());
+                } else {
+                    shrank(layout.size() - new_size);
+                }
+            }
+            moved
+        }
+    }
+
+    /// Measure from now: the most held at once restarts at what's held now,
+    /// which this returns. Only meaningful with one test per process, as
+    /// nextest runs them.
+    pub fn start() -> usize {
+        let held = HELD.load(Relaxed);
+        PEAK.store(held, Relaxed);
+        held
+    }
+
+    /// The most held at once since [`start`].
+    pub fn peak() -> usize {
+        PEAK.load(Relaxed)
+    }
+}
 
 // ============================================================================
 // OpenAPI Documentation
@@ -163,6 +244,7 @@ An analysis shows admins every row. An analyst sees only the rows of their grant
         api::analyses::filtered_options,
         api::analyses::filtered_search,
         api::analyses::run_query,
+        api::analyses::export_analysis,
     ),
     components(schemas(
         HealthResponse,
@@ -202,6 +284,7 @@ An analysis shows admins every row. An analyst sees only the rows of their grant
         api::admin::WalletStatusChangeResponse,
         api::admin::AnalysisLogResponse,
         storage::analysis_log::AnalysisRecord,
+        storage::analysis_log::ExportEvent,
         // Shared domain types
         storage::wallets::WalletResponse,
         storage::wallets::WalletStatus,
@@ -264,6 +347,8 @@ An analysis shows admins every row. An analyst sees only the rows of their grant
         api::analyses::OptionsRequest,
         api::analyses::SearchRequest,
         api::analyses::SearchResponse,
+        api::analyses::ExportRequest,
+        analysis::export::Format,
         analysis::query::QueryRequest,
         analysis::query::FilterRequest,
         analysis::query::Mode,
@@ -1074,6 +1159,7 @@ mod tests {
             "/v1/drt/pools/{pool_pda}/analyses/{analysis_id}/options",
             "/v1/drt/pools/{pool_pda}/analyses/{analysis_id}/options/{filter}",
             "/v1/drt/pools/{pool_pda}/analyses/{analysis_id}/query",
+            "/v1/drt/pools/{pool_pda}/analyses/{analysis_id}/export",
             "/v1/drt/pools/{pool_pda}/analyses/{analysis_id}/scope-check",
             "/v1/drt/pools/{pool_pda}/grant",
             "/v1/drt/pools/{pool_pda}/grant-scope",

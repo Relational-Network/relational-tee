@@ -254,6 +254,193 @@ fn catalogue_pages_match_reference_sql_with_blanks_dates_and_every_sort() {
     }
 }
 
+/// Text a spreadsheet could misread, and a blank. The first four start as
+/// formulas, which a CSV export prefixes with `'`; the amounts stay as stored.
+const AWKWARD: [&str; 16] = [
+    "=1+1",
+    "-2+3",
+    "@SUM(A1)",
+    "+cmd|' /C calc'!A0",
+    "Value A",
+    "",
+    "Alpha \"Al\", Jr",
+    "Line\nbreak",
+    "-€1,234.50",
+    "€-12.50",
+    "-25.00",
+    "+353",
+    "Zoë Ångström 日本",
+    "_x0041_",
+    "00042",
+    "Tab\there",
+];
+
+/// Dates either side of 01/01/2026 to 28/02/2026, on both its ends, and a blank.
+const DATES: [&str; 7] = [
+    "31/12/2025",
+    "01/01/2026",
+    "15/01/2026",
+    "",
+    "28/02/2026",
+    "01/03/2026",
+    "01/01/2026",
+];
+
+/// `rows` invented rows for `def`, with blanks in every column. Each kind of
+/// column repeats with a period prime to the others', so filters on
+/// different kinds cut across one another; each text column starts at its
+/// own place in [`AWKWARD`], so neighbouring columns hold different cells.
+fn awkward_rows(def: &Definition, rows: usize) -> Vec<Vec<String>> {
+    (0..rows)
+        .map(|i| {
+            def.columns
+                .iter()
+                .enumerate()
+                .map(|(j, c)| {
+                    match c.name.as_str() {
+                        "staff_number" => {
+                            ["000123", "", "000124", "0042", "123", "009999", "1", "00", "000123"]
+                                [i % 9]
+                        }
+                        "membership_number" => [
+                            "001", "002", "", "0001", "010", "099", "1", "000", "001", "0100", "7",
+                        ][i % 11],
+                        "employer_group" => ["Group A", "Group B", "Group A", "", "Group A"][i % 5],
+                        "employer" => ["Bank A", "Bank B", ""][i % 3],
+                        "fee_payment_facility_code" => {
+                            ["Value A", "Value B", "Secret", "", "Value A"][i % 5]
+                        }
+                        _ if c.kind == ColumnType::Date => DATES[i % DATES.len()],
+                        _ => AWKWARD[(i + j) % AWKWARD.len()],
+                    }
+                    .to_string()
+                })
+                .collect()
+        })
+        .collect()
+}
+
+#[test]
+/// Every view exports, in both formats, in and out of a scope, exactly the
+/// rows its pages return, in their order: a CSV with formulas prefixed and
+/// every other cell as stored, an XLSX file with every cell literal text.
+fn catalogue_exports_hold_every_page_of_the_query() {
+    use crate::analysis::export::tests::{export, read_csv, read_xlsx, upload};
+    use crate::analysis::export::{Format, Limits};
+    const PAGE: u64 = 500;
+    for example in EXAMPLES {
+        let def = Definition::parse(example.source.as_bytes()).unwrap();
+        let csv = upload(&def, &awkward_rows(&def, 700));
+        let headers: Vec<String> = def
+            .output
+            .iter()
+            .map(|c| def.column(c).unwrap().header.clone())
+            .collect();
+        // Each select matches the same rows of `AWKWARD`'s cycle: a
+        // formula, a blank, a line break and an amount.
+        let mut combined = serde_json::Map::new();
+        for filter in &def.filters {
+            let j = def
+                .columns
+                .iter()
+                .position(|c| c.name == filter.name)
+                .unwrap();
+            let selection = match (filter.kind, filter.name.as_str()) {
+                (FilterKind::DateRange, _) => {
+                    serde_json::json!({"from": "01/01/2026", "to": "28/02/2026"})
+                }
+                (_, "staff_number") => {
+                    serde_json::json!({"mode": "selected", "values": ["", "000123", "0042"]})
+                }
+                (_, "fee_payment_facility_code") => {
+                    serde_json::json!({"mode": "selected", "values": ["", "Value A"]})
+                }
+                (FilterKind::MultiSelect, _) => {
+                    let values = [0, 5, 7, 8].map(|k| AWKWARD[(k + j) % AWKWARD.len()]);
+                    serde_json::json!({"mode": "selected", "values": values})
+                }
+                (FilterKind::SearchSelect, _) => continue,
+            };
+            combined.insert(filter.name.clone(), selection);
+        }
+        // No sort is the default: the date column, newest first.
+        let mut cases = Vec::new();
+        for sort in [
+            None,
+            Some((example.sort, "asc")),
+            Some(("surname", "asc")),
+            Some(("surname", "desc")),
+        ] {
+            let mut case = serde_json::Map::new();
+            if let Some((field, direction)) = sort {
+                case.insert(
+                    "sort".into(),
+                    serde_json::json!({"field": field, "direction": direction}),
+                );
+            }
+            cases.push(serde_json::Value::Object(case.clone()));
+            case.insert("filters".into(), combined.clone().into());
+            cases.push(serde_json::Value::Object(case));
+        }
+        for scope in [Scope::All, example.scope()] {
+            let unscoped = matches!(scope, Scope::All);
+            let table = build(&def, &[&csv], &scope);
+            for case in &cases {
+                let page = |offset: u64| {
+                    let mut paged = case.clone();
+                    paged["pagination"] = serde_json::json!({"limit": PAGE, "offset": offset});
+                    let query = Query::check(&def, &request(paged)).unwrap();
+                    table.page(&def, &query, &soon()).unwrap()
+                };
+                let total = page(0).total_matched;
+                let mut pages: Vec<Vec<Option<String>>> = Vec::new();
+                for offset in (0..total).step_by(PAGE as usize) {
+                    pages.extend(page(offset).rows.iter().map(|row| {
+                        def.output
+                            .iter()
+                            .map(|c| row[c].as_str().map(String::from))
+                            .collect()
+                    }));
+                }
+                assert_eq!(pages.len() as u64, total);
+                assert!(total > 0, "{} {case}", def.analysis_id);
+                if unscoped && case.get("filters").is_none() {
+                    assert!(total > PAGE, "{}", def.analysis_id);
+                }
+                let query = Query::check(&def, &request(case.clone())).unwrap();
+                for format in [Format::Csv, Format::Xlsx] {
+                    let (bytes, rows) =
+                        export(&table, &def, &query, format, Limits::default(), &soon()).unwrap();
+                    assert_eq!(rows, total);
+                    let read = match format {
+                        Format::Csv => read_csv(&bytes),
+                        Format::Xlsx => read_xlsx(&bytes),
+                    };
+                    let expected = std::iter::once(headers.clone()).chain(pages.iter().map(|row| {
+                        row.iter()
+                            .map(|cell| match (cell.as_deref(), format) {
+                                (None, _) => String::new(),
+                                (Some(v), Format::Csv) if AWKWARD[..4].contains(&v) => {
+                                    format!("'{v}")
+                                }
+                                (Some(v), _) => v.to_string(),
+                            })
+                            .collect::<Vec<_>>()
+                    }));
+                    assert_eq!(read.len() as u64, total + 1);
+                    for (n, (read, expected)) in read.iter().zip(expected).enumerate() {
+                        assert_eq!(
+                            *read, expected,
+                            "{} {case} {format:?} row {n}",
+                            def.analysis_id
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[test]
 /// Scope and blank selections constrain all derived views of a dataset.
 fn catalogue_scopes_restrict_rows_options_searches_and_member_counts() {

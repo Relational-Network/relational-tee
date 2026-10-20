@@ -10,7 +10,9 @@
 //! SQLite and counting work runs on blocking threads, about one per CPU at a
 //! time, and stops at its deadline or once no request waits for it. Work on
 //! a table waits for the table's earlier work before it takes a thread, so
-//! a busy table can't hold every thread.
+//! a busy table can't hold every thread. Exports run at most half as many
+//! at a time as there are threads, and each reserves the memory its file
+//! may need before it writes it.
 
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -18,18 +20,21 @@ use std::time::Duration;
 
 use lru::LruCache;
 use sha2::{Digest, Sha256};
+use tokio::sync::Semaphore;
 use tracing::info;
 use zeroize::Zeroizing;
 
 use super::cache::{Cache, Weigh};
 use super::definition::Definition;
+use super::export::{self, Format, Limits};
+use super::query::Query;
 use super::table::{Scope, ScopeCounts, Table, TableError};
 use crate::budget::{Budget, Reservation};
 use crate::config::MAX_BODY_SIZE;
 use crate::error::ApiError;
 use crate::storage::pools::{PoolDoc, Upload};
 use crate::storage::{Storage, StoreError};
-use crate::work::{Stop, Threads, QUEUE_WAIT};
+use crate::work::{Cancelled, Stop, Threads, QUEUE_WAIT};
 
 /// Memory for decrypted datasets.
 const DATASET_BUDGET: usize = 512 << 20;
@@ -52,6 +57,8 @@ const BUILD_TIME: Duration = Duration::from_secs(30);
 
 /// How long one statement may run: well inside the request time limit.
 pub const DEADLINE: Duration = Duration::from_secs(10);
+/// How long an export waits for a slot before it gets 503.
+const EXPORT_WAIT: Duration = Duration::from_secs(5);
 
 struct Dataset {
     csv: Zeroizing<Vec<u8>>,
@@ -122,6 +129,23 @@ pub struct Analyses {
     counts: Cache<Version, ScopeCounts>,
     threads: Threads,
     memory: Arc<Budget>,
+    exports: Exports,
+}
+
+/// What exports may hold, and how many run at once.
+struct Exports {
+    limits: Limits,
+    slots: Arc<Semaphore>,
+    /// How long an export waits for a slot.
+    wait: Duration,
+}
+
+/// An export's file and how many rows it holds, with the file's share of
+/// the worker's memory, held until it's dropped.
+pub struct Exported {
+    pub file: Vec<u8>,
+    pub rows: u64,
+    pub held: Reservation,
 }
 
 impl Default for Analyses {
@@ -156,8 +180,10 @@ impl Analyses {
         Self::with_threads(memory, Threads::default())
     }
 
-    /// [`Self::new`], with CPU-heavy work on `threads`.
+    /// [`Self::new`], with CPU-heavy work on `threads`, and half as many
+    /// exports at a time.
     pub fn with_threads(memory: Arc<Budget>, threads: Threads) -> Self {
+        let slots = (threads.count() / 2).max(1);
         Self {
             definitions: Mutex::new(LruCache::new(MAX_DEFINITIONS)),
             datasets: Cache::new(DATASET_BUDGET, MAX_ENTRIES),
@@ -165,7 +191,27 @@ impl Analyses {
             counts: Cache::new(COUNTS_BUDGET, MAX_ENTRIES),
             threads,
             memory,
+            exports: Exports {
+                limits: Limits::default(),
+                slots: Arc::new(Semaphore::new(slots)),
+                wait: EXPORT_WAIT,
+            },
         }
+    }
+
+    /// These analyses, with exports held to `limits` and waiting `wait` for
+    /// a slot.
+    #[cfg(test)]
+    pub fn with_exports(mut self, limits: Limits, wait: Duration) -> Self {
+        self.exports.limits = limits;
+        self.exports.wait = wait;
+        self
+    }
+
+    /// The slots exports take, one each while they run.
+    #[cfg(test)]
+    pub fn export_slots(&self) -> &Arc<Semaphore> {
+        &self.exports.slots
     }
 
     /// The worker's memory budget, which uploads reserve from too.
@@ -339,16 +385,90 @@ impl Analyses {
         table: Arc<Table>,
         work: impl FnOnce(&Table, &Stop) -> Result<T, ApiError> + Send + 'static,
     ) -> Result<T, ApiError> {
+        self.on_table_for(table, DEADLINE, None, work).await
+    }
+
+    /// [`Self::on_table`], with `work` stopping after `time`, and once
+    /// `cancelled` is set when there is one.
+    async fn on_table_for<T: Send + 'static>(
+        &self,
+        table: Arc<Table>,
+        time: Duration,
+        cancelled: Option<&Cancelled>,
+        work: impl FnOnce(&Table, &Stop) -> Result<T, ApiError> + Send + 'static,
+    ) -> Result<T, ApiError> {
         let turn = tokio::time::timeout(QUEUE_WAIT, table.turn())
             .await
             .map_err(|_| busy())?
             .ok_or_else(|| ApiError::internal("the table's queue is closed"))?;
+        let stop = match cancelled {
+            Some(cancelled) => Stop::after(time).linked(cancelled),
+            None => Stop::after(time),
+        };
         self.threads
-            .run(Stop::after(DEADLINE), move |stop| {
+            .run(stop, move |stop| {
                 let _turn = turn;
                 work(&table, stop)
             })
             .await
+    }
+
+    /// The file of `format` holding every row of `table` that `query`
+    /// matches, in its sort. An export waits up to a few seconds for one of
+    /// the export slots (`503 analysis_busy`), then counts the rows, refusing
+    /// more than its limit allows; reserves twice the largest file it may
+    /// make, which the file's own length replaces once it's written; and
+    /// writes the file, a row at a time, under the table's turn. Counting
+    /// and writing each stop at the export's deadline, and once `cancelled`
+    /// is set.
+    pub async fn export(
+        &self,
+        table: Arc<Table>,
+        definition: Arc<Definition>,
+        query: Query,
+        format: Format,
+        cancelled: &Cancelled,
+    ) -> Result<Exported, ApiError> {
+        let limits = self.exports.limits;
+        let _slot = tokio::time::timeout(
+            self.exports.wait,
+            self.exports.slots.clone().acquire_owned(),
+        )
+        .await
+        .map_err(|_| busy())?
+        .map_err(|_| ApiError::internal("the export slots are closed"))?;
+        let query = Arc::new(query);
+        let (def, asked) = (definition.clone(), query.clone());
+        self.on_table_for(
+            table.clone(),
+            limits.deadline,
+            Some(cancelled),
+            move |table, stop| Ok(export::count(table, &def, &asked, limits, stop)?),
+        )
+        .await?;
+        let mut held = self
+            .memory
+            .reserve(limits.max_bytes.saturating_mul(2), MEMORY_WAIT)
+            .await?;
+        let (file, rows) = self
+            .on_table_for(
+                table,
+                limits.deadline,
+                Some(cancelled),
+                move |table, stop| {
+                    Ok(export::write(
+                        table,
+                        &definition,
+                        &query,
+                        format,
+                        limits,
+                        stop,
+                    )?)
+                },
+            )
+            .await?;
+        held.resize(&self.memory, file.len(), MEMORY_WAIT).await?;
+        Ok(Exported { file, rows, held })
     }
 
     /// The datasets and tables loaded so far, and their bytes.

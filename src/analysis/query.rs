@@ -339,23 +339,30 @@ impl Query {
         (clause, binds)
     }
 
-    /// This query's page of `def`'s table under `conditions`: the output
+    /// Every row of `def`'s table that `conditions` match: the output
     /// columns, sorted by the sort column (case-insensitively for text) and
-    /// then `_record_id`, which its index holds in that order, with
-    /// `:_limit` and `:_offset` to bind.
-    fn page_sql(&self, def: &Definition, conditions: &str) -> String {
+    /// then `_record_id`, which its index holds in that order.
+    fn ordered_sql(&self, def: &Definition, conditions: &str) -> String {
         let columns: Vec<String> = def.output.iter().map(|c| quoted(c)).collect();
         let collate = match def.column(&self.sort).map(|c| c.kind) {
             Some(ColumnType::Text) => " COLLATE NOCASE",
             _ => "",
         };
         format!(
-            "SELECT {} FROM {}{conditions} ORDER BY {}{collate} {}, {RECORD_ID} ASC \
-             LIMIT :_limit OFFSET :_offset",
+            "SELECT {} FROM {}{conditions} ORDER BY {}{collate} {}, {RECORD_ID} ASC",
             columns.join(", "),
             quoted(&def.relation),
             quoted(&self.sort),
             self.direction.sql()
+        )
+    }
+
+    /// This query's page of those rows, with `:_limit` and `:_offset` to
+    /// bind.
+    fn page_sql(&self, def: &Definition, conditions: &str) -> String {
+        format!(
+            "{} LIMIT :_limit OFFSET :_offset",
+            self.ordered_sql(def, conditions)
         )
     }
 
@@ -442,12 +449,25 @@ fn bind_all(statement: &mut Statement<'_>, binds: &[(String, String)]) -> rusqli
     Ok(())
 }
 
-fn cell(value: Option<String>, kind: ColumnType) -> Value {
+/// A cell as a request sees it: a date as DD/MM/YYYY, an empty cell as
+/// `None`.
+fn text(value: Option<String>, kind: ColumnType) -> Option<String> {
     match (value, kind) {
-        (None, _) => Value::Null,
-        (Some(v), ColumnType::Date) => Value::String(dates::from_sql(&v).unwrap_or(v)),
-        (Some(v), ColumnType::Text) => Value::String(v),
+        (Some(v), ColumnType::Date) => Some(dates::from_sql(&v).unwrap_or(v)),
+        (value, _) => value,
     }
+}
+
+fn cell(value: Option<String>, kind: ColumnType) -> Value {
+    text(value, kind).map_or(Value::Null, Value::String)
+}
+
+/// The type of each of `def`'s output columns, in order.
+fn output_kinds(def: &Definition) -> Vec<ColumnType> {
+    def.output
+        .iter()
+        .map(|name| def.column(name).map_or(ColumnType::Text, |c| c.kind))
+        .collect()
 }
 
 /// The rows `page` returns, by output column.
@@ -455,11 +475,7 @@ fn page_rows(
     def: &Definition,
     page: &mut Statement<'_>,
 ) -> Result<Vec<Map<String, Value>>, QueryError> {
-    let kinds: Vec<ColumnType> = def
-        .output
-        .iter()
-        .map(|name| def.column(name).map_or(ColumnType::Text, |c| c.kind))
-        .collect();
+    let kinds = output_kinds(def);
     let mut rows = Vec::new();
     let mut cursor = page.raw_query();
     while let Some(row) = cursor.next()? {
@@ -572,22 +588,74 @@ impl Table {
         result
     }
 
-    /// The page `query` asks for, and how many rows match in all: every row
-    /// when it sets no filter, so then nothing is counted.
+    /// How many rows `conditions` match: every row when `query` sets no
+    /// filter, so then nothing is counted.
+    fn matched(
+        &self,
+        conn: &Connection,
+        def: &Definition,
+        query: &Query,
+        conditions: &str,
+        binds: &[(String, String)],
+    ) -> Result<u64, QueryError> {
+        if query.filters.is_empty() {
+            return Ok(self.rows as u64);
+        }
+        let mut count = conn.prepare(&Query::count_sql(def, conditions))?;
+        bind_all(&mut count, binds)?;
+        let total: i64 = match count.raw_query().next()? {
+            Some(row) => row.get(0)?,
+            None => 0,
+        };
+        Ok(u64::try_from(total).unwrap_or(0))
+    }
+
+    /// How many rows `query` matches in all.
+    pub fn count(&self, def: &Definition, query: &Query, stop: &Stop) -> Result<u64, QueryError> {
+        let (conditions, binds) = query.conditions();
+        self.run(stop, |conn| {
+            self.matched(conn, def, query, &conditions, &binds)
+        })
+    }
+
+    /// Every row `query` matches, in its sort and without paging, each
+    /// passed to `row` as the cells of the definition's output columns, in
+    /// order (dates as DD/MM/YYYY, an empty cell as `None`). Stops at the
+    /// first error `row` returns; otherwise returns how many rows it passed.
+    pub fn each_row<E: From<QueryError>>(
+        &self,
+        def: &Definition,
+        query: &Query,
+        stop: &Stop,
+        mut row: impl FnMut(&[Option<String>]) -> Result<(), E>,
+    ) -> Result<u64, E> {
+        let (conditions, binds) = query.conditions();
+        let kinds = output_kinds(def);
+        let mut cells: Vec<Option<String>> = vec![None; kinds.len()];
+        let mut passed = 0;
+        self.run(stop, |conn| {
+            let mut rows = conn.prepare(&query.ordered_sql(def, &conditions))?;
+            bind_all(&mut rows, &binds)?;
+            let mut cursor = rows.raw_query();
+            while let Some(next) = cursor.next()? {
+                for (i, kind) in kinds.iter().enumerate() {
+                    cells[i] = text(next.get(i)?, *kind);
+                }
+                if let Err(e) = row(&cells) {
+                    return Ok(Err(e));
+                }
+                passed += 1;
+            }
+            Ok(Ok(()))
+        })??;
+        Ok(passed)
+    }
+
+    /// The page `query` asks for, and how many rows match in all.
     pub fn page(&self, def: &Definition, query: &Query, stop: &Stop) -> Result<Page, QueryError> {
         let (conditions, binds) = query.conditions();
         self.run(stop, |conn| {
-            let total = if query.filters.is_empty() {
-                self.rows as u64
-            } else {
-                let mut count = conn.prepare(&Query::count_sql(def, &conditions))?;
-                bind_all(&mut count, &binds)?;
-                let total: i64 = match count.raw_query().next()? {
-                    Some(row) => row.get(0)?,
-                    None => 0,
-                };
-                u64::try_from(total).unwrap_or(0)
-            };
+            let total = self.matched(conn, def, query, &conditions, &binds)?;
 
             let mut distinct = BTreeMap::new();
             if !query.distinct.is_empty() {
