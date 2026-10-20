@@ -18,6 +18,7 @@ use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use bytes::Bytes;
 use lru::LruCache;
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
@@ -140,12 +141,24 @@ struct Exports {
     wait: Duration,
 }
 
-/// An export's file and how many rows it holds, with the file's share of
-/// the worker's memory, held until it's dropped.
+/// An export's file and how many rows it holds. The file holds its share
+/// of the worker's memory until the last of its bytes is dropped, wherever
+/// they are by then, such as in a connection's buffers.
 pub struct Exported {
-    pub file: Vec<u8>,
+    pub file: Bytes,
     pub rows: u64,
-    pub held: Reservation,
+}
+
+/// A file with the reservation that counts its allocation.
+struct HeldFile {
+    file: Vec<u8>,
+    _held: Reservation,
+}
+
+impl AsRef<[u8]> for HeldFile {
+    fn as_ref(&self) -> &[u8] {
+        &self.file
+    }
 }
 
 impl Default for Analyses {
@@ -417,7 +430,7 @@ impl Analyses {
     /// matches, in its sort. An export waits up to a few seconds for one of
     /// the export slots (`503 analysis_busy`), then counts the rows, refusing
     /// more than its limit allows; reserves twice the largest file it may
-    /// make, which the file's own length replaces once it's written; and
+    /// make, which the file's own allocation replaces once it's written; and
     /// writes the file, a row at a time, under the table's turn. Counting
     /// and writing each stop at the export's deadline, and once `cancelled`
     /// is set.
@@ -467,8 +480,15 @@ impl Analyses {
                 },
             )
             .await?;
-        held.resize(&self.memory, file.len(), MEMORY_WAIT).await?;
-        Ok(Exported { file, rows, held })
+        // The writer's buffer grows by doubling, so the file's allocation can
+        // be up to twice its length, and shrinking it may leave the memory
+        // where it is.
+        held.resize(&self.memory, file.capacity(), MEMORY_WAIT)
+            .await?;
+        Ok(Exported {
+            file: Bytes::from_owner(HeldFile { file, _held: held }),
+            rows,
+        })
     }
 
     /// The datasets and tables loaded so far, and their bytes.

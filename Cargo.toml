@@ -68,7 +68,7 @@ hyper = { version = "1", default-features = false, features = ["client"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client-legacy", "http1", "server-auto", "service", "tokio"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1"] }
 http-body-util = { version = "0.1", default-features = false }
-bytes = { version = "1", default-features = false }
+bytes = { version = "1.9", default-features = false }
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 webpki-roots = { version = "1", default-features = false }
 

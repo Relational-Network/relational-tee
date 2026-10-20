@@ -30,7 +30,6 @@ use axum::http::{header, HeaderMap, HeaderName, Method};
 use axum::response::Response;
 use axum::Json;
 use chrono::{DateTime, Utc};
-use http_body_util::Full;
 use hyper::body::{Frame, SizeHint};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -49,7 +48,6 @@ use crate::analysis::table::{check_targets, Scope, Target};
 use crate::api::pools::load_pool;
 use crate::audit;
 use crate::auth::{Caller, Permission};
-use crate::budget::Reservation;
 use crate::error::ApiError;
 use crate::state::AppState;
 use crate::storage::analysis_log::{AnalysisRecord, ExportEvent};
@@ -976,13 +974,10 @@ pub async fn export_analysis(
         error!(error = %e, "An export's task failed");
         ApiError::internal("the export failed")
     })??;
-    let Exported { file, rows, held } = exported;
+    let Exported { file, rows } = exported;
     audit::rows(rows);
     let name = file_name(&analysis_id, requested_at, format);
-    let body = Body::new(HeldFile {
-        file: Full::new(Bytes::from(file)),
-        _held: held,
-    });
+    let body = Body::new(FileBody(file));
     Response::builder()
         .header(header::CONTENT_TYPE, format.content_type())
         .header(
@@ -1114,30 +1109,36 @@ fn file_name(analysis_id: &str, requested_at: DateTime<Utc>, format: Format) -> 
     )
 }
 
-/// A file's body, holding the file's share of the worker's memory until
-/// it's sent or dropped.
-struct HeldFile {
-    file: Full<Bytes>,
-    _held: Reservation,
-}
+/// The most of a file each frame of its body holds, so that a connection
+/// that copies frames into its own buffer copies this much at a time, and
+/// takes more only once the client has read what it holds.
+const FILE_FRAME: usize = 64 << 10;
 
-impl HttpBody for HeldFile {
+/// A file's body, sent a frame at a time.
+struct FileBody(Bytes);
+
+impl HttpBody for FileBody {
     type Data = Bytes;
     type Error = Infallible;
 
     fn poll_frame(
         self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
+        _: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
-        Pin::new(&mut self.get_mut().file).poll_frame(cx)
+        let rest = &mut self.get_mut().0;
+        if rest.is_empty() {
+            return Poll::Ready(None);
+        }
+        let frame = rest.split_to(rest.len().min(FILE_FRAME));
+        Poll::Ready(Some(Ok(Frame::data(frame))))
     }
 
     fn is_end_stream(&self) -> bool {
-        self.file.is_end_stream()
+        self.0.is_empty()
     }
 
     fn size_hint(&self) -> SizeHint {
-        self.file.size_hint()
+        SizeHint::with_exact(self.0.len() as u64)
     }
 }
 
@@ -1150,6 +1151,7 @@ pub(crate) mod tests {
     use axum::body::{to_bytes, Body};
     use axum::http::{Request, StatusCode};
     use axum::Router;
+    use http_body_util::BodyExt;
     use sha2::{Digest, Sha256};
     use solana_pubkey::Pubkey;
     use tower::ServiceExt;
@@ -2896,6 +2898,54 @@ pub(crate) mod tests {
         assert_eq!(ended[0].grant_id, Some(format!("g-{ana_id}")));
         assert_eq!(ended[0].outcome, "pool_settling");
         assert!(ended[0].export.as_ref().unwrap().bytes.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_exports_file_holds_its_memory_until_its_last_bytes_are_dropped() {
+        let (worker, analyses) = worker_exporting(Analyses::default());
+        let owner = worker.admin("oid-owner").await;
+        let pool_pda = awards_pool(&worker, &owner).await;
+        let export = || {
+            post(
+                &export_path(&pool_pda),
+                &owner.token,
+                &json!({ "format": "xlsx" }),
+            )
+        };
+        // The first export loads the table, which stays cached.
+        let (status, _, _, _) = download(&worker.app, export()).await;
+        assert_eq!(status, StatusCode::OK);
+        let memory = analyses.memory().clone();
+        let free = memory.available();
+
+        let response = worker.app.clone().oneshot(export()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body();
+        let frame = body.frame().await.unwrap().unwrap().into_data().unwrap();
+        let held = free - memory.available();
+        assert!(held >= frame.len().max(1), "{held} bytes held");
+        // A connection can hold a frame after it has dropped the body.
+        drop(body);
+        assert_eq!(free - memory.available(), held);
+        drop(frame);
+        assert_eq!(memory.available(), free);
+    }
+
+    #[tokio::test]
+    async fn a_files_body_is_sent_a_frame_at_a_time() {
+        let file: Vec<u8> = (0..=255u8).cycle().take(3 * FILE_FRAME + 100).collect();
+        let mut body = FileBody(Bytes::from(file.clone()));
+        assert_eq!(body.size_hint().exact(), Some(file.len() as u64));
+        let (mut sent, mut frames) = (Vec::new(), Vec::new());
+        while let Some(frame) = body.frame().await {
+            let data = frame.unwrap().into_data().unwrap();
+            frames.push(data.len());
+            sent.extend_from_slice(&data);
+        }
+        assert_eq!(frames, [FILE_FRAME, FILE_FRAME, FILE_FRAME, 100]);
+        assert_eq!(sent, file);
+        assert!(body.is_end_stream());
+        assert_eq!(body.size_hint().exact(), Some(0));
     }
 
     #[test]
