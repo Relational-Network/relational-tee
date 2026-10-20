@@ -18,7 +18,6 @@ use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use bytes::Bytes;
 use lru::LruCache;
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
@@ -141,24 +140,13 @@ struct Exports {
     wait: Duration,
 }
 
-/// An export's file and how many rows it holds. The file holds its share
-/// of the worker's memory until the last of its bytes is dropped, wherever
-/// they are by then, such as in a connection's buffers.
+/// An export's file and how many rows it holds, with the reservation that
+/// counts the file's allocation, which the file should hold until the last
+/// of its bytes is dropped.
 pub struct Exported {
-    pub file: Bytes,
+    pub file: Vec<u8>,
     pub rows: u64,
-}
-
-/// A file with the reservation that counts its allocation.
-struct HeldFile {
-    file: Vec<u8>,
-    _held: Reservation,
-}
-
-impl AsRef<[u8]> for HeldFile {
-    fn as_ref(&self) -> &[u8] {
-        &self.file
-    }
+    pub held: Reservation,
 }
 
 impl Default for Analyses {
@@ -225,6 +213,11 @@ impl Analyses {
     #[cfg(test)]
     pub fn export_slots(&self) -> &Arc<Semaphore> {
         &self.exports.slots
+    }
+
+    /// What exports are held to.
+    pub fn export_limits(&self) -> Limits {
+        self.exports.limits
     }
 
     /// The worker's memory budget, which uploads reserve from too.
@@ -485,10 +478,7 @@ impl Analyses {
         // where it is.
         held.resize(&self.memory, file.capacity(), MEMORY_WAIT)
             .await?;
-        Ok(Exported {
-            file: Bytes::from_owner(HeldFile { file, _held: held }),
-            rows,
-        })
+        Ok(Exported { file, rows, held })
     }
 
     /// The datasets and tables loaded so far, and their bytes.
