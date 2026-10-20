@@ -51,8 +51,8 @@ FROM mcc_categories
 WHERE (:designation IS NULL OR coalesce(designation, '') IN (SELECT value FROM json_each(:designation)))
   AND (:category_date_accredited_from IS NULL OR category_date_accredited >= :category_date_accredited_from)
   AND (:category_date_accredited_to IS NULL OR category_date_accredited <= :category_date_accredited_to)
-  AND (:staff_number IS NULL OR staff_number IN (SELECT value FROM json_each(:staff_number)))
-  AND (:membership_number IS NULL OR membership_number IN (SELECT value FROM json_each(:membership_number)))
+  AND (:staff_number IS NULL OR coalesce(staff_number, '') IN (SELECT value FROM json_each(:staff_number)))
+  AND (:membership_number IS NULL OR coalesce(membership_number, '') IN (SELECT value FROM json_each(:membership_number)))
 '''
 
 [sql.options]
@@ -64,12 +64,12 @@ category_date_accredited = '''
 SELECT min(category_date_accredited) AS min, max(category_date_accredited) AS max FROM mcc_categories
 '''
 staff_number = '''
-SELECT staff_number AS value
-FROM mcc_categories WHERE staff_number LIKE :search || '%' ESCAPE '\'
+SELECT coalesce(staff_number, '') AS value
+FROM mcc_categories WHERE coalesce(staff_number, '') LIKE :search || '%' ESCAPE '\'
 GROUP BY staff_number ORDER BY staff_number LIMIT :limit
 '''
 membership_number = '''
-SELECT membership_number AS value
-FROM mcc_categories WHERE membership_number LIKE :search || '%' ESCAPE '\'
+SELECT coalesce(membership_number, '') AS value
+FROM mcc_categories WHERE coalesce(membership_number, '') LIKE :search || '%' ESCAPE '\'
 GROUP BY membership_number ORDER BY membership_number LIMIT :limit
 '''
