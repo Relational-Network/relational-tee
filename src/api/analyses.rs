@@ -22,18 +22,20 @@ use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use axum::body::{Body, Bytes, HttpBody};
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderName, Method};
 use axum::response::Response;
-use axum::Json;
+use axum::{Extension, Json};
 use chrono::{DateTime, Utc};
 use hyper::body::{Frame, SizeHint};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tokio::sync::oneshot;
 use tracing::{error, warn, Instrument, Span};
 use utoipa::ToSchema;
 
@@ -48,6 +50,8 @@ use crate::analysis::table::{check_targets, Scope, Target};
 use crate::api::pools::load_pool;
 use crate::audit;
 use crate::auth::{Caller, Permission};
+use crate::budget::Reservation;
+use crate::edge::Connection;
 use crate::error::ApiError;
 use crate::state::AppState;
 use crate::storage::analysis_log::{AnalysisRecord, ExportEvent};
@@ -904,7 +908,7 @@ pub async fn run_query(
     path = "/v1/drt/pools/{pool_pda}/analyses/{analysis_id}/export",
     tag = "Analyses",
     summary = "Export an analysis",
-    description = "Every row the caller sees that the request's filters match, in the sort asked for, as a file of the analysis's output columns: CSV (UTF-8 with a byte order mark, CRLF line ends) or XLSX. The filters and sort are checked as a query's are; an export takes no page, `distinct` or scope. Dates are DD/MM/YYYY and empty cells are empty. Every XLSX cell is text, never a number, formula or link; a CSV value that a spreadsheet would read as a formula starts with `'`, unless it's a plain amount such as `-25.00`. An export holds at most 100,000 rows and 50 MiB, and fails rather than returning part of its rows. It's recorded in the analysis log twice under the export ID it returns: when it's asked for, before any work, and when it ends, and a file is sent only once its success is stored. Read-only, so it needs no Idempotency-Key. Needs `analyses:run`, and for an analyst an active grant.",
+    description = "Every row the caller sees that the request's filters match, in the sort asked for, as a file of the analysis's output columns: CSV (UTF-8 with a byte order mark, CRLF line ends) or XLSX. The filters and sort are checked as a query's are; an export takes no page, `distinct` or scope. Dates are DD/MM/YYYY and empty cells are empty. Every XLSX cell is text, never a number, formula or link; a CSV value that a spreadsheet would read as a formula starts with `'`, unless it's a plain amount such as `-25.00`. An export holds at most 100,000 rows and 50 MiB, and fails rather than returning part of its rows. It's recorded in the analysis log twice under the export ID it returns: when it's asked for, before any work, and when it ends, and a file is sent only once its success is stored. A file not sent within 5 minutes has its connection closed. Read-only, so it needs no Idempotency-Key. Needs `analyses:run`, and for an analyst an active grant.",
     security(("bearer_auth" = [])),
     params(
         ("pool_pda" = String, Path, description = "Pool PDA address (base58)"),
@@ -935,6 +939,7 @@ pub async fn export_analysis(
     caller: Caller,
     State(state): State<AppState>,
     Path((pool_pda, analysis_id)): Path<(String, String)>,
+    connection: Option<Extension<Connection>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
@@ -966,6 +971,7 @@ pub async fn export_analysis(
     // The export runs in a task of its own, so that it records how it ended
     // even if its client goes away; dropping `cancel` stops its work.
     let cancel = Cancel::default();
+    let send_time = state.analyses.export_limits().send_time;
     let task = tokio::spawn(
         run_export(state, caller, doc, analysis, body, logged, cancel.watch())
             .instrument(Span::current()),
@@ -974,9 +980,18 @@ pub async fn export_analysis(
         error!(error = %e, "An export's task failed");
         ApiError::internal("the export failed")
     })??;
-    let Exported { file, rows } = exported;
+    let Exported { file, rows, held } = exported;
     audit::rows(rows);
     let name = file_name(&analysis_id, requested_at, format);
+    let (unsent, sent) = oneshot::channel();
+    let file = Bytes::from_owner(HeldFile {
+        file,
+        _held: held,
+        _unsent: unsent,
+    });
+    if let Some(Extension(connection)) = connection {
+        tokio::spawn(close_unless_sent(sent, connection, send_time).instrument(Span::current()));
+    }
     let body = Body::new(FileBody(file));
     Response::builder()
         .header(header::CONTENT_TYPE, format.content_type())
@@ -995,7 +1010,8 @@ pub async fn export_analysis(
 
 /// The export route's work, after its request is recorded: the file, and
 /// the record of how it ended, stored before the file is returned. A
-/// success whose record can't be stored, once retried, returns nothing.
+/// success whose record can't be stored, once retried, returns nothing. The
+/// work ends wherever it is, waits included, once `cancelled` is set.
 async fn run_export(
     state: AppState,
     caller: Caller,
@@ -1005,7 +1021,7 @@ async fn run_export(
     mut logged: Logged,
     cancelled: Cancelled,
 ) -> Result<(Exported, Format), ApiError> {
-    let result = async {
+    let work = async {
         let def = state
             .analyses
             .definition(&state.storage, &analysis.code_hash_hex)
@@ -1035,15 +1051,20 @@ async fn run_export(
             .export(table, def, query, request.format, &cancelled)
             .await?;
         if_current(&state, &doc, analyst, (exported, request.format)).await
-    }
-    .await;
+    };
+    let result = tokio::select! {
+        biased;
+        () = cancelled.wait() => Err(client_gone()),
+        result = work => result,
+    };
 
     let record = &mut logged.record;
     let event = record.export.as_mut().expect("an export's record names it");
+    let export_id = event.export_id.clone();
     let (result_name, outcome) = match &result {
         Ok(_) if cancelled.is_set() => ("cancelled", "cancelled"),
         Ok(_) => ("success", "success"),
-        Err(e) if e.code == "analysis_timeout" && cancelled.is_set() => ("cancelled", "cancelled"),
+        Err(e) if e.code == CLIENT_GONE => ("cancelled", "cancelled"),
         Err(e) if e.code == "analysis_timeout" => ("timeout", e.code),
         Err(e) if e.status.is_server_error() => ("failed", e.code),
         Err(e) => ("refused", e.code),
@@ -1072,15 +1093,35 @@ async fn run_export(
     match (result, stored) {
         (Ok(file), Ok(())) => Ok(file),
         (Ok(_), Err(e)) => {
-            error!(alert = "analysis_log", error = %e, "An export couldn't be logged");
+            error!(alert = "analysis_log", %export_id, error = %e, "An export's end couldn't be logged, so its file was withheld");
             Err(log_unavailable())
         }
         (Err(e), stored) => {
             if let Err(log) = stored {
-                warn!(error = %log, "A failed export couldn't be logged");
+                error!(alert = "analysis_log", %export_id, error = %log, "An export's end couldn't be logged");
             }
             Err(e)
         }
+    }
+}
+
+/// The code of the error an export whose client went away ends with, which
+/// no one receives.
+const CLIENT_GONE: &str = "client_gone";
+
+fn client_gone() -> ApiError {
+    ApiError::service_unavailable("the export's client went away").with_code(CLIENT_GONE)
+}
+
+/// Close `connection` unless the file whose last bytes drop `sent`'s sender
+/// has been sent, or dropped, within `time`.
+async fn close_unless_sent(sent: oneshot::Receiver<()>, connection: Connection, time: Duration) {
+    if tokio::time::timeout(time, sent).await.is_err() {
+        warn!(
+            seconds = time.as_secs(),
+            "An export's file wasn't sent in time; closing its connection"
+        );
+        connection.close();
     }
 }
 
@@ -1107,6 +1148,22 @@ fn file_name(analysis_id: &str, requested_at: DateTime<Utc>, format: Format) -> 
         requested_at.format("%Y%m%d-%H%M%S"),
         format.extension()
     )
+}
+
+/// An export's file, with the reservation that counts its allocation and
+/// the sender whose drop says it's been sent, both of which go once the
+/// last of its bytes is dropped, wherever they are by then, such as in a
+/// connection's buffers.
+struct HeldFile {
+    file: Vec<u8>,
+    _held: Reservation,
+    _unsent: oneshot::Sender<()>,
+}
+
+impl AsRef<[u8]> for HeldFile {
+    fn as_ref(&self) -> &[u8] {
+        &self.file
+    }
 }
 
 /// The most of a file each frame of its body holds, so that a connection
@@ -2645,6 +2702,21 @@ pub(crate) mod tests {
             .unwrap_or_else(|_| panic!("{what} took too long"))
     }
 
+    /// The record of how the pool's first export ended, once its task has
+    /// stored it.
+    async fn ended_export(worker: &Worker, pool_pda: &Pubkey) -> AnalysisRecord {
+        within("the export recording its end", async {
+            loop {
+                let log = logged_today(worker, pool_pda).await;
+                if let Some(ended) = finished(&log).into_iter().next() {
+                    break ended.clone();
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+    }
+
     #[tokio::test]
     async fn an_export_whose_client_goes_away_is_logged_as_cancelled() {
         let one_slot = Analyses::with_threads(Arc::new(Budget::default()), Threads::new(2));
@@ -2691,21 +2763,84 @@ pub(crate) mod tests {
         drop(turn);
 
         // The export's own task records how it ended.
-        let ended = within("the export recording its end", async {
-            loop {
-                let log = logged_today(&worker, &pool_pda).await;
-                if let Some(ended) = finished(&log).into_iter().next() {
-                    break ended.clone();
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await;
+        let ended = ended_export(&worker, &pool_pda).await;
         assert_eq!(ended.outcome, "cancelled");
         let event = ended.export.as_ref().unwrap();
         assert_eq!(event.result.as_deref(), Some("cancelled"));
         assert!(event.bytes.is_none());
         assert_eq!(analyses.export_slots().available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_export_whose_client_goes_away_while_it_waits_ends_at_once() {
+        let one_slot = Analyses::with_threads(Arc::new(Budget::default()), Threads::new(2))
+            .with_exports(Limits::default(), Duration::from_secs(60));
+        let (worker, analyses) = worker_exporting(one_slot);
+        let owner = worker.admin("oid-owner").await;
+        let pool_pda = awards_pool(&worker, &owner).await;
+        let slot = analyses
+            .export_slots()
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+        let request = tokio::spawn(worker.app.clone().oneshot(post(
+            &export_path(&pool_pda),
+            &owner.token,
+            &json!({ "format": "csv" }),
+        )));
+        // Once its table is built, the export waits for the slot, which
+        // would take a minute.
+        within("the export's table being built", async {
+            while analyses.usage().1 .1 == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        request.abort();
+
+        let ended = ended_export(&worker, &pool_pda).await;
+        assert_eq!(ended.outcome, "cancelled");
+        let event = ended.export.as_ref().unwrap();
+        assert_eq!(event.result.as_deref(), Some("cancelled"));
+        drop(slot);
+    }
+
+    #[tokio::test]
+    async fn an_export_not_sent_in_time_closes_its_connection() {
+        let quick = Limits {
+            send_time: Duration::from_millis(200),
+            ..Limits::default()
+        };
+        let (worker, _) =
+            worker_exporting(Analyses::default().with_exports(quick, Duration::from_secs(5)));
+        let owner = worker.admin("oid-owner").await;
+        let pool_pda = awards_pool(&worker, &owner).await;
+        let export = |connection: &Connection| {
+            let mut request = post(
+                &export_path(&pool_pda),
+                &owner.token,
+                &json!({ "format": "csv" }),
+            );
+            request.extensions_mut().insert(connection.clone());
+            request
+        };
+
+        let read = Connection::default();
+        let (status, _, _, _) = download(&worker.app, export(&read)).await;
+        assert_eq!(status, StatusCode::OK);
+        let unread = Connection::default();
+        let response = worker.app.clone().oneshot(export(&unread)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        within("the unread file's connection closing", async {
+            while !unread.is_closed() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(!read.is_closed(), "a file sent in time leaves it open");
+        drop(response);
     }
 
     type Hook = Box<

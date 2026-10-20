@@ -41,6 +41,9 @@ use crate::work::Stop;
 pub const MAX_ROWS: u64 = 100_000;
 /// The largest file an export makes.
 pub const MAX_BYTES: usize = 50 << 20;
+/// How long a file may take to send before its connection is closed: the
+/// largest file at about 170 KiB/s, as long as an upload may take.
+pub const SEND_TIME: Duration = Duration::from_secs(300);
 /// The longest text an XLSX cell holds, in UTF-16 units, as Excel counts.
 const MAX_CELL_CHARS: usize = 32_767;
 /// The most rows an XLSX worksheet holds, its header included.
@@ -80,6 +83,8 @@ pub struct Limits {
     pub max_bytes: usize,
     /// How long counting the rows may take, and then writing them.
     pub deadline: Duration,
+    /// How long the file may take to send.
+    pub send_time: Duration,
 }
 
 impl Default for Limits {
@@ -88,6 +93,7 @@ impl Default for Limits {
             max_rows: MAX_ROWS,
             max_bytes: MAX_BYTES,
             deadline: super::runner::DEADLINE,
+            send_time: SEND_TIME,
         }
     }
 }

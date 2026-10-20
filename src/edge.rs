@@ -14,31 +14,34 @@
 //! routes ([`REQUESTS`], [`UPLOADS`]), and an upload waits for the memory it
 //! needs before its body is read ([`admit_upload`]); request headers are
 //! bounded in size and must arrive in time, and HTTP/2 connections in their
-//! open requests ([`http_settings`]); and a worker serves at most
-//! [`MAX_CONNECTIONS`] connections at once ([`ConnectionLimit`]).
+//! open requests ([`http_settings`]); a worker serves at most
+//! [`MAX_CONNECTIONS`] connections at once ([`ConnectionLimit`]); and a
+//! request can close its own connection ([`Connection`]).
 
 use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroU32;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Request, State};
 use axum::http::{header, HeaderName, HeaderValue, Method};
-use axum::middleware::Next;
+use axum::middleware::{AddExtension, Next};
 use axum::response::{IntoResponse, Response};
-use axum::Router;
+use axum::{Extension, Router};
 use axum_server::accept::Accept;
+use futures_util::task::AtomicWaker;
 use governor::clock::{Clock, DefaultClock};
 use governor::{DefaultKeyedRateLimiter, Quota, RateLimiter};
 use hyper_util::rt::{TokioExecutor, TokioTimer};
 use hyper_util::server::conn::auto;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tower_http::cors::{AllowOrigin, CorsLayer};
+use tower_layer::Layer;
 use tracing::warn;
 
 use crate::budget::Budget;
@@ -277,7 +280,8 @@ pub async fn admit_upload(
 pub const MAX_CONNECTIONS: usize = 1024;
 
 /// An acceptor that serves at most `limit` connections at once. Past it, a
-/// new connection is closed as it arrives, before any TLS handshake.
+/// new connection is closed as it arrives, before any TLS handshake. Each
+/// request it serves has its connection's [`Connection`] as an extension.
 #[derive(Clone)]
 pub struct ConnectionLimit<A> {
     inner: A,
@@ -326,7 +330,7 @@ where
     A::Service: Send + 'static,
 {
     type Stream = Held<A::Stream>;
-    type Service = A::Service;
+    type Service = AddExtension<A::Service, Connection>;
     type Future = Pin<Box<dyn Future<Output = io::Result<(Self::Stream, Self::Service)>> + Send>>;
 
     fn accept(&self, stream: I, service: S) -> Self::Future {
@@ -339,14 +343,58 @@ where
         let accepted = self.inner.accept(stream, service);
         Box::pin(async move {
             let (stream, service) = accepted.await?;
+            let connection = Connection::default();
             Ok((
                 Held {
                     stream,
                     _slot: slot,
+                    connection: connection.clone(),
                 },
-                service,
+                Extension(connection).layer(service),
             ))
         })
+    }
+}
+
+/// A request's connection, which the request can close. A response whose
+/// client stops reading holds the connection, and what the response holds,
+/// for as long as the client keeps the connection open: HTTP/2 flow control
+/// or a full socket buffer means hyper stops asking the response for more,
+/// so only closing the connection lets go of it.
+#[derive(Clone, Debug, Default)]
+pub struct Connection(Arc<Closing>);
+
+#[derive(Debug, Default)]
+struct Closing {
+    closed: AtomicBool,
+    waker: AtomicWaker,
+}
+
+impl Connection {
+    /// Close the connection, and with it every request it carries: its
+    /// reads and writes fail from now on, so hyper drops it, and its
+    /// responses with it.
+    pub fn close(&self) {
+        self.0.closed.store(true, Ordering::SeqCst);
+        self.0.waker.wake();
+    }
+
+    #[cfg(test)]
+    pub fn is_closed(&self) -> bool {
+        self.0.closed.load(Ordering::SeqCst)
+    }
+
+    /// An error once the connection is closed. The task asking is woken
+    /// when it's closed later.
+    fn check(&self, cx: &Context<'_>) -> io::Result<()> {
+        self.0.waker.register(cx.waker());
+        if self.0.closed.load(Ordering::SeqCst) {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "a request closed its connection",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -369,10 +417,12 @@ impl Drop for Slot {
     }
 }
 
-/// A connection's stream, which keeps its place in the count while open.
+/// A connection's stream, which keeps its place in the count while open,
+/// and fails once a request closes its [`Connection`].
 pub struct Held<T> {
     stream: T,
     _slot: Slot,
+    connection: Connection,
 }
 
 impl<T: AsyncRead + Unpin> AsyncRead for Held<T> {
@@ -381,6 +431,7 @@ impl<T: AsyncRead + Unpin> AsyncRead for Held<T> {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        self.connection.check(cx)?;
         Pin::new(&mut self.stream).poll_read(cx, buf)
     }
 }
@@ -391,6 +442,7 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for Held<T> {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
+        self.connection.check(cx)?;
         Pin::new(&mut self.stream).poll_write(cx, buf)
     }
 
@@ -399,6 +451,7 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for Held<T> {
         cx: &mut Context<'_>,
         bufs: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
+        self.connection.check(cx)?;
         Pin::new(&mut self.stream).poll_write_vectored(cx, bufs)
     }
 
@@ -407,6 +460,7 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for Held<T> {
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.connection.check(cx)?;
         Pin::new(&mut self.stream).poll_flush(cx)
     }
 
@@ -773,6 +827,100 @@ mod tests {
             .unwrap();
         let (_, waited) = until_closed(&mut client).await;
         about(waited, 2 * H2_KEEP_ALIVE);
+    }
+
+    /// A response body that counts itself in `live` until it's dropped.
+    struct Counted(Vec<u8>, Arc<AtomicUsize>);
+
+    impl AsRef<[u8]> for Counted {
+        fn as_ref(&self) -> &[u8] {
+            &self.0
+        }
+    }
+
+    impl Drop for Counted {
+        fn drop(&mut self) {
+            self.1.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_request_can_close_its_connection_while_its_client_reads_nothing() {
+        for http2 in [false, true] {
+            let live = Arc::new(AtomicUsize::new(0));
+            let (connections, mut seen) = tokio::sync::mpsc::unbounded_channel();
+            let counted = live.clone();
+            let app = Router::new().route(
+                "/",
+                get(move |Extension(connection): Extension<Connection>| {
+                    let (live, connections) = (counted.clone(), connections.clone());
+                    async move {
+                        connections.send(connection).unwrap();
+                        live.fetch_add(1, Ordering::SeqCst);
+                        Body::from(Bytes::from_owner(Counted(vec![0; 8 << 20], live)))
+                    }
+                }),
+            );
+            let (client, server) = tokio::io::duplex(64 * 1024);
+            let (stream, service) = ConnectionLimit::new(DefaultAcceptor::new(), 1)
+                .accept(server, app)
+                .await
+                .unwrap();
+            let mut builder = auto::Builder::new(TokioExecutor::new());
+            http_settings(&mut builder);
+            let serving = tokio::spawn(async move {
+                let _ = builder
+                    .serve_connection(TokioIo::new(stream), TowerToHyperService::new(service))
+                    .await;
+            });
+
+            let request = axum::http::Request::get("http://worker/")
+                .body(Body::empty())
+                .unwrap();
+            let (response, _sender): (_, Box<dyn std::any::Any + Send>) = if http2 {
+                let (mut sender, connection) = hyper::client::conn::http2::handshake(
+                    TokioExecutor::new(),
+                    TokioIo::new(client),
+                )
+                .await
+                .unwrap();
+                tokio::spawn(connection);
+                (
+                    sender.send_request(request).await.unwrap(),
+                    Box::new(sender),
+                )
+            } else {
+                let (mut sender, connection) =
+                    hyper::client::conn::http1::handshake(TokioIo::new(client))
+                        .await
+                        .unwrap();
+                tokio::spawn(connection);
+                (
+                    sender.send_request(request).await.unwrap(),
+                    Box::new(sender),
+                )
+            };
+            assert_eq!(response.status(), StatusCode::OK);
+            let connection = seen.recv().await.unwrap();
+            // The client reads none of the body, so the server can't send it.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(!serving.is_finished(), "HTTP/2: {http2}");
+            assert_eq!(live.load(Ordering::SeqCst), 1);
+
+            connection.close();
+            tokio::time::timeout(Duration::from_secs(5), serving)
+                .await
+                .expect("the connection closes")
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while live.load(Ordering::SeqCst) > 0 {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("the response is dropped; HTTP/2: {http2}"));
+            drop(response);
+        }
     }
 
     #[tokio::test]

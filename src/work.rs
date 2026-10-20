@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::runtime::{Handle, RuntimeFlavor};
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore};
 use tracing::{error, warn};
 
 use crate::error::ApiError;
@@ -39,7 +39,8 @@ pub struct Stop {
 
 /// A request's cancellation, for work that goes on in a task of its own
 /// when the request's future is dropped, as it is when its client goes
-/// away: dropping this fires every [`Stop`] linked to its [`Cancelled`].
+/// away: dropping this fires every [`Stop`] linked to its [`Cancelled`],
+/// and ends every [`Cancelled::wait`].
 /// Each step of the work gets a stop of its own, since a stop is abandoned
 /// once its step ends, and they share the request's flag.
 #[derive(Debug, Default)]
@@ -54,17 +55,33 @@ impl Cancel {
 
 impl Drop for Cancel {
     fn drop(&mut self) {
-        self.0 .0.store(true, Ordering::Relaxed);
+        self.0 .0.set.store(true, Ordering::SeqCst);
+        self.0 .0.notify.notify_waiters();
     }
 }
 
 /// Whether a request's [`Cancel`] has been dropped.
 #[derive(Clone, Debug, Default)]
-pub struct Cancelled(Arc<AtomicBool>);
+pub struct Cancelled(Arc<Flag>);
+
+#[derive(Debug, Default)]
+struct Flag {
+    set: AtomicBool,
+    notify: Notify,
+}
 
 impl Cancelled {
     pub fn is_set(&self) -> bool {
-        self.0.load(Ordering::Relaxed)
+        self.0.set.load(Ordering::SeqCst)
+    }
+
+    /// Wait until it's set.
+    pub async fn wait(&self) {
+        let mut notified = std::pin::pin!(self.0.notify.notified());
+        notified.as_mut().enable();
+        if !self.is_set() {
+            notified.await;
+        }
     }
 }
 
@@ -362,6 +379,27 @@ mod tests {
         assert!(cancelled.is_set());
         assert!(second.stopped());
         assert!(!Stop::after(Duration::from_secs(60)).stopped(), "unlinked");
+    }
+
+    #[tokio::test]
+    async fn waiting_for_a_cancellation_ends_when_its_request_goes() {
+        let cancel = Cancel::default();
+        let cancelled = cancel.watch();
+        let waiting = tokio::spawn({
+            let cancelled = cancelled.clone();
+            async move { cancelled.wait().await }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!waiting.is_finished());
+        drop(cancel);
+        tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("the wait ends")
+            .unwrap();
+        // Once set, a wait ends at once.
+        tokio::time::timeout(Duration::from_secs(5), cancelled.wait())
+            .await
+            .expect("an already-set wait ends");
     }
 
     #[tokio::test]
