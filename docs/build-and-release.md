@@ -5,7 +5,7 @@
 `flake.nix` pins nixpkgs and builds with crane, taking the toolchain from `rust-toolchain.toml`:
 
 - `packages.x86_64-linux.server`: the release binary, statically linked against musl, with mimalloc as its allocator. `SOURCE_DATE_EPOCH` comes from the commit, and build paths are remapped out of the binary.
-- `packages.x86_64-linux.image`: an OCI image containing only the binary, a pinned CA bundle and an `/etc/passwd` entry for the non-root user 65532. It has no shell, package manager or Nix. The entrypoint is `/bin/relational-tee`, on port 8443.
+- `packages.x86_64-linux.image`: an OCI image containing only the binary and an `/etc/passwd` entry for the non-root user 65532. It has no shell, package manager, Nix or CA bundle: the worker trusts only the Mozilla roots compiled into it from `webpki-roots`. The entrypoint is `/bin/relational-tee`, on port 8443.
 - `packages.aarch64-linux.image-dev`: the same image with the `dev` feature, for local container stacks on Apple Silicon.
 - `checks`: rustfmt, clippy and nextest, run by `nix flake check`.
 
