@@ -134,6 +134,7 @@
           echo 'nonroot:x:65532:' > $out/etc/group
         '';
 
+      # No CA bundle: the worker trusts only the webpki-roots compiled into it.
       imageFor =
         pkgs: tag: server:
         pkgs.dockerTools.buildLayeredImage {
@@ -141,7 +142,6 @@
           inherit tag;
           contents = [
             server
-            pkgs.cacert
             (etcFor pkgs)
           ];
           config = {
@@ -149,7 +149,6 @@
             User = "65532:65532";
             WorkingDir = "/";
             ExposedPorts."8443/tcp" = { };
-            Env = [ "SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt" ];
           };
         };
     in
